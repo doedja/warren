@@ -86,10 +86,15 @@ For a WAN deployment, add `--tls` to the hub (it prints a fingerprint) and join
 nodes with `--tls --hub-fingerprint <fp>`. Install a node as a boot service with
 `warren node install --hub ... --token ... [--tls --hub-fingerprint ...]`.
 
-Admin: run the hub with `--admin-listen 127.0.0.1:9000 --admin-token <secret>`
-for a web dashboard at that address (manage nodes, enrollment tokens, and proxy
-users). Tokens and users live in the `--db` SQLite file and persist across
-restarts; `warren enroll --db <file>` mints a token from the CLI.
+Admin dashboard: run the hub with `--admin-listen 0.0.0.0:9000 --admin-token <secret>`
+for a web dashboard at that address, gated by HTTP Basic auth (any username, the
+admin token as password). It **auto-refreshes** (live nodes, pending approvals,
+approved keys, tokens, proxy users) and shows a **Connect** card with
+copy-paste install + proxy commands. Pass `--public-node-addr HOST:7000` and
+`--public-proxy-addr HOST:18080` so the card shows the real addresses; the
+fingerprint is filled in automatically. Each enrollment token has a "copy
+install" button that builds the full one-liner. Tokens/users live in the `--db`
+SQLite file; `warren enroll --db <file>` also mints a token from the CLI.
 
 ## Install a node (one-liner)
 
@@ -105,8 +110,11 @@ curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh 
   --hub HOST:7000 --tls --hub-fingerprint FP
 ```
 
-The installer fetches the release binary and registers a boot service. Run with
-no args to just install the binary.
+The installer ([`install.sh`](https://github.com/doedja/warren/blob/main/install.sh))
+fetches the matching binary from [Releases](https://github.com/doedja/warren/releases/latest)
+(musl static, x86_64 + arm64) and registers a boot service. Run with no args to
+just install the binary. The admin dashboard's Connect card / per-token "copy
+install" button gives you this exact command with the host + fingerprint filled in.
 
 ## Node identity + enrollment
 
