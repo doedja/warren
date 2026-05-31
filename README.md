@@ -22,28 +22,36 @@ and the node.
 > A warren is a network of connected burrows. Each device digs one burrow out to
 > the hub; the hub is the warren your apps enter through.
 
-## The whole setup
+## Set it up: two steps
+
+**1. On a server, install warren and start the hub.** It mints and prints a join
+token, so there is no secret to invent.
 
 ```bash
-# 1. on a server, once: install warren and start the hub (it prints a join token)
-curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh && \
-  warren hub --proxy-user me --proxy-pass YOURPASSWORD
-
-# 2. on each device you own: join the pool (JOINKEY = the token the hub printed)
-curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh -s -- \
-  --hub SERVER:7000 --token JOINKEY
-
-# 3. from anywhere: send traffic through your pool
-curl -x http://me:YOURPASSWORD@SERVER:8000 https://api.ipify.org        # a device's home IP
-curl -x http://me+phone:YOURPASSWORD@SERVER:8000 https://api.ipify.org  # only the "phone" device
+curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh && warren hub --proxy-user me --proxy-pass YOURPASSWORD
 ```
 
-That is everything. No secret to invent (the hub mints the join token and prints
-it), no VPN to mesh, no proxy to configure on each device, no rotator to bolt on.
-Add more devices and the hub spreads requests across them and skips any that drop.
-A plain username uses the whole pool; `user+name` sends traffic out one named
-device, like picking a single exit node. And you do not have to type the device
-line by hand: the dashboard prints it for you with the address and token filled in.
+**2. On each device you own, join the pool.** `JOINKEY` is the token the hub
+printed (or copy the whole line from the dashboard, address and token filled in).
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh -s -- --hub SERVER:7000 --token JOINKEY
+```
+
+That is the setup. No VPN to mesh, no proxy to configure on each device, no
+rotator to bolt on. Add more devices and the hub spreads requests across them and
+skips any that drop. Now point any app at the proxy:
+
+```bash
+curl -x http://me:YOURPASSWORD@SERVER:8000 https://api.ipify.org
+```
+
+A plain username uses the whole pool and fails over automatically. Add a device
+name to send traffic out one device, like picking a single exit node:
+
+```bash
+curl -x http://me+phone:YOURPASSWORD@SERVER:8000 https://api.ipify.org
+```
 
 ## Why one binary
 
