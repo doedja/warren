@@ -4,18 +4,28 @@
 use serde::{Deserialize, Serialize};
 
 /// Protocol version. Bump on any breaking change to the message shapes.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Stable identity the hub assigns to a node at enrollment.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NodeId(pub String);
 
 /// What the node tells the hub the moment its control stream opens.
+///
+/// The node proves possession of its ed25519 key by signing
+/// `b"warren-node-auth" || pubkey || timestamp.to_le_bytes()`. Enrollment is
+/// then: an approved pubkey, or a valid `token` (which auto-approves the key).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Hello {
     pub protocol_version: u16,
-    /// Enrollment token (first connect) OR a previously issued node credential.
-    pub token: String,
+    /// ed25519 public key (32 bytes).
+    pub pubkey: Vec<u8>,
+    /// Optional enrollment token (Mode B: presenting it auto-approves the key).
+    pub token: Option<String>,
+    /// Unix seconds; signed, so a captured Hello cannot be replayed later.
+    pub timestamp: u64,
+    /// ed25519 signature over the auth message above (64 bytes).
+    pub signature: Vec<u8>,
     pub node_name: String,
     pub platform: Platform,
     pub agent_version: String,
@@ -33,8 +43,17 @@ pub enum Platform {
 /// Hub's response to [`Hello`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HelloReply {
-    Welcome { node_id: NodeId },
-    Reject { reason: String },
+    Welcome {
+        node_id: NodeId,
+    },
+    Reject {
+        reason: String,
+    },
+    /// Key recorded as pending; an admin must approve it. `code` is a short
+    /// human-friendly identifier (a prefix of the key fingerprint).
+    Pending {
+        code: String,
+    },
 }
 
 /// Messages from hub to node on the control connection after the handshake.
@@ -107,14 +126,17 @@ mod tests {
 
     #[test]
     fn test_protocol_version() {
-        assert_eq!(PROTOCOL_VERSION, 1);
+        assert_eq!(PROTOCOL_VERSION, 2);
     }
 
     #[test]
     fn test_hello_roundtrip() {
         let original = Hello {
-            protocol_version: 1,
-            token: "tok_abc".into(),
+            protocol_version: PROTOCOL_VERSION,
+            pubkey: vec![1u8; 32],
+            token: Some("tok_abc".into()),
+            timestamp: 1700000000,
+            signature: vec![2u8; 64],
             node_name: "test-node".into(),
             platform: Platform::Linux,
             agent_version: "0.1.0".into(),

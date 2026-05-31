@@ -36,8 +36,16 @@ pub const DASHBOARD: &str = r###"<!doctype html>
 </header>
 <main>
   <section class="card">
-    <h2>Nodes</h2>
+    <h2>Pending approval</h2>
+    <table><thead><tr><th>Code</th><th>Name</th><th>Key</th><th></th></tr></thead><tbody id="pending"></tbody></table>
+  </section>
+  <section class="card">
+    <h2>Live nodes</h2>
     <table><thead><tr><th>Node</th><th>Fails</th></tr></thead><tbody id="nodes"></tbody></table>
+  </section>
+  <section class="card">
+    <h2>Approved keys</h2>
+    <table><thead><tr><th>Name</th><th>Key</th><th>Approved</th><th></th></tr></thead><tbody id="keys"></tbody></table>
   </section>
   <section class="card">
     <h2>Enrollment tokens</h2>
@@ -107,7 +115,26 @@ async function addUser(){
   document.getElementById('uname').value=''; document.getElementById('upass').value=''; loadUsers();
 }
 async function delUser(u){ await api('DELETE','/api/users/'+encodeURIComponent(u)); loadUsers(); }
-async function loadAll(){ try { await loadNodes(); await loadTokens(); await loadUsers(); } catch(e){} }
+function shortKey(pk){ return pk.length > 16 ? pk.slice(0,16)+'...' : pk; }
+async function loadPending(){
+  const rows = await api('GET','/api/pending');
+  document.getElementById('pending').innerHTML = rows.map(p =>
+    `<tr><td><code>${esc(p.code)}</code></td><td>${esc(p.name)}</td><td>${esc(shortKey(p.pubkey))}</td>`+
+    `<td><button onclick="approve('${esc(p.pubkey)}')">approve</button> `+
+    `<button class="ghost" onclick="denyNode('${esc(p.pubkey)}')">deny</button></td></tr>`).join('')
+    || '<tr><td colspan=4>none</td></tr>';
+}
+async function approve(pk){ await api('POST','/api/pending/'+encodeURIComponent(pk)+'/approve'); loadPending(); loadKeys(); }
+async function denyNode(pk){ await api('DELETE','/api/pending/'+encodeURIComponent(pk)); loadPending(); }
+async function loadKeys(){
+  const rows = await api('GET','/api/node-keys');
+  document.getElementById('keys').innerHTML = rows.map(k =>
+    `<tr><td>${esc(k.name)}</td><td><code>${esc(shortKey(k.pubkey))}</code></td><td>${fmtDate(k.approved_at)}</td>`+
+    `<td><button class="ghost" onclick="revokeKey('${esc(k.pubkey)}')">revoke</button></td></tr>`).join('')
+    || '<tr><td colspan=4>none</td></tr>';
+}
+async function revokeKey(pk){ await api('DELETE','/api/node-keys/'+encodeURIComponent(pk)); loadKeys(); }
+async function loadAll(){ try { await loadPending(); await loadNodes(); await loadKeys(); await loadTokens(); await loadUsers(); } catch(e){} }
 if (TOK) loadAll();
 </script>
 </body>

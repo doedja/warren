@@ -19,6 +19,17 @@ impl Store {
             CREATE TABLE IF NOT EXISTS proxy_users (
                 username TEXT PRIMARY KEY,
                 password TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS node_keys (
+                pubkey TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                approved_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS pending_nodes (
+                pubkey TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                code TEXT NOT NULL,
+                first_seen INTEGER NOT NULL
             );",
         )?;
         Ok(Store {
@@ -127,6 +138,107 @@ impl Store {
         let count: i64 =
             conn.query_row("SELECT COUNT(*) FROM proxy_users", [], |row| row.get(0))?;
         Ok(count > 0)
+    }
+
+    // --- node keys (approved) -------------------------------------------------
+
+    fn now() -> i64 {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+
+    /// Approve a node pubkey (and drop any matching pending entry).
+    pub fn approve_node(&self, pubkey: &str, name: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO node_keys (pubkey, name, approved_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![pubkey, name, Self::now()],
+        )?;
+        conn.execute(
+            "DELETE FROM pending_nodes WHERE pubkey = ?1",
+            rusqlite::params![pubkey],
+        )?;
+        Ok(())
+    }
+
+    pub fn is_node_approved(&self, pubkey: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        match conn.query_row(
+            "SELECT 1 FROM node_keys WHERE pubkey = ?1",
+            rusqlite::params![pubkey],
+            |_| Ok(()),
+        ) {
+            Ok(_) => Ok(true),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn list_nodes(&self) -> Result<Vec<(String, String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT pubkey, name, approved_at FROM node_keys")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn delete_node(&self, pubkey: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM node_keys WHERE pubkey = ?1",
+            rusqlite::params![pubkey],
+        )?;
+        Ok(n > 0)
+    }
+
+    // --- pending nodes (awaiting approval) ------------------------------------
+
+    /// Record a pubkey awaiting admin approval (no-op if already pending).
+    pub fn add_pending(&self, pubkey: &str, name: &str, code: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO pending_nodes (pubkey, name, code, first_seen) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![pubkey, name, code, Self::now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_pending(&self) -> Result<Vec<(String, String, String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT pubkey, name, code, first_seen FROM pending_nodes")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    pub fn delete_pending(&self, pubkey: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let n = conn.execute(
+            "DELETE FROM pending_nodes WHERE pubkey = ?1",
+            rusqlite::params![pubkey],
+        )?;
+        Ok(n > 0)
     }
 }
 

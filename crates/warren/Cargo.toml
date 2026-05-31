@@ -28,6 +28,8 @@ rustls = { version = "0.23", default-features = false, features = ["logging", "s
 rcgen = "0.13"
 sha2 = "0.10"
 hex = "0.4"
+# Node identity: ed25519 keypair, signed enrollment.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 
 # Persistence + admin surface.
 rusqlite = { version = "0.32", features = ["bundled"] }

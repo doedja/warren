@@ -55,7 +55,11 @@ async fn end_to_end_proxy_through_node() {
     tokio::spawn(async move {
         let _ = run_agent(RunArgs {
             hub: node_addr.to_string(),
-            token: "secret".into(),
+            token: Some("secret".into()),
+            key_file: Some(format!(
+                "{}/warren-e2e-proxy.key",
+                std::env::temp_dir().display()
+            )),
             name: "test-node".into(),
             tls: false,
             hub_fingerprint: None,
@@ -148,7 +152,11 @@ async fn rejects_bad_auth_and_allows_good() {
     tokio::spawn(async move {
         let _ = run_agent(RunArgs {
             hub: node_addr.to_string(),
-            token: "secret".into(),
+            token: Some("secret".into()),
+            key_file: Some(format!(
+                "{}/warren-e2e-auth.key",
+                std::env::temp_dir().display()
+            )),
             name: "auth-node".into(),
             tls: false,
             hub_fingerprint: None,

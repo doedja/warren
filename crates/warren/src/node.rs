@@ -23,6 +23,7 @@ use warren_proto::{
 };
 
 use crate::conn::Conn;
+use crate::identity::Identity;
 use crate::tls;
 use crate::wire::{read_msg, write_msg};
 
@@ -47,9 +48,12 @@ pub struct RunArgs {
     /// Hub node-facing address, host:port (e.g. 127.0.0.1:7000).
     #[arg(long)]
     pub hub: String,
-    /// Enrollment token.
+    /// Enrollment token (Mode B). Omit to request admin approval (Mode A).
     #[arg(long)]
-    pub token: String,
+    pub token: Option<String>,
+    /// File holding this node's ed25519 key (created on first run).
+    #[arg(long)]
+    pub key_file: Option<String>,
     /// Name this node shows up as in the hub.
     #[arg(long, default_value = "")]
     pub name: String,
@@ -86,12 +90,23 @@ pub async fn run_agent(args: RunArgs) -> Result<()> {
     } else {
         None
     };
+    let key_path = args.key_file.clone().unwrap_or_else(default_key_file);
+    let identity =
+        Identity::load_or_create(&key_path).with_context(|| format!("node key {key_path}"))?;
+    tracing::info!(code = %crate::identity::short_code(&identity.pubkey()), key = %key_path, "node identity ready");
     loop {
-        match connect_once(&args, &name, &connector).await {
+        match connect_once(&args, &name, &connector, &identity).await {
             Ok(()) => tracing::warn!("control connection closed; reconnecting in 3s"),
             Err(e) => tracing::warn!(error = %e, "control connection error; reconnecting in 3s"),
         }
         tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+}
+
+fn default_key_file() -> String {
+    match std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+        Ok(home) => format!("{home}/.warren/node.key"),
+        Err(_) => "warren-node.key".to_string(),
     }
 }
 
@@ -111,12 +126,24 @@ async fn dial_conn(addr: &str, connector: &Option<TlsConnector>) -> Result<Conn>
     }
 }
 
-async fn connect_once(args: &RunArgs, name: &str, connector: &Option<TlsConnector>) -> Result<()> {
+async fn connect_once(
+    args: &RunArgs,
+    name: &str,
+    connector: &Option<TlsConnector>,
+    identity: &Identity,
+) -> Result<()> {
     let mut conn = dial_conn(&args.hub, connector).await?;
 
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let hello = Hello {
         protocol_version: PROTOCOL_VERSION,
+        pubkey: identity.pubkey(),
         token: args.token.clone(),
+        timestamp,
+        signature: identity.sign_auth(timestamp),
         node_name: name.to_string(),
         platform: current_platform(),
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -127,6 +154,9 @@ async fn connect_once(args: &RunArgs, name: &str, connector: &Option<TlsConnecto
     match reply {
         HelloReply::Welcome { node_id } => {
             tracing::info!(node = %node_id.0, hub = %args.hub, "enrolled")
+        }
+        HelloReply::Pending { code } => {
+            anyhow::bail!("pending admin approval (code {code}); approve it in the hub dashboard")
         }
         HelloReply::Reject { reason } => anyhow::bail!("hub rejected node: {reason}"),
     }
@@ -230,9 +260,15 @@ fn node_run_argv(exe: &str, a: &RunArgs) -> Vec<String> {
         "run".into(),
         "--hub".into(),
         a.hub.clone(),
-        "--token".into(),
-        a.token.clone(),
     ];
+    if let Some(token) = &a.token {
+        v.push("--token".into());
+        v.push(token.clone());
+    }
+    if let Some(kf) = &a.key_file {
+        v.push("--key-file".into());
+        v.push(kf.clone());
+    }
     if !a.name.is_empty() {
         v.push("--name".into());
         v.push(a.name.clone());

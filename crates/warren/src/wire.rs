@@ -51,7 +51,10 @@ mod tests {
 
         let hello = warren_proto::Hello {
             protocol_version: warren_proto::PROTOCOL_VERSION,
-            token: "tok".into(),
+            pubkey: vec![1u8; 32],
+            token: Some("tok".into()),
+            timestamp: 1,
+            signature: vec![2u8; 64],
             node_name: "n".into(),
             platform: warren_proto::Platform::Linux,
             agent_version: "0.1.0".into(),

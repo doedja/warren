@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Html;
-use axum::routing::{delete, get};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use clap::Args;
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,7 @@ use tokio_rustls::TlsAcceptor;
 use warren_proto::{DataHello, Greeting, Hello, HelloReply, HubToNode, NodeId, NodeToHub};
 
 use crate::conn::Conn;
+use crate::identity;
 use crate::proxy;
 use crate::socks5;
 use crate::store::Store;
@@ -165,6 +166,13 @@ impl Hub {
             })
             .collect()
     }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Random lowercase-alnum token (32 chars).
@@ -310,17 +318,51 @@ async fn handle_node_conn(stream: TcpStream, hub: Arc<Hub>) -> Result<()> {
 }
 
 async fn handle_control(hello: Hello, mut conn: Conn, hub: Arc<Hub>) -> Result<()> {
-    if !hub.store.token_valid(&hello.token).unwrap_or(false) {
+    // 1. The node must own its key and present a fresh timestamp.
+    if !identity::verify_auth(&hello.pubkey, hello.timestamp, &hello.signature) {
         let _ = write_msg(
             &mut conn,
             &HelloReply::Reject {
-                reason: "bad token".into(),
+                reason: "bad signature".into(),
             },
         )
         .await;
         return Ok(());
     }
-    let node_id = NodeId(format!("{}-{}", hello.node_name, hub.next_conn_id()));
+    let skew = (unix_now() - hello.timestamp as i64).abs();
+    if skew > 120 {
+        let _ = write_msg(
+            &mut conn,
+            &HelloReply::Reject {
+                reason: "stale timestamp".into(),
+            },
+        )
+        .await;
+        return Ok(());
+    }
+
+    // 2. Enrollment: an already-approved key, or a valid token (auto-approve),
+    //    otherwise record as pending and ask for admin approval.
+    let pk_hex = identity::fingerprint(&hello.pubkey);
+    let code = identity::short_code(&hello.pubkey);
+    if !hub.store.is_node_approved(&pk_hex).unwrap_or(false) {
+        let by_token = hello
+            .token
+            .as_deref()
+            .map(|t| hub.store.token_valid(t).unwrap_or(false))
+            .unwrap_or(false);
+        if by_token {
+            let _ = hub.store.approve_node(&pk_hex, &hello.node_name);
+            tracing::info!(%code, name = %hello.node_name, "node approved via token");
+        } else {
+            let _ = hub.store.add_pending(&pk_hex, &hello.node_name, &code);
+            let _ = write_msg(&mut conn, &HelloReply::Pending { code: code.clone() }).await;
+            tracing::info!(%code, name = %hello.node_name, "node pending admin approval");
+            return Ok(());
+        }
+    }
+
+    let node_id = NodeId(format!("{}-{}", hello.node_name, code));
     write_msg(
         &mut conn,
         &HelloReply::Welcome {
@@ -606,6 +648,11 @@ async fn run_admin(listen: String, ctx: AdminCtx) -> Result<()> {
         .route("/api/tokens/:token", delete(api_delete_token))
         .route("/api/users", get(api_list_users).post(api_create_user))
         .route("/api/users/:username", delete(api_delete_user))
+        .route("/api/pending", get(api_list_pending))
+        .route("/api/pending/:pubkey/approve", post(api_approve_pending))
+        .route("/api/pending/:pubkey", delete(api_deny_pending))
+        .route("/api/node-keys", get(api_list_node_keys))
+        .route("/api/node-keys/:pubkey", delete(api_delete_node_key))
         .with_state(ctx);
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
@@ -703,5 +750,105 @@ async fn api_delete_user(
         return Err(StatusCode::UNAUTHORIZED);
     }
     ctx.hub.store.delete_user(&username).map_err(ise)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Serialize)]
+struct PendingInfo {
+    pubkey: String,
+    name: String,
+    code: String,
+    first_seen: i64,
+}
+
+#[derive(Serialize)]
+struct NodeKeyInfo {
+    pubkey: String,
+    name: String,
+    approved_at: i64,
+}
+
+async fn api_list_pending(
+    State(ctx): State<AdminCtx>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<PendingInfo>>, StatusCode> {
+    if !authed(&headers, &ctx.token) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let rows = ctx.hub.store.list_pending().map_err(ise)?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|(pubkey, name, code, first_seen)| PendingInfo {
+                pubkey,
+                name,
+                code,
+                first_seen,
+            })
+            .collect(),
+    ))
+}
+
+async fn api_approve_pending(
+    State(ctx): State<AdminCtx>,
+    headers: HeaderMap,
+    Path(pubkey): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    if !authed(&headers, &ctx.token) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    // Carry over the name from the pending entry if present.
+    let name = ctx
+        .hub
+        .store
+        .list_pending()
+        .map_err(ise)?
+        .into_iter()
+        .find(|(pk, ..)| pk == &pubkey)
+        .map(|(_, name, ..)| name)
+        .unwrap_or_else(|| "node".to_string());
+    ctx.hub.store.approve_node(&pubkey, &name).map_err(ise)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn api_deny_pending(
+    State(ctx): State<AdminCtx>,
+    headers: HeaderMap,
+    Path(pubkey): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    if !authed(&headers, &ctx.token) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    ctx.hub.store.delete_pending(&pubkey).map_err(ise)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn api_list_node_keys(
+    State(ctx): State<AdminCtx>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<NodeKeyInfo>>, StatusCode> {
+    if !authed(&headers, &ctx.token) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let rows = ctx.hub.store.list_nodes().map_err(ise)?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|(pubkey, name, approved_at)| NodeKeyInfo {
+                pubkey,
+                name,
+                approved_at,
+            })
+            .collect(),
+    ))
+}
+
+async fn api_delete_node_key(
+    State(ctx): State<AdminCtx>,
+    headers: HeaderMap,
+    Path(pubkey): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    if !authed(&headers, &ctx.token) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    ctx.hub.store.delete_node(&pubkey).map_err(ise)?;
     Ok(StatusCode::NO_CONTENT)
 }
