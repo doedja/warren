@@ -21,7 +21,7 @@ use axum::routing::{delete, get};
 use axum::{Json, Router};
 use clap::Args;
 use serde::{Deserialize, Serialize};
-use tokio::io::{copy_bidirectional, split};
+use tokio::io::{copy_bidirectional, split, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::{timeout, Duration};
@@ -394,10 +394,12 @@ fn host_fail_count(m: &StdMutex<HashMap<String, u32>>, host: &str) -> u32 {
     m.lock().unwrap().get(host).copied().unwrap_or(0)
 }
 
-#[derive(Clone, Copy)]
-enum Proto {
-    Http,
+/// What the client spoke, and (for plain HTTP) the rewritten request to send
+/// to the target once a data connection is open.
+enum Mode {
+    Connect,
     Socks5,
+    Http(Vec<u8>),
 }
 
 async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
@@ -411,18 +413,17 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
     let store = hub.store.clone();
     let verify = move |u: &str, p: &str| store.check_user(u, p).unwrap_or(false);
 
-    let (proto, host, port) = if peek[0] == 0x05 {
+    let (mode, host, port) = if peek[0] == 0x05 {
         let verify_opt: Option<&socks5::Verifier> = if need_auth { Some(&verify) } else { None };
         match socks5::negotiate(&mut client, verify_opt).await? {
-            Some((h, p)) => (Proto::Socks5, h, p),
+            Some((h, p)) => (Mode::Socks5, h, p),
             None => return Ok(()), // rejected, reply already sent
         }
     } else {
-        let req = proxy::read_connect_request(&mut client).await?;
+        let req = proxy::read_request(&mut client).await?;
         if need_auth {
             let ok = req
-                .authorization
-                .as_deref()
+                .authorization()
                 .and_then(proxy::parse_basic)
                 .map(|(u, p)| verify(&u, &p))
                 .unwrap_or(false);
@@ -431,12 +432,36 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
                 return Ok(());
             }
         }
-        (Proto::Http, req.host, req.port)
+        if req.method.eq_ignore_ascii_case("CONNECT") {
+            // target is host:port
+            match req.target.rsplit_once(':') {
+                Some((h, p)) => match p.parse::<u16>() {
+                    Ok(port) => (Mode::Connect, h.to_string(), port),
+                    Err(_) => {
+                        proxy::write_bad_gateway(&mut client).await?;
+                        return Ok(());
+                    }
+                },
+                None => {
+                    proxy::write_bad_gateway(&mut client).await?;
+                    return Ok(());
+                }
+            }
+        } else {
+            // plain HTTP: absolute-URI request, forwarded in origin form.
+            match proxy::forward_request(&req) {
+                Some((h, p, head)) => (Mode::Http(head), h, p),
+                None => {
+                    proxy::write_bad_gateway(&mut client).await?;
+                    return Ok(());
+                }
+            }
+        }
     };
 
     let nodes = hub.snapshot().await;
     if nodes.is_empty() {
-        reject(&mut client, proto).await?;
+        reject(&mut client, &mode).await?;
         return Ok(());
     }
 
@@ -478,7 +503,11 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
             Ok(Ok(mut data)) => {
                 fails.store(0, Ordering::Relaxed);
                 host_fails.lock().unwrap().remove(&host);
-                established(&mut client, proto).await?;
+                match &mode {
+                    Mode::Connect => proxy::write_established(&mut client).await?,
+                    Mode::Socks5 => socks5::write_reply(&mut client, socks5::REP_SUCCESS).await?,
+                    Mode::Http(head) => data.write_all(head).await?,
+                }
                 let _ = copy_bidirectional(&mut client, &mut data).await;
                 return Ok(());
             }
@@ -492,21 +521,14 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
         }
     }
 
-    reject(&mut client, proto).await?;
+    reject(&mut client, &mode).await?;
     Ok(())
 }
 
-async fn established(client: &mut TcpStream, proto: Proto) -> std::io::Result<()> {
-    match proto {
-        Proto::Http => proxy::write_established(client).await,
-        Proto::Socks5 => socks5::write_reply(client, socks5::REP_SUCCESS).await,
-    }
-}
-
-async fn reject(client: &mut TcpStream, proto: Proto) -> std::io::Result<()> {
-    match proto {
-        Proto::Http => proxy::write_bad_gateway(client).await,
-        Proto::Socks5 => socks5::write_reply(client, socks5::REP_GENERAL_FAILURE).await,
+async fn reject(client: &mut TcpStream, mode: &Mode) -> std::io::Result<()> {
+    match mode {
+        Mode::Connect | Mode::Http(_) => proxy::write_bad_gateway(client).await,
+        Mode::Socks5 => socks5::write_reply(client, socks5::REP_GENERAL_FAILURE).await,
     }
 }
 
