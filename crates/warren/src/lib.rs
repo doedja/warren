@@ -5,6 +5,7 @@
 
 #![allow(dead_code)]
 
+pub mod admin_ui;
 pub mod conn;
 pub mod hub;
 pub mod node;

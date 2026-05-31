@@ -14,7 +14,13 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use axum::extract::{Path, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::Html;
+use axum::routing::{delete, get};
+use axum::{Json, Router};
 use clap::Args;
+use serde::{Deserialize, Serialize};
 use tokio::io::{copy_bidirectional, split};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -61,6 +67,12 @@ pub struct HubArgs {
     /// Without it, a fresh cert is generated each boot.
     #[arg(long, env = "WARREN_TLS_CERT_DIR")]
     pub tls_cert_dir: Option<String>,
+    /// Serve the admin API + dashboard on this address (e.g. 127.0.0.1:9000).
+    #[arg(long, env = "WARREN_ADMIN_LISTEN")]
+    pub admin_listen: Option<String>,
+    /// Bearer token required by the admin API.
+    #[arg(long, env = "WARREN_ADMIN_TOKEN")]
+    pub admin_token: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -85,6 +97,8 @@ struct NodeEntry {
 pub struct HubConfig {
     pub store: Arc<Store>,
     pub tls: Option<TlsAcceptor>,
+    /// (listen addr, bearer token) for the admin API + dashboard.
+    pub admin: Option<(String, String)>,
 }
 
 struct Hub {
@@ -120,6 +134,33 @@ impl Hub {
     async fn take_pending(&self, id: u64) -> Option<oneshot::Sender<Conn>> {
         self.pending.lock().await.remove(&id)
     }
+    async fn list_node_info(&self) -> Vec<NodeInfo> {
+        self.nodes
+            .lock()
+            .await
+            .iter()
+            .map(|n| NodeInfo {
+                id: n.id.0.clone(),
+                fails: n.fails.load(Ordering::Relaxed),
+            })
+            .collect()
+    }
+}
+
+/// Random lowercase-alnum token (32 chars).
+fn gen_token() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    (0..32)
+        .map(|_| {
+            let c: u8 = rng.gen_range(0u8..36);
+            if c < 10 {
+                (b'0' + c) as char
+            } else {
+                (b'a' + (c - 10)) as char
+            }
+        })
+        .collect()
 }
 
 pub async fn run(args: HubArgs) -> Result<()> {
@@ -152,7 +193,13 @@ pub async fn run(args: HubArgs) -> Result<()> {
         store.add_user(u, p)?;
     }
 
-    let cfg = HubConfig { store, tls };
+    let admin = match (args.admin_listen, args.admin_token) {
+        (Some(l), Some(t)) => Some((l, t)),
+        (Some(_), None) => anyhow::bail!("--admin-listen requires --admin-token"),
+        _ => None,
+    };
+
+    let cfg = HubConfig { store, tls, admin };
     run_with_listeners(node_listener, proxy_listener, cfg).await
 }
 
@@ -161,9 +208,10 @@ pub async fn run_with_listeners(
     proxy_listener: TcpListener,
     cfg: HubConfig,
 ) -> Result<()> {
+    let HubConfig { store, tls, admin } = cfg;
     let hub = Arc::new(Hub {
-        store: cfg.store,
-        tls: cfg.tls,
+        store,
+        tls,
         nodes: Mutex::new(Vec::new()),
         pending: Mutex::new(HashMap::new()),
         rr: AtomicUsize::new(0),
@@ -175,8 +223,21 @@ pub async fn run_with_listeners(
         proxy_listen = ?proxy_listener.local_addr().ok(),
         auth = hub.store.auth_required().unwrap_or(false),
         tls = hub.tls.is_some(),
+        admin = admin.is_some(),
         "warren hub up"
     );
+
+    if let Some((listen, token)) = admin {
+        let ctx = AdminCtx {
+            hub: hub.clone(),
+            token,
+        };
+        tokio::spawn(async move {
+            if let Err(e) = run_admin(listen, ctx).await {
+                tracing::error!(error = %e, "admin server stopped");
+            }
+        });
+    }
 
     let h1 = hub.clone();
     let node_task = tokio::spawn(async move {
@@ -417,18 +478,7 @@ async fn reject(client: &mut TcpStream, proto: Proto) -> std::io::Result<()> {
 }
 
 pub async fn enroll(args: EnrollArgs) -> Result<()> {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    let token: String = (0..32)
-        .map(|_| {
-            let c: u8 = rng.gen_range(0u8..36);
-            if c < 10 {
-                (b'0' + c) as char
-            } else {
-                (b'a' + (c - 10)) as char
-            }
-        })
-        .collect();
+    let token = gen_token();
     let store = Store::open(&args.db).with_context(|| format!("open db {}", args.db))?;
     store.add_token(&token, &args.name)?;
     println!(
@@ -437,4 +487,165 @@ pub async fn enroll(args: EnrollArgs) -> Result<()> {
     );
     println!("join node:  warren node run --hub <hub-host:7000> --token {token}");
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Admin API + dashboard
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct AdminCtx {
+    hub: Arc<Hub>,
+    token: String,
+}
+
+#[derive(Serialize)]
+struct NodeInfo {
+    id: String,
+    fails: u32,
+}
+
+#[derive(Serialize)]
+struct TokenInfo {
+    token: String,
+    name: String,
+    created: i64,
+}
+
+#[derive(Deserialize)]
+struct NameReq {
+    name: String,
+}
+
+#[derive(Serialize)]
+struct TokenResp {
+    token: String,
+}
+
+#[derive(Deserialize)]
+struct UserReq {
+    username: String,
+    password: String,
+}
+
+fn authed(headers: &HeaderMap, token: &str) -> bool {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|t| t == token)
+        .unwrap_or(false)
+}
+
+fn ise<E: std::fmt::Display>(e: E) -> StatusCode {
+    tracing::warn!(error = %e, "admin api error");
+    StatusCode::INTERNAL_SERVER_ERROR
+}
+
+async fn run_admin(listen: String, ctx: AdminCtx) -> Result<()> {
+    let app = Router::new()
+        .route("/", get(|| async { Html(crate::admin_ui::DASHBOARD) }))
+        .route("/api/nodes", get(api_nodes))
+        .route("/api/tokens", get(api_list_tokens).post(api_create_token))
+        .route("/api/tokens/:token", delete(api_delete_token))
+        .route("/api/users", get(api_list_users).post(api_create_user))
+        .route("/api/users/:username", delete(api_delete_user))
+        .with_state(ctx);
+    let listener = tokio::net::TcpListener::bind(&listen)
+        .await
+        .with_context(|| format!("bind admin {listen}"))?;
+    tracing::info!(%listen, "admin API + dashboard up");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn api_nodes(
+    State(ctx): State<AdminCtx>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<NodeInfo>>, StatusCode> {
+    if !authed(&headers, &ctx.token) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(Json(ctx.hub.list_node_info().await))
+}
+
+async fn api_list_tokens(
+    State(ctx): State<AdminCtx>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<TokenInfo>>, StatusCode> {
+    if !authed(&headers, &ctx.token) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let rows = ctx.hub.store.list_tokens().map_err(ise)?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|(token, name, created)| TokenInfo {
+                token,
+                name,
+                created,
+            })
+            .collect(),
+    ))
+}
+
+async fn api_create_token(
+    State(ctx): State<AdminCtx>,
+    headers: HeaderMap,
+    Json(req): Json<NameReq>,
+) -> Result<Json<TokenResp>, StatusCode> {
+    if !authed(&headers, &ctx.token) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let token = gen_token();
+    ctx.hub.store.add_token(&token, &req.name).map_err(ise)?;
+    Ok(Json(TokenResp { token }))
+}
+
+async fn api_delete_token(
+    State(ctx): State<AdminCtx>,
+    headers: HeaderMap,
+    Path(token): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    if !authed(&headers, &ctx.token) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    ctx.hub.store.delete_token(&token).map_err(ise)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn api_list_users(
+    State(ctx): State<AdminCtx>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<String>>, StatusCode> {
+    if !authed(&headers, &ctx.token) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(Json(ctx.hub.store.list_users().map_err(ise)?))
+}
+
+async fn api_create_user(
+    State(ctx): State<AdminCtx>,
+    headers: HeaderMap,
+    Json(req): Json<UserReq>,
+) -> Result<StatusCode, StatusCode> {
+    if !authed(&headers, &ctx.token) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    ctx.hub
+        .store
+        .add_user(&req.username, &req.password)
+        .map_err(ise)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn api_delete_user(
+    State(ctx): State<AdminCtx>,
+    headers: HeaderMap,
+    Path(username): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    if !authed(&headers, &ctx.token) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    ctx.hub.store.delete_user(&username).map_err(ise)?;
+    Ok(StatusCode::NO_CONTENT)
 }

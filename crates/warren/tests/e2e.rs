@@ -42,7 +42,11 @@ async fn end_to_end_proxy_through_node() {
         let _ = run_with_listeners(node_l, proxy_l, {
             let store = std::sync::Arc::new(warren::store::Store::open(":memory:").unwrap());
             store.add_token("secret", "test").unwrap();
-            HubConfig { store, tls: None }
+            HubConfig {
+                store,
+                tls: None,
+                admin: None,
+            }
         })
         .await;
     });
@@ -133,7 +137,11 @@ async fn rejects_bad_auth_and_allows_good() {
             let store = std::sync::Arc::new(warren::store::Store::open(":memory:").unwrap());
             store.add_token("secret", "test").unwrap();
             store.add_user("u", "p").unwrap();
-            HubConfig { store, tls: None }
+            HubConfig {
+                store,
+                tls: None,
+                admin: None,
+            }
         })
         .await;
     });
