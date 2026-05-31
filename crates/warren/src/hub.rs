@@ -95,6 +95,10 @@ pub struct EnrollArgs {
 
 struct NodeEntry {
     id: NodeId,
+    /// Friendly device name (without the disambiguating code suffix). Clients
+    /// select a single device by putting this after a `+` in the proxy
+    /// username, e.g. `user+phone`.
+    name: String,
     tx: mpsc::UnboundedSender<HubToNode>,
     /// Consecutive dial failures (any target); reset to 0 on a successful dial.
     fails: Arc<AtomicU32>,
@@ -132,9 +136,14 @@ impl Hub {
     fn next_conn_id(&self) -> u64 {
         self.conn_seq.fetch_add(1, Ordering::Relaxed)
     }
-    #[allow(clippy::type_complexity)]
+    /// Snapshot of connected nodes. When `sel` is `Some(name)`, only nodes with
+    /// that exact device name are returned, so a client can route through one
+    /// specific device (and gets nothing, not a fallback, if it is offline).
+    // `map_or(true, ...)` keeps the MSRV at 1.74; `Option::is_none_or` is 1.82+.
+    #[allow(clippy::type_complexity, clippy::unnecessary_map_or)]
     async fn snapshot(
         &self,
+        sel: Option<&str>,
     ) -> Vec<(
         NodeId,
         mpsc::UnboundedSender<HubToNode>,
@@ -145,6 +154,7 @@ impl Hub {
             .lock()
             .await
             .iter()
+            .filter(|n| sel.map_or(true, |s| n.name == s))
             .map(|n| {
                 (
                     n.id.clone(),
@@ -174,6 +184,7 @@ impl Hub {
             .iter()
             .map(|n| NodeInfo {
                 id: n.id.0.clone(),
+                name: n.name.clone(),
                 fails: n.fails.load(Ordering::Relaxed),
             })
             .collect()
@@ -228,6 +239,13 @@ pub async fn run(args: HubArgs) -> Result<()> {
     let store = Arc::new(Store::open(&args.db).with_context(|| format!("open db {}", args.db))?);
     if let Some(tok) = &args.enroll_token {
         store.add_token(tok, "cli")?;
+    } else if store.list_tokens()?.is_empty() {
+        // No token supplied and none stored yet: mint one so a fresh hub is
+        // usable without inventing a secret. Printed once here and shown in the
+        // dashboard under Enrollment tokens. Rotate with `warren enroll`.
+        let tok = gen_token();
+        store.add_token(&tok, "auto")?;
+        println!("warren enroll token (use on your devices with --token): {tok}");
     }
     if let (Some(u), Some(p)) = (&args.proxy_user, &args.proxy_pass) {
         store.add_user(u, p)?;
@@ -404,6 +422,7 @@ async fn handle_control(hello: Hello, mut conn: Conn, hub: Arc<Hub>) -> Result<(
     let (tx, mut rx) = mpsc::unbounded_channel::<HubToNode>();
     hub.add_node(NodeEntry {
         id: node_id.clone(),
+        name: hello.node_name.clone(),
         tx: tx.clone(),
         fails: Arc::new(AtomicU32::new(0)),
         host_fails: Arc::new(StdMutex::new(HashMap::new())),
@@ -466,6 +485,16 @@ fn host_fail_count(m: &StdMutex<HashMap<String, u32>>, host: &str) -> u32 {
     m.lock().unwrap().get(host).copied().unwrap_or(0)
 }
 
+/// Split a proxy username into its base user and an optional device selector.
+/// `user+phone` -> ("user", Some("phone")); `user` -> ("user", None). A trailing
+/// or empty selector (`user+`) is treated as no selector.
+fn split_selector(user: &str) -> (&str, Option<String>) {
+    match user.split_once('+') {
+        Some((base, sel)) if !sel.is_empty() => (base, Some(sel.to_string())),
+        _ => (user, None),
+    }
+}
+
 /// What the client spoke, and (for plain HTTP) the rewritten request to send
 /// to the target once a data connection is open.
 enum Mode {
@@ -483,7 +512,17 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
 
     let need_auth = hub.store.auth_required().unwrap_or(false);
     let store = hub.store.clone();
-    let verify = move |u: &str, p: &str| store.check_user(u, p).unwrap_or(false);
+    // A proxy username of `user+device` routes through one specific device;
+    // `user` alone uses the whole pool. Auth runs inside the SOCKS5/HTTP paths,
+    // so capture any device selector there and read it back once the target is
+    // known. The password is checked against the base username only.
+    let selector: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+    let sel_cap = selector.clone();
+    let verify = move |u: &str, p: &str| {
+        let (base, sel) = split_selector(u);
+        *sel_cap.lock().unwrap() = sel;
+        store.check_user(base, p).unwrap_or(false)
+    };
 
     let (mode, host, port) = if peek[0] == 0x05 {
         let verify_opt: Option<&socks5::Verifier> = if need_auth { Some(&verify) } else { None };
@@ -531,8 +570,12 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
         }
     };
 
-    let nodes = hub.snapshot().await;
+    let selector = selector.lock().unwrap().take();
+    let nodes = hub.snapshot(selector.as_deref()).await;
     if nodes.is_empty() {
+        // Either no devices are connected, or a specific device was named
+        // (user+device) and it is not online. Reject rather than silently
+        // leaving from a different device than the client asked for.
         reject(&mut client, &mode).await?;
         return Ok(());
     }
@@ -629,6 +672,7 @@ struct AdminCtx {
 #[derive(Serialize)]
 struct NodeInfo {
     id: String,
+    name: String,
     fails: u32,
 }
 
@@ -937,4 +981,19 @@ async fn api_delete_node_key(
     }
     ctx.hub.store.delete_node(&pubkey).map_err(ise)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_selector;
+
+    #[test]
+    fn selector_parsing() {
+        assert_eq!(split_selector("me"), ("me", None));
+        assert_eq!(split_selector("me+phone"), ("me", Some("phone".into())));
+        // empty selector is ignored (no device pinned)
+        assert_eq!(split_selector("me+"), ("me+", None));
+        // only the first + splits; later ones are part of the device name
+        assert_eq!(split_selector("me+a+b"), ("me", Some("a+b".into())));
+    }
 }

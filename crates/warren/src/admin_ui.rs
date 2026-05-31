@@ -12,7 +12,9 @@ pub const DASHBOARD: &str = r###"<!doctype html>
   body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
   header { padding:16px 20px; border-bottom:1px solid var(--line); display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
   h1 { font-size:16px; margin:0 8px 0 0; }
-  h2 { font-size:13px; color:var(--mut); margin:0 0 10px; text-transform:uppercase; letter-spacing:.05em; }
+  h2 { font-size:13px; color:var(--mut); margin:0 0 4px; text-transform:uppercase; letter-spacing:.05em; }
+  .desc { color:var(--mut); font-size:12px; margin:0 0 12px; line-height:1.45; max-width:62ch; }
+  .hint { color:var(--acc); cursor:help; border-bottom:1px dotted var(--acc); }
   main { padding:20px; display:grid; gap:18px; max-width:920px; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:16px; }
   input { background:#0b0d10; border:1px solid var(--line); color:var(--fg); padding:6px 8px; border-radius:5px; font:inherit; }
@@ -44,22 +46,27 @@ pub const DASHBOARD: &str = r###"<!doctype html>
 <main>
   <section class="card">
     <h2>Connect</h2>
+    <p class="desc">Your hub's addresses, plus ready-to-run commands. Copy a command, fill in a token or password, and run it on a device or client. The fingerprint is your hub's public ID: devices pin it to be sure they reached you, so it is safe to share.</p>
     <div id="connect">loading...</div>
   </section>
   <section class="card">
     <h2>Pending approval</h2>
+    <p class="desc">Devices that connected without an enrollment token. Approve one to let it serve traffic, or deny it. Match the short code against the device to be sure it is yours.</p>
     <table><thead><tr><th>Code</th><th>Name</th><th>Key</th><th></th></tr></thead><tbody id="pending"></tbody></table>
   </section>
   <section class="card">
     <h2>Live nodes</h2>
-    <table><thead><tr><th>Node</th><th>Fails</th></tr></thead><tbody id="nodes"></tbody></table>
+    <p class="desc">Devices connected right now and ready to carry requests. Fails counts recent dial errors; the hub skips a device that keeps failing. Copy a device's command to send traffic out only through that one device.</p>
+    <table><thead><tr><th>Node</th><th>Fails</th><th>Use just this device</th></tr></thead><tbody id="nodes"></tbody></table>
   </section>
   <section class="card">
     <h2>Approved keys</h2>
+    <p class="desc">Device identities the hub trusts (each device made its own key on first run). Revoke one to kick that device out of the pool for good.</p>
     <table><thead><tr><th>Name</th><th>Key</th><th>Approved</th><th></th></tr></thead><tbody id="keys"></tbody></table>
   </section>
   <section class="card">
     <h2>Enrollment tokens</h2>
+    <p class="desc">A secret that lets a new device join automatically (no manual approval). Hand it to a device with --token. Delete it to stop new devices joining with it. <span class="hint" title="On the hub, run:  warren enroll --name device&#10;That mints a fresh token. Hand it out, then delete the old token here to cut off any device that still has the old one.">How do I rotate it?</span></p>
     <div class="row">
       <input id="tname" placeholder="node name">
       <button onclick="addToken()">Create token</button>
@@ -68,6 +75,7 @@ pub const DASHBOARD: &str = r###"<!doctype html>
   </section>
   <section class="card">
     <h2>Proxy users</h2>
+    <p class="desc">Logins for apps that send traffic through the pool: the proxy username and password you put in curl, your browser, or a scraper.</p>
     <div class="row">
       <input id="uname" placeholder="username">
       <input id="upass" type="password" placeholder="password">
@@ -111,11 +119,12 @@ async function loadInfo(){
   const proxy = i.proxy_addr || '<hub-host>:18080';
   const puser = i.proxy_user || 'USER';
   let html = kv('Node link', node) + kv('Proxy', proxy);
-  if (i.fingerprint) html += kv('Fingerprint', i.fingerprint);
+  if (i.fingerprint) html += kv('Fingerprint (hub ID)', i.fingerprint);
   html += cmd('Add a node (installer, fill in a token from below)', installCmd('<ENROLL_TOKEN>'));
   html += cmd('Add a node (existing binary)', `warren node run --hub ${node} --token <ENROLL_TOKEN>${tlsFlags()}`);
-  html += cmd('Use proxy (HTTPS / CONNECT)', `curl -x http://${puser}:<PASSWORD>@${proxy} https://api.ipify.org`);
-  html += cmd('Use proxy (SOCKS5)', `curl -x socks5h://${puser}:<PASSWORD>@${proxy} https://api.ipify.org`);
+  html += cmd('Use the pool (HTTPS / CONNECT, auto-picks a device)', `curl -x http://${puser}:<PASSWORD>@${proxy} https://api.ipify.org`);
+  html += cmd('Use the pool (SOCKS5)', `curl -x socks5h://${puser}:<PASSWORD>@${proxy} https://api.ipify.org`);
+  html += cmd('Use ONE device (put its name after +, see Live nodes)', `curl -x http://${puser}+DEVICE:<PASSWORD>@${proxy} https://api.ipify.org`);
   document.getElementById('connect').innerHTML = html;
 }
 async function loadPending(){
@@ -130,9 +139,15 @@ async function approve(pk){ await api('POST','/api/pending/'+encodeURIComponent(
 async function denyNode(pk){ await api('DELETE','/api/pending/'+encodeURIComponent(pk)); loadPending(); }
 async function loadNodes(){
   const rows = await api('GET','/api/nodes');
-  document.getElementById('nodes').innerHTML = rows.map(n =>
-    `<tr><td>${esc(n.id)}</td><td>${n.fails}</td></tr>`).join('') || '<tr><td colspan=2>no nodes</td></tr>';
+  const puser = INFO.proxy_user || 'USER';
+  const proxy = INFO.proxy_addr || '<hub-host>:18080';
+  document.getElementById('nodes').innerHTML = rows.map(n => {
+    const c = `curl -x http://${puser}+${n.name}:<PASSWORD>@${proxy} https://api.ipify.org`;
+    return `<tr><td>${esc(n.id)}</td><td>${n.fails}</td>`+
+      `<td><button class="ghost" onclick='copyText(${JSON.stringify(c)})'>copy proxy cmd</button></td></tr>`;
+  }).join('') || '<tr><td colspan=3>no nodes</td></tr>';
 }
+function copyText(t){ navigator.clipboard.writeText(t); setStatus('proxy command copied'); }
 async function loadKeys(){
   const rows = await api('GET','/api/node-keys');
   document.getElementById('keys').innerHTML = rows.map(k =>

@@ -188,6 +188,80 @@ async fn rejects_bad_auth_and_allows_good() {
     panic!("authorized request never succeeded");
 }
 
+#[tokio::test]
+async fn routes_to_named_device_and_rejects_unknown() {
+    // Target echo server.
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_addr = target.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = target.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4];
+                if s.read_exact(&mut buf).await.is_ok() {
+                    let _ = s.write_all(&buf).await;
+                    let _ = s.flush().await;
+                }
+            });
+        }
+    });
+
+    // Hub requiring Basic auth, with one device named "exit1".
+    let node_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let node_addr = node_l.local_addr().unwrap();
+    let proxy_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_l.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = run_with_listeners(node_l, proxy_l, {
+            let store = std::sync::Arc::new(warren::store::Store::open(":memory:").unwrap());
+            store.add_token("secret", "test").unwrap();
+            store.add_user("u", "p").unwrap();
+            HubConfig {
+                store,
+                tls: None,
+                admin: None,
+                public_node_addr: None,
+                public_proxy_addr: None,
+                fingerprint: None,
+            }
+        })
+        .await;
+    });
+    tokio::spawn(async move {
+        let _ = run_agent(RunArgs {
+            hub: node_addr.to_string(),
+            token: Some("secret".into()),
+            key_file: Some(format!("{}/warren-e2e-named.key", std::env::temp_dir().display())),
+            name: "exit1".into(),
+            tls: false,
+            hub_fingerprint: None,
+            insecure: false,
+        })
+        .await;
+    });
+
+    // Once the named device is reachable via `u+exit1`, the pin works.
+    let mut up = false;
+    for _ in 0..50 {
+        if let Ok((200, true)) = proxy_attempt(proxy_addr, target_addr, Some(("u+exit1", "p"))).await
+        {
+            up = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(up, "request pinned to the named device never succeeded");
+
+    // A device that does not exist is rejected (502), never silently served by
+    // another device.
+    let (status, _) = proxy_attempt(proxy_addr, target_addr, Some(("u+ghost", "p")))
+        .await
+        .expect("attempt");
+    assert_eq!(status, 502, "unknown device name must not fall back to the pool");
+}
+
 /// Returns (http_status, echo_ok). echo_ok is only meaningful on 200.
 async fn proxy_attempt(
     proxy_addr: SocketAddr,

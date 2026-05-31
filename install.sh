@@ -8,6 +8,17 @@ set -e
 
 REPO="doedja/warren"
 
+# Clean uninstall: stop the service, remove the key, remove the binary.
+if [ "$1" = "--uninstall" ] || [ "$1" = "uninstall" ]; then
+  if command -v warren >/dev/null 2>&1; then
+    warren node uninstall || true
+  else
+    echo "warren: binary not on PATH; nothing to run. Remove it manually if present." >&2
+  fi
+  echo "warren: uninstalled." >&2
+  exit 0
+fi
+
 os="$(uname -s)"
 arch="$(uname -m)"
 

@@ -245,20 +245,24 @@
     <h2>Get started<span class="b">_</span></h2>
     <p class="sub">One command on a server, one paste per device. The dashboard writes the device line for you, so you never assemble flags by hand.</p>
 
-    <p class="sub" style="margin:14px 0 4px"><span class="stepnum">01</span>start the hub, on any always-on host</p>
+    <p class="sub" style="margin:14px 0 4px"><span class="stepnum">01</span>on a server: get warren and start the hub (one paste)</p>
     <div class="code"><button class="copy" onclick="cp(this)">COPY</button>
-<pre>warren hub --enroll-token SECRET --proxy-user me --proxy-pass pw</pre></div>
+<pre>curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh && \
+  warren hub --proxy-user me --proxy-pass YOURPASSWORD</pre></div>
+    <p class="sub" style="margin:6px 0 0;font-size:18px">The hub mints a join token and prints it. No secret to invent.</p>
 
     <p class="sub" style="margin:16px 0 4px"><span class="stepnum">02</span>join a device you own, one line</p>
     <div class="code"><button class="copy" onclick="cp(this)">COPY</button>
 <pre>curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh -s -- \
-  --hub SERVER:7000 --token SECRET</pre></div>
+  --hub SERVER:7000 --token JOINKEY</pre></div>
+    <p class="sub" style="margin:6px 0 0;font-size:18px">JOINKEY is the token the hub printed (or copy the whole line from the dashboard).</p>
 
     <p class="sub" style="margin:16px 0 4px"><span class="stepnum">03</span>send traffic through your pool</p>
     <div class="code"><button class="copy" onclick="cp(this)">COPY</button>
-<pre>curl -x http://me:pw@SERVER:8000 https://api.ipify.org   <span class="cmt"># prints a device IP</span></pre></div>
+<pre>curl -x http://me:YOURPASSWORD@SERVER:8000 https://api.ipify.org   <span class="cmt"># a device IP</span>
+curl -x http://me+phone:YOURPASSWORD@SERVER:8000 https://api.ipify.org  <span class="cmt"># just the "phone" device</span></pre></div>
 
-    <p class="sub" style="margin-top:20px">On Windows, run <code>install.ps1</code> instead. Hub on the public internet? Add <code>--tls</code> and the device pins it, the dashboard hands you the fingerprint. Full docs and prebuilt binaries on <a href="https://github.com/doedja/warren" style="color:var(--amber)">GitHub</a>.</p>
+    <p class="sub" style="margin-top:20px">Plain user picks any healthy device; <code>user+name</code> goes out one specific device. On Windows, run <code>install.ps1</code>. Hub on the public internet? Add <code>--tls</code>; the dashboard hands you the fingerprint. Full docs and prebuilt binaries on <a href="https://github.com/doedja/warren" style="color:var(--amber)">GitHub</a>.</p>
   </section>
 </div>
 

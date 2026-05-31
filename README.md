@@ -22,24 +22,28 @@ and the node.
 > A warren is a network of connected burrows. Each device digs one burrow out to
 > the hub; the hub is the warren your apps enter through.
 
-## The whole thing in three lines
+## The whole setup
 
 ```bash
-# 1. on a server, once: start the hub
-warren hub --enroll-token SECRET --proxy-user me --proxy-pass pw
+# 1. on a server, once: install warren and start the hub (it prints a join token)
+curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh && \
+  warren hub --proxy-user me --proxy-pass YOURPASSWORD
 
-# 2. on each device you own: join the pool (one line)
+# 2. on each device you own: join the pool (JOINKEY = the token the hub printed)
 curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh -s -- \
-  --hub SERVER:7000 --token SECRET
+  --hub SERVER:7000 --token JOINKEY
 
 # 3. from anywhere: send traffic through your pool
-curl -x http://me:pw@SERVER:8000 https://api.ipify.org   # prints a device's home IP
+curl -x http://me:YOURPASSWORD@SERVER:8000 https://api.ipify.org        # a device's home IP
+curl -x http://me+phone:YOURPASSWORD@SERVER:8000 https://api.ipify.org  # only the "phone" device
 ```
 
-That is the whole setup. No VPN to mesh, no proxy to configure on each device, no
-rotator to bolt on. Add more devices and the hub spreads requests across them and
-skips any that drop. And you do not have to type that device line by hand: the
-dashboard prints it for you with the address and token already filled in.
+That is everything. No secret to invent (the hub mints the join token and prints
+it), no VPN to mesh, no proxy to configure on each device, no rotator to bolt on.
+Add more devices and the hub spreads requests across them and skips any that drop.
+A plain username uses the whole pool; `user+name` sends traffic out one named
+device, like picking a single exit node. And you do not have to type the device
+line by hand: the dashboard prints it for you with the address and token filled in.
 
 ## Why one binary
 
@@ -81,6 +85,8 @@ approval, your proxy users, and enrollment tokens, each labeled with what it doe
 ## What you get
 
 - One proxy endpoint for a pool of your own devices, with automatic failover.
+- **Pick the pool or one device.** `user:pass` auto-picks a healthy device;
+  `user+name:pass` sends traffic out one named device, like an exit node.
 - **HTTP CONNECT, SOCKS5, and plain HTTP**, all on the same port, with auth.
 - A **live web dashboard** to add devices, approve them, and copy install commands.
 - **Encrypted device link** (opt-in TLS; the device pins the hub's key).
@@ -102,8 +108,15 @@ arguments to just drop in the binary.
     -Hub SERVER:7000 -Token SECRET
 ```
 
-To remove a device: `warren node uninstall` (or `install.ps1 -Uninstall`). No
-prebuilt binary for your arch? Build it:
+**Clean uninstall** (stops the service, deletes the node key, removes the binary):
+
+```bash
+warren node uninstall                                                    # if warren is on PATH
+curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh -s -- --uninstall
+```
+
+On Windows: `install.ps1 -Uninstall`. Revoke the device's key in the dashboard too
+if you want the hub to forget it. No prebuilt binary for your arch? Build it:
 `cargo install --git https://github.com/doedja/warren warren`.
 
 ## Running the hub on the public internet
@@ -149,14 +162,52 @@ Mount a volume at `/data` (it holds the TLS cert and the state file) and set
   retries another if one fails. If no device can serve, it errors out; it never
   quietly falls back to your real IP.
 
+## Commands
+
+One binary, three subcommands. Run any with `--help` for the full list.
+
+**`warren hub`** runs the control plane and the client-facing proxy.
+
+| flag | default | what it does |
+|------|---------|--------------|
+| `--listen` | `0.0.0.0:7000` | address devices dial in on (control + data) |
+| `--proxy-listen` | `0.0.0.0:8000` | address apps send proxy traffic to |
+| `--enroll-token` | auto-minted | join secret for devices; if omitted, one is generated and printed on first run |
+| `--proxy-user` / `--proxy-pass` | none | seed a proxy login (clients auth with these) |
+| `--admin-listen` / `--admin-token` | off | serve the dashboard; log in with any username + the token |
+| `--tls` | off | encrypt the device link; prints a fingerprint devices pin |
+| `--tls-cert-dir` | none | keep the TLS cert across restarts (so the fingerprint is stable) |
+| `--db` | `warren.db` | SQLite file (tokens + proxy users + device keys) |
+| `--public-node-addr` / `--public-proxy-addr` | none | addresses shown in the dashboard's commands |
+
+Every flag also reads an env var (`WARREN_ENROLL_TOKEN`, `WARREN_PROXY_USER`,
+`WARREN_PROXY_PASS`, `WARREN_ADMIN_LISTEN`, `WARREN_ADMIN_TOKEN`, `WARREN_DB`, ...),
+which is how the container image is configured.
+
+**`warren node run --hub HOST:7000`** runs the agent on a device.
+
+| flag | what it does |
+|------|--------------|
+| `--token` | join automatically (Mode B); omit to wait for dashboard approval (Mode A) |
+| `--name` | the device's name in the pool (defaults to its hostname); this is the name used in `user+name` |
+| `--tls` `--hub-fingerprint FP` | use TLS and pin the hub (required if the hub uses `--tls`) |
+| `--key-file` | where the device keeps its identity key (default `~/.warren/node.key`) |
+
+**`warren node install ...`** takes the same flags as `node run` and registers a
+boot service (systemd / launchd / Windows task) so the device rejoins on reboot.
+**`warren node uninstall`** does a clean removal: stops the service, deletes the
+key, removes the binary.
+
+**`warren enroll --name device`** (on the hub) mints a fresh enrollment token and
+prints it. Use it to rotate: mint a new one, hand it out, then delete the old
+token in the dashboard.
+
 ## Build from source
 
 ```bash
 cargo build --release   # needs rustup, stable >= 1.74; binary at target/release/warren
 cargo test              # unit + end-to-end tests
 ```
-
-Design notes and the wire protocol are in [`SPEC.md`](SPEC.md).
 
 ## License
 

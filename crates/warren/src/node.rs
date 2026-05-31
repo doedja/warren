@@ -413,7 +413,35 @@ async fn uninstall_service() -> Result<()> {
         }
         _ => println!("nothing to uninstall on this platform"),
     }
+    remove_node_state();
     Ok(())
+}
+
+/// Leave the device clean after the service is gone: delete the node identity
+/// (and its dir if now empty), and best-effort remove the installed binary.
+fn remove_node_state() {
+    let key = default_key_file();
+    if std::fs::remove_file(&key).is_ok() {
+        println!("removed node key: {key}");
+    }
+    if let Some(dir) = std::path::Path::new(&key).parent() {
+        // Only removes ~/.warren when it is empty; harmless otherwise.
+        let _ = std::fs::remove_dir(dir);
+    }
+    match std::env::current_exe() {
+        // A running .exe cannot delete itself on Windows; the PowerShell
+        // uninstaller removes the install dir, so just point at it here.
+        Ok(exe) if cfg!(windows) => println!("remove the binary to finish: {}", exe.display()),
+        // On Unix, unlinking the running binary is fine.
+        Ok(exe) => {
+            if std::fs::remove_file(&exe).is_ok() {
+                println!("removed binary: {}", exe.display());
+            } else {
+                println!("binary left at {} (remove it to finish)", exe.display());
+            }
+        }
+        Err(_) => {}
+    }
 }
 
 fn hostname() -> String {
