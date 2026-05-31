@@ -303,15 +303,41 @@ async fn install_service(args: RunArgs) -> Result<()> {
     match current_platform() {
         Platform::Linux => install_systemd(&argv),
         Platform::MacOs => install_launchd(&argv),
+        Platform::Windows => install_windows(&argv),
         _ => {
             println!(
-                "Automatic install supports Linux (systemd) and macOS (launchd).\n\
-                 On Windows, run this via a Scheduled Task or NSSM:\n  {}",
+                "Automatic install is not supported on this platform. Run manually:\n  {}",
                 argv.join(" ")
             );
             Ok(())
         }
     }
+}
+
+/// Windows: a Scheduled Task that runs the node at startup as SYSTEM.
+fn install_windows(argv: &[String]) -> Result<()> {
+    // /TR takes one string; quote the exe path, append the rest.
+    let tr = format!("\"{}\" {}", argv[0], argv[1..].join(" "));
+    run_cmd(
+        "schtasks",
+        &[
+            "/Create",
+            "/TN",
+            "warren-node",
+            "/TR",
+            tr.as_str(),
+            "/SC",
+            "ONSTART",
+            "/RU",
+            "SYSTEM",
+            "/RL",
+            "HIGHEST",
+            "/F",
+        ],
+    )?;
+    let _ = run_cmd("schtasks", &["/Run", "/TN", "warren-node"]);
+    println!("installed Windows scheduled task 'warren-node' (runs at startup)");
+    Ok(())
 }
 
 fn install_systemd(argv: &[String]) -> Result<()> {
@@ -379,6 +405,11 @@ async fn uninstall_service() -> Result<()> {
             let _ = run_cmd("launchctl", &["unload", "-w", &plist_path]);
             std::fs::remove_file(&plist_path).ok();
             println!("removed launchd agent: {plist_path}");
+        }
+        Platform::Windows => {
+            let _ = run_cmd("schtasks", &["/End", "/TN", "warren-node"]);
+            run_cmd("schtasks", &["/Delete", "/TN", "warren-node", "/F"])?;
+            println!("removed Windows scheduled task: warren-node");
         }
         _ => println!("nothing to uninstall on this platform"),
     }

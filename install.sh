@@ -11,19 +11,29 @@ REPO="doedja/warren"
 os="$(uname -s)"
 arch="$(uname -m)"
 
-if [ "$os" != "Linux" ]; then
-  echo "warren: only Linux x86_64/arm64 release binaries are published." >&2
-  echo "On $os, build from source: cargo build --release." >&2
+fallback() {
+  echo "warren: no prebuilt binary for $os/$arch." >&2
+  echo "On Windows, use install.ps1. Otherwise build from source:" >&2
+  echo "  cargo install --git https://github.com/$REPO warren" >&2
   exit 1
-fi
+}
 
-case "$arch" in
-  x86_64) target="x86_64-unknown-linux-musl" ;;
-  aarch64 | arm64) target="aarch64-unknown-linux-musl" ;;
-  *)
-    echo "warren: unsupported arch '$arch'. Build from source." >&2
-    exit 1
+case "$os" in
+  Linux)
+    case "$arch" in
+      x86_64) target="x86_64-unknown-linux-musl" ;;
+      aarch64 | arm64) target="aarch64-unknown-linux-musl" ;;
+      *) fallback ;;
+    esac
     ;;
+  Darwin)
+    case "$arch" in
+      x86_64) target="x86_64-apple-darwin" ;;
+      arm64 | aarch64) target="aarch64-apple-darwin" ;;
+      *) fallback ;;
+    esac
+    ;;
+  *) fallback ;;
 esac
 
 url="https://github.com/$REPO/releases/latest/download/warren-$target.tar.gz"
