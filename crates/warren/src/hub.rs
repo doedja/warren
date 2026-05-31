@@ -75,6 +75,12 @@ pub struct HubArgs {
     /// Bearer token required by the admin API.
     #[arg(long, env = "WARREN_ADMIN_TOKEN")]
     pub admin_token: Option<String>,
+    /// Public address nodes dial, shown in the dashboard (e.g. 1.2.3.4:7000).
+    #[arg(long, env = "WARREN_PUBLIC_NODE_ADDR")]
+    pub public_node_addr: Option<String>,
+    /// Public proxy address, shown in the dashboard (e.g. 1.2.3.4:18080).
+    #[arg(long, env = "WARREN_PUBLIC_PROXY_ADDR")]
+    pub public_proxy_addr: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -105,11 +111,17 @@ pub struct HubConfig {
     pub tls: Option<TlsAcceptor>,
     /// (listen addr, bearer token) for the admin API + dashboard.
     pub admin: Option<(String, String)>,
+    pub public_node_addr: Option<String>,
+    pub public_proxy_addr: Option<String>,
+    pub fingerprint: Option<String>,
 }
 
 struct Hub {
     store: Arc<Store>,
     tls: Option<TlsAcceptor>,
+    public_node_addr: Option<String>,
+    public_proxy_addr: Option<String>,
+    fingerprint: Option<String>,
     nodes: Mutex<Vec<NodeEntry>>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Conn>>>,
     rr: AtomicUsize,
@@ -199,18 +211,18 @@ pub async fn run(args: HubArgs) -> Result<()> {
         .await
         .with_context(|| format!("bind proxy listener {}", args.proxy_listen))?;
 
-    let tls = if args.tls {
-        let (acceptor, fingerprint) = match &args.tls_cert_dir {
+    let (tls, fingerprint) = if args.tls {
+        let (acceptor, fp) = match &args.tls_cert_dir {
             Some(dir) => tls::server_acceptor_from_dir(dir)?,
             None => tls::server_acceptor()?,
         };
-        println!("warren hub TLS fingerprint: {fingerprint}");
-        tracing::info!(%fingerprint,
+        println!("warren hub TLS fingerprint: {fp}");
+        tracing::info!(fingerprint = %fp,
             "TLS enabled on node link; join nodes with --tls --hub-fingerprint <fingerprint>");
-        Some(acceptor)
+        (Some(acceptor), Some(fp))
     } else {
         tracing::warn!("node link is PLAINTEXT (no --tls); use only on localhost or a tailnet");
-        None
+        (None, None)
     };
 
     let store = Arc::new(Store::open(&args.db).with_context(|| format!("open db {}", args.db))?);
@@ -227,7 +239,14 @@ pub async fn run(args: HubArgs) -> Result<()> {
         _ => None,
     };
 
-    let cfg = HubConfig { store, tls, admin };
+    let cfg = HubConfig {
+        store,
+        tls,
+        admin,
+        public_node_addr: args.public_node_addr,
+        public_proxy_addr: args.public_proxy_addr,
+        fingerprint,
+    };
     run_with_listeners(node_listener, proxy_listener, cfg).await
 }
 
@@ -236,10 +255,20 @@ pub async fn run_with_listeners(
     proxy_listener: TcpListener,
     cfg: HubConfig,
 ) -> Result<()> {
-    let HubConfig { store, tls, admin } = cfg;
+    let HubConfig {
+        store,
+        tls,
+        admin,
+        public_node_addr,
+        public_proxy_addr,
+        fingerprint,
+    } = cfg;
     let hub = Arc::new(Hub {
         store,
         tls,
+        public_node_addr,
+        public_proxy_addr,
+        fingerprint,
         nodes: Mutex::new(Vec::new()),
         pending: Mutex::new(HashMap::new()),
         rr: AtomicUsize::new(0),
@@ -666,6 +695,7 @@ fn ise<E: std::fmt::Display>(e: E) -> StatusCode {
 async fn run_admin(listen: String, ctx: AdminCtx) -> Result<()> {
     let app = Router::new()
         .route("/", get(dashboard))
+        .route("/api/info", get(api_info))
         .route("/api/nodes", get(api_nodes))
         .route("/api/tokens", get(api_list_tokens).post(api_create_token))
         .route("/api/tokens/:token", delete(api_delete_token))
@@ -683,6 +713,39 @@ async fn run_admin(listen: String, ctx: AdminCtx) -> Result<()> {
     tracing::info!(%listen, "admin API + dashboard up");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[derive(Serialize)]
+struct InfoJson {
+    node_addr: Option<String>,
+    proxy_addr: Option<String>,
+    fingerprint: Option<String>,
+    tls: bool,
+    proxy_user: Option<String>,
+    install_url: String,
+}
+
+async fn api_info(
+    State(ctx): State<AdminCtx>,
+    headers: HeaderMap,
+) -> Result<Json<InfoJson>, StatusCode> {
+    if !authed(&headers, &ctx.token) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let proxy_user = ctx
+        .hub
+        .store
+        .list_users()
+        .ok()
+        .and_then(|u| u.into_iter().next());
+    Ok(Json(InfoJson {
+        node_addr: ctx.hub.public_node_addr.clone(),
+        proxy_addr: ctx.hub.public_proxy_addr.clone(),
+        fingerprint: ctx.hub.fingerprint.clone(),
+        tls: ctx.hub.tls.is_some(),
+        proxy_user,
+        install_url: "https://raw.githubusercontent.com/doedja/warren/main/install.sh".to_string(),
+    }))
 }
 
 async fn api_nodes(

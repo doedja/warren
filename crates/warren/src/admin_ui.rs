@@ -1,4 +1,4 @@
-//! Static HTML for the hub admin dashboard, served at `/`.
+//! Static HTML for the hub admin dashboard, served at `/` (behind Basic auth).
 
 pub const DASHBOARD: &str = r###"<!doctype html>
 <html lang="en">
@@ -7,32 +7,45 @@ pub const DASHBOARD: &str = r###"<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>warren admin</title>
 <style>
-  :root { --bg:#0d0f12; --card:#161a20; --line:#262c36; --fg:#e6e9ef; --mut:#8a93a3; --acc:#5fa8ff; }
+  :root { --bg:#0d0f12; --card:#161a20; --line:#262c36; --fg:#e6e9ef; --mut:#8a93a3; --acc:#5fa8ff; --ok:#46c46e; }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
-  header { padding:16px 20px; border-bottom:1px solid var(--line); display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
-  h1 { font-size:16px; margin:0 12px 0 0; }
+  header { padding:16px 20px; border-bottom:1px solid var(--line); display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+  h1 { font-size:16px; margin:0 8px 0 0; }
   h2 { font-size:13px; color:var(--mut); margin:0 0 10px; text-transform:uppercase; letter-spacing:.05em; }
-  main { padding:20px; display:grid; gap:18px; max-width:900px; }
+  main { padding:20px; display:grid; gap:18px; max-width:920px; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:16px; }
   input { background:#0b0d10; border:1px solid var(--line); color:var(--fg); padding:6px 8px; border-radius:5px; font:inherit; }
   button { background:var(--acc); border:0; color:#06121f; padding:6px 12px; border-radius:5px; font:inherit; cursor:pointer; }
   button.ghost { background:transparent; color:var(--mut); border:1px solid var(--line); }
   table { width:100%; border-collapse:collapse; margin-top:10px; }
-  th,td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); font-size:13px; }
+  th,td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); font-size:13px; vertical-align:top; }
   th { color:var(--mut); font-weight:600; }
   .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
   code { color:var(--acc); word-break:break-all; }
   #status { color:var(--mut); margin-left:auto; }
+  .live { color:var(--ok); font-size:11px; border:1px solid var(--line); border-radius:10px; padding:1px 8px; }
+  .kv { display:flex; gap:10px; padding:3px 0; }
+  .kv b { color:var(--mut); min-width:110px; font-weight:600; }
+  .cmd { margin:10px 0; }
+  .cmdlabel { color:var(--mut); font-size:12px; margin-bottom:4px; }
+  .cmdrow { display:flex; gap:8px; align-items:flex-start; background:#0b0d10; border:1px solid var(--line); border-radius:6px; padding:8px 10px; }
+  .cmdrow code { flex:1; white-space:pre-wrap; }
+  .cmdrow button { flex:0 0 auto; }
 </style>
 </head>
 <body>
 <header>
   <h1>warren admin</h1>
+  <span id="live" class="live">live</span>
   <button class="ghost" onclick="loadAll()">Refresh</button>
   <span id="status"></span>
 </header>
 <main>
+  <section class="card">
+    <h2>Connect</h2>
+    <div id="connect">loading...</div>
+  </section>
   <section class="card">
     <h2>Pending approval</h2>
     <table><thead><tr><th>Code</th><th>Name</th><th>Key</th><th></th></tr></thead><tbody id="pending"></tbody></table>
@@ -64,55 +77,47 @@ pub const DASHBOARD: &str = r###"<!doctype html>
   </section>
 </main>
 <script>
+let INFO = {};
 function setStatus(m){ document.getElementById('status').textContent = m; }
 async function api(method, path, body){
-  // The page is behind HTTP Basic auth, so the browser attaches credentials
-  // to these same-origin requests automatically.
+  // Page is behind HTTP Basic auth; the browser attaches credentials to these
+  // same-origin requests automatically.
   const opt = { method, headers: {} };
   if (body){ opt.headers['Content-Type']='application/json'; opt.body = JSON.stringify(body); }
   const r = await fetch(path, opt);
   if (r.status === 401){ setStatus('unauthorized (reload to sign in)'); throw new Error('401'); }
   if (!r.ok){ setStatus('error ' + r.status); throw new Error(r.status); }
-  setStatus('ok');
+  setStatus('updated ' + new Date().toLocaleTimeString());
   const t = await r.text();
   return t ? JSON.parse(t) : null;
 }
 function esc(s){ return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
 function fmtDate(s){ return s ? new Date(s*1000).toISOString().slice(0,19).replace('T',' ') : ''; }
-async function loadNodes(){
-  const rows = await api('GET','/api/nodes');
-  document.getElementById('nodes').innerHTML = rows.map(n =>
-    `<tr><td>${esc(n.id)}</td><td>${n.fails}</td></tr>`).join('') || '<tr><td colspan=2>no nodes</td></tr>';
+function shortKey(pk){ return pk && pk.length > 16 ? pk.slice(0,16)+'...' : (pk||''); }
+function copyEl(btn){
+  const c = btn.parentElement.querySelector('code').textContent;
+  navigator.clipboard.writeText(c).then(()=>{ btn.textContent='copied'; setTimeout(()=>btn.textContent='copy',1200); });
 }
-async function loadTokens(){
-  const rows = await api('GET','/api/tokens');
-  document.getElementById('tokens').innerHTML = rows.map(t =>
-    `<tr><td>${esc(t.name)}</td><td><code>${esc(t.token)}</code></td><td>${fmtDate(t.created)}</td>`+
-    `<td><button class="ghost" onclick="delToken('${esc(t.token)}')">delete</button></td></tr>`).join('')
-    || '<tr><td colspan=4>no tokens</td></tr>';
+function kv(k,v){ return `<div class="kv"><b>${k}</b><code>${esc(v)}</code></div>`; }
+function cmd(label, c){ return `<div class="cmd"><div class="cmdlabel">${label}</div><div class="cmdrow"><code>${esc(c)}</code><button class="ghost" onclick="copyEl(this)">copy</button></div></div>`; }
+function tlsFlags(){ return (INFO.tls && INFO.fingerprint) ? ` --tls --hub-fingerprint ${INFO.fingerprint}` : ''; }
+function installCmd(token){
+  const node = INFO.node_addr || '<hub-host>:7000';
+  return `curl -fsSL ${INFO.install_url||'https://raw.githubusercontent.com/doedja/warren/main/install.sh'} | sh -s -- --hub ${node} --token ${token}${tlsFlags()}`;
 }
-async function loadUsers(){
-  const rows = await api('GET','/api/users');
-  document.getElementById('users').innerHTML = rows.map(u =>
-    `<tr><td>${esc(u)}</td><td><button class="ghost" onclick="delUser('${esc(u)}')">delete</button></td></tr>`).join('')
-    || '<tr><td colspan=2>no users</td></tr>';
+async function loadInfo(){
+  const i = await api('GET','/api/info'); INFO = i;
+  const node = i.node_addr || '<hub-host>:7000';
+  const proxy = i.proxy_addr || '<hub-host>:18080';
+  const puser = i.proxy_user || 'USER';
+  let html = kv('Node link', node) + kv('Proxy', proxy);
+  if (i.fingerprint) html += kv('Fingerprint', i.fingerprint);
+  html += cmd('Add a node (installer, fill in a token from below)', installCmd('<ENROLL_TOKEN>'));
+  html += cmd('Add a node (existing binary)', `warren node run --hub ${node} --token <ENROLL_TOKEN>${tlsFlags()}`);
+  html += cmd('Use proxy (HTTPS / CONNECT)', `curl -x http://${puser}:<PASSWORD>@${proxy} https://api.ipify.org`);
+  html += cmd('Use proxy (SOCKS5)', `curl -x socks5h://${puser}:<PASSWORD>@${proxy} https://api.ipify.org`);
+  document.getElementById('connect').innerHTML = html;
 }
-async function addToken(){
-  const name = document.getElementById('tname').value.trim() || 'node';
-  const res = await api('POST','/api/tokens',{name});
-  if (res && res.token) setStatus('token: ' + res.token);
-  document.getElementById('tname').value=''; loadTokens();
-}
-async function delToken(t){ await api('DELETE','/api/tokens/'+encodeURIComponent(t)); loadTokens(); }
-async function addUser(){
-  const username = document.getElementById('uname').value.trim();
-  const password = document.getElementById('upass').value;
-  if (!username) return;
-  await api('POST','/api/users',{username,password});
-  document.getElementById('uname').value=''; document.getElementById('upass').value=''; loadUsers();
-}
-async function delUser(u){ await api('DELETE','/api/users/'+encodeURIComponent(u)); loadUsers(); }
-function shortKey(pk){ return pk.length > 16 ? pk.slice(0,16)+'...' : pk; }
 async function loadPending(){
   const rows = await api('GET','/api/pending');
   document.getElementById('pending').innerHTML = rows.map(p =>
@@ -123,6 +128,11 @@ async function loadPending(){
 }
 async function approve(pk){ await api('POST','/api/pending/'+encodeURIComponent(pk)+'/approve'); loadPending(); loadKeys(); }
 async function denyNode(pk){ await api('DELETE','/api/pending/'+encodeURIComponent(pk)); loadPending(); }
+async function loadNodes(){
+  const rows = await api('GET','/api/nodes');
+  document.getElementById('nodes').innerHTML = rows.map(n =>
+    `<tr><td>${esc(n.id)}</td><td>${n.fails}</td></tr>`).join('') || '<tr><td colspan=2>no nodes</td></tr>';
+}
 async function loadKeys(){
   const rows = await api('GET','/api/node-keys');
   document.getElementById('keys').innerHTML = rows.map(k =>
@@ -131,8 +141,41 @@ async function loadKeys(){
     || '<tr><td colspan=4>none</td></tr>';
 }
 async function revokeKey(pk){ await api('DELETE','/api/node-keys/'+encodeURIComponent(pk)); loadKeys(); }
-async function loadAll(){ try { await loadPending(); await loadNodes(); await loadKeys(); await loadTokens(); await loadUsers(); } catch(e){} }
+async function loadTokens(){
+  const rows = await api('GET','/api/tokens');
+  document.getElementById('tokens').innerHTML = rows.map(t =>
+    `<tr><td>${esc(t.name)}</td><td><code>${esc(t.token)}</code></td><td>${fmtDate(t.created)}</td>`+
+    `<td><button class="ghost" onclick='copyInstall(${JSON.stringify(t.token)})'>copy install</button> `+
+    `<button class="ghost" onclick="delToken('${esc(t.token)}')">delete</button></td></tr>`).join('')
+    || '<tr><td colspan=4>no tokens</td></tr>';
+}
+function copyInstall(token){ navigator.clipboard.writeText(installCmd(token)); setStatus('install command copied for token'); }
+async function addToken(){
+  const name = document.getElementById('tname').value.trim() || 'node';
+  const res = await api('POST','/api/tokens',{name});
+  if (res && res.token) setStatus('token: ' + res.token);
+  document.getElementById('tname').value=''; loadTokens();
+}
+async function delToken(t){ await api('DELETE','/api/tokens/'+encodeURIComponent(t)); loadTokens(); }
+async function loadUsers(){
+  const rows = await api('GET','/api/users');
+  document.getElementById('users').innerHTML = rows.map(u =>
+    `<tr><td>${esc(u)}</td><td><button class="ghost" onclick="delUser('${esc(u)}')">delete</button></td></tr>`).join('')
+    || '<tr><td colspan=2>no users</td></tr>';
+}
+async function addUser(){
+  const username = document.getElementById('uname').value.trim();
+  const password = document.getElementById('upass').value;
+  if (!username) return;
+  await api('POST','/api/users',{username,password});
+  document.getElementById('uname').value=''; document.getElementById('upass').value=''; loadUsers();
+}
+async function delUser(u){ await api('DELETE','/api/users/'+encodeURIComponent(u)); loadUsers(); }
+async function loadAll(){
+  try { await loadInfo(); await loadPending(); await loadNodes(); await loadKeys(); await loadTokens(); await loadUsers(); } catch(e){}
+}
 loadAll();
+setInterval(loadAll, 5000);
 </script>
 </body>
 </html>

@@ -46,6 +46,9 @@ async fn end_to_end_proxy_through_node() {
                 store,
                 tls: None,
                 admin: None,
+                public_node_addr: None,
+                public_proxy_addr: None,
+                fingerprint: None,
             }
         })
         .await;
@@ -145,6 +148,9 @@ async fn rejects_bad_auth_and_allows_good() {
                 store,
                 tls: None,
                 admin: None,
+                public_node_addr: None,
+                public_proxy_addr: None,
+                fingerprint: None,
             }
         })
         .await;
