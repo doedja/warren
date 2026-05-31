@@ -103,6 +103,20 @@ pub fn check_proxy_auth(req: &ConnectRequest, expected: Option<&(String, String)
     }
 }
 
+/// Parse a `Basic <base64(user:pass)>` header value into (user, pass).
+pub fn parse_basic(authorization: &str) -> Option<(String, String)> {
+    let rest = match authorization.get(..6) {
+        Some(scheme) if scheme.eq_ignore_ascii_case("basic ") => &authorization[6..],
+        _ => return None,
+    };
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(rest.trim())
+        .ok()?;
+    let s = String::from_utf8(decoded).ok()?;
+    let (u, p) = s.split_once(':')?;
+    Some((u.to_string(), p.to_string()))
+}
+
 pub async fn write_established<W: AsyncWrite + Unpin>(w: &mut W) -> std::io::Result<()> {
     w.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await?;

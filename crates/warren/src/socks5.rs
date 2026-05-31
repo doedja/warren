@@ -17,6 +17,9 @@ const CMD_CONNECT: u8 = 0x01;
 pub const REP_SUCCESS: u8 = 0x00;
 pub const REP_GENERAL_FAILURE: u8 = 0x01;
 
+/// Username/password verifier: `(user, pass) -> ok`.
+pub type Verifier = dyn Fn(&str, &str) -> bool + Send + Sync;
+
 fn invalid(msg: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg)
 }
@@ -27,7 +30,7 @@ fn invalid(msg: &str) -> std::io::Error {
 /// written.
 pub async fn negotiate<S: AsyncRead + AsyncWrite + Unpin>(
     s: &mut S,
-    creds: Option<&(String, String)>,
+    verify: Option<&Verifier>,
 ) -> std::io::Result<Option<(String, u16)>> {
     // Greeting: VER, NMETHODS, METHODS...
     let mut head = [0u8; 2];
@@ -40,8 +43,8 @@ pub async fn negotiate<S: AsyncRead + AsyncWrite + Unpin>(
     s.read_exact(&mut methods).await?;
 
     // Method selection.
-    match creds {
-        Some(c) => {
+    match verify {
+        Some(v) => {
             if !methods.contains(&METHOD_USERPASS) {
                 s.write_all(&[VER, METHOD_NONE]).await?;
                 s.flush().await?;
@@ -49,7 +52,7 @@ pub async fn negotiate<S: AsyncRead + AsyncWrite + Unpin>(
             }
             s.write_all(&[VER, METHOD_USERPASS]).await?;
             s.flush().await?;
-            if !userpass_auth(s, c).await? {
+            if !userpass_auth(s, v).await? {
                 return Ok(None);
             }
         }
@@ -111,7 +114,7 @@ pub async fn negotiate<S: AsyncRead + AsyncWrite + Unpin>(
 
 async fn userpass_auth<S: AsyncRead + AsyncWrite + Unpin>(
     s: &mut S,
-    creds: &(String, String),
+    verify: &Verifier,
 ) -> std::io::Result<bool> {
     // VER(=1), ULEN, UNAME, PLEN, PASSWD
     let mut ver = [0u8; 1];
@@ -128,7 +131,10 @@ async fn userpass_auth<S: AsyncRead + AsyncWrite + Unpin>(
     let mut pass = vec![0u8; plen[0] as usize];
     s.read_exact(&mut pass).await?;
 
-    let ok = user == creds.0.as_bytes() && pass == creds.1.as_bytes();
+    let ok = verify(
+        &String::from_utf8_lossy(&user),
+        &String::from_utf8_lossy(&pass),
+    );
     s.write_all(&[0x01, if ok { 0x00 } else { 0x01 }]).await?;
     s.flush().await?;
     Ok(ok)
@@ -169,8 +175,8 @@ mod tests {
     async fn negotiate_rejects_when_auth_required_but_not_offered() {
         let bytes = connect_domain("h", 80); // offers only noauth
         let mut io = tokio_test_duplex(bytes).await;
-        let creds = ("u".to_string(), "p".to_string());
-        let got = negotiate(&mut io, Some(&creds)).await.unwrap();
+        let verify = |u: &str, p: &str| u == "u" && p == "p";
+        let got = negotiate(&mut io, Some(&verify)).await.unwrap();
         assert_eq!(got, None);
     }
 

@@ -29,6 +29,6 @@ rcgen = "0.13"
 sha2 = "0.10"
 hex = "0.4"
 
-# Later deps (not yet wired):
-#   axum      -- admin JSON API + embedded UI
-#   rusqlite  -- SQLite persistence (tokens, proxy-users)
+# Persistence + admin surface.
+rusqlite = { version = "0.32", features = ["bundled"] }
+axum = "0.7"

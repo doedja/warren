@@ -39,15 +39,11 @@ async fn end_to_end_proxy_through_node() {
     let proxy_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_l.local_addr().unwrap();
     tokio::spawn(async move {
-        let _ = run_with_listeners(
-            node_l,
-            proxy_l,
-            HubConfig {
-                enroll_token: "secret".into(),
-                proxy_creds: None,
-                tls: None,
-            },
-        )
+        let _ = run_with_listeners(node_l, proxy_l, {
+            let store = std::sync::Arc::new(warren::store::Store::open(":memory:").unwrap());
+            store.add_token("secret", "test").unwrap();
+            HubConfig { store, tls: None }
+        })
         .await;
     });
 
@@ -133,15 +129,12 @@ async fn rejects_bad_auth_and_allows_good() {
     let proxy_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_l.local_addr().unwrap();
     tokio::spawn(async move {
-        let _ = run_with_listeners(
-            node_l,
-            proxy_l,
-            HubConfig {
-                enroll_token: "secret".into(),
-                proxy_creds: Some(("u".into(), "p".into())),
-                tls: None,
-            },
-        )
+        let _ = run_with_listeners(node_l, proxy_l, {
+            let store = std::sync::Arc::new(warren::store::Store::open(":memory:").unwrap());
+            store.add_token("secret", "test").unwrap();
+            store.add_user("u", "p").unwrap();
+            HubConfig { store, tls: None }
+        })
         .await;
     });
     tokio::spawn(async move {

@@ -26,6 +26,7 @@ use warren_proto::{DataHello, Greeting, Hello, HelloReply, HubToNode, NodeId, No
 use crate::conn::Conn;
 use crate::proxy;
 use crate::socks5;
+use crate::store::Store;
 use crate::tls;
 use crate::wire::{read_msg, write_msg};
 
@@ -41,10 +42,13 @@ pub struct HubArgs {
     /// Client-facing proxy listen address (HTTP CONNECT).
     #[arg(long, default_value = "0.0.0.0:8000")]
     pub proxy_listen: String,
-    /// Shared enrollment token a node must present to join.
+    /// SQLite database (enrollment tokens + proxy users). Created if absent.
+    #[arg(long, env = "WARREN_DB", default_value = "warren.db")]
+    pub db: String,
+    /// Seed this enrollment token into the DB on startup (optional).
     #[arg(long, env = "WARREN_ENROLL_TOKEN")]
-    pub enroll_token: String,
-    /// Optional Basic-auth username required of proxy clients.
+    pub enroll_token: Option<String>,
+    /// Seed this proxy username into the DB on startup (with --proxy-pass).
     #[arg(long, env = "WARREN_PROXY_USER")]
     pub proxy_user: Option<String>,
     /// Optional Basic-auth password required of proxy clients.
@@ -64,6 +68,9 @@ pub struct EnrollArgs {
     /// Friendly name for the node (informational).
     #[arg(long, default_value = "node")]
     pub name: String,
+    /// SQLite database to add the token to (must match the hub's --db).
+    #[arg(long, env = "WARREN_DB", default_value = "warren.db")]
+    pub db: String,
 }
 
 struct NodeEntry {
@@ -76,14 +83,12 @@ struct NodeEntry {
 /// Runtime config independent of the CLI, so tests can drive the hub with
 /// pre-bound listeners on ephemeral ports.
 pub struct HubConfig {
-    pub enroll_token: String,
-    pub proxy_creds: Option<(String, String)>,
+    pub store: Arc<Store>,
     pub tls: Option<TlsAcceptor>,
 }
 
 struct Hub {
-    enroll_token: String,
-    proxy_creds: Option<(String, String)>,
+    store: Arc<Store>,
     tls: Option<TlsAcceptor>,
     nodes: Mutex<Vec<NodeEntry>>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Conn>>>,
@@ -139,14 +144,15 @@ pub async fn run(args: HubArgs) -> Result<()> {
         None
     };
 
-    let cfg = HubConfig {
-        enroll_token: args.enroll_token,
-        proxy_creds: match (args.proxy_user, args.proxy_pass) {
-            (Some(u), Some(p)) => Some((u, p)),
-            _ => None,
-        },
-        tls,
-    };
+    let store = Arc::new(Store::open(&args.db).with_context(|| format!("open db {}", args.db))?);
+    if let Some(tok) = &args.enroll_token {
+        store.add_token(tok, "cli")?;
+    }
+    if let (Some(u), Some(p)) = (&args.proxy_user, &args.proxy_pass) {
+        store.add_user(u, p)?;
+    }
+
+    let cfg = HubConfig { store, tls };
     run_with_listeners(node_listener, proxy_listener, cfg).await
 }
 
@@ -156,8 +162,7 @@ pub async fn run_with_listeners(
     cfg: HubConfig,
 ) -> Result<()> {
     let hub = Arc::new(Hub {
-        enroll_token: cfg.enroll_token,
-        proxy_creds: cfg.proxy_creds,
+        store: cfg.store,
         tls: cfg.tls,
         nodes: Mutex::new(Vec::new()),
         pending: Mutex::new(HashMap::new()),
@@ -168,7 +173,7 @@ pub async fn run_with_listeners(
     tracing::info!(
         node_listen = ?node_listener.local_addr().ok(),
         proxy_listen = ?proxy_listener.local_addr().ok(),
-        auth = hub.proxy_creds.is_some(),
+        auth = hub.store.auth_required().unwrap_or(false),
         tls = hub.tls.is_some(),
         "warren hub up"
     );
@@ -224,7 +229,7 @@ async fn handle_node_conn(stream: TcpStream, hub: Arc<Hub>) -> Result<()> {
 }
 
 async fn handle_control(hello: Hello, mut conn: Conn, hub: Arc<Hub>) -> Result<()> {
-    if hello.token != hub.enroll_token {
+    if !hub.store.token_valid(&hello.token).unwrap_or(false) {
         let _ = write_msg(
             &mut conn,
             &HelloReply::Reject {
@@ -317,16 +322,29 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
         return Ok(());
     }
 
+    let need_auth = hub.store.auth_required().unwrap_or(false);
+    let store = hub.store.clone();
+    let verify = move |u: &str, p: &str| store.check_user(u, p).unwrap_or(false);
+
     let (proto, host, port) = if peek[0] == 0x05 {
-        match socks5::negotiate(&mut client, hub.proxy_creds.as_ref()).await? {
+        let verify_opt: Option<&socks5::Verifier> = if need_auth { Some(&verify) } else { None };
+        match socks5::negotiate(&mut client, verify_opt).await? {
             Some((h, p)) => (Proto::Socks5, h, p),
             None => return Ok(()), // rejected, reply already sent
         }
     } else {
         let req = proxy::read_connect_request(&mut client).await?;
-        if !proxy::check_proxy_auth(&req, hub.proxy_creds.as_ref()) {
-            proxy::write_auth_required(&mut client).await?;
-            return Ok(());
+        if need_auth {
+            let ok = req
+                .authorization
+                .as_deref()
+                .and_then(proxy::parse_basic)
+                .map(|(u, p)| verify(&u, &p))
+                .unwrap_or(false);
+            if !ok {
+                proxy::write_auth_required(&mut client).await?;
+                return Ok(());
+            }
         }
         (Proto::Http, req.host, req.port)
     };
@@ -411,8 +429,12 @@ pub async fn enroll(args: EnrollArgs) -> Result<()> {
             }
         })
         .collect();
-    println!("enroll token for '{}': {}", args.name, token);
-    println!("start hub:  warren hub --enroll-token {token}");
+    let store = Store::open(&args.db).with_context(|| format!("open db {}", args.db))?;
+    store.add_token(&token, &args.name)?;
+    println!(
+        "enroll token for '{}': {}  (added to {})",
+        args.name, token, args.db
+    );
     println!("join node:  warren node run --hub <hub-host:7000> --token {token}");
     Ok(())
 }

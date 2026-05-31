@@ -10,5 +10,6 @@ pub mod hub;
 pub mod node;
 pub mod proxy;
 pub mod socks5;
+pub mod store;
 pub mod tls;
 pub mod wire;
