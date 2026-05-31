@@ -38,6 +38,36 @@ pub fn server_acceptor() -> Result<(TlsAcceptor, String)> {
     Ok((TlsAcceptor::from(Arc::new(config)), fingerprint))
 }
 
+/// Like [`server_acceptor`] but persists the cert/key under `dir` and reuses
+/// them on restart, so the fingerprint stays stable across redeploys.
+pub fn server_acceptor_from_dir(dir: &str) -> Result<(TlsAcceptor, String)> {
+    init_crypto();
+    let cert_path = std::path::Path::new(dir).join("warren-cert.der");
+    let key_path = std::path::Path::new(dir).join("warren-key.der");
+
+    let (cert_bytes, key_bytes) = if cert_path.exists() && key_path.exists() {
+        (std::fs::read(&cert_path)?, std::fs::read(&key_path)?)
+    } else {
+        let cert = rcgen::generate_simple_self_signed(vec!["warren".to_string()])
+            .map_err(|e| anyhow!("self-signed cert: {e}"))?;
+        let c = cert.cert.der().to_vec();
+        let k = cert.key_pair.serialize_der();
+        std::fs::create_dir_all(dir).ok();
+        std::fs::write(&cert_path, &c)?;
+        std::fs::write(&key_path, &k)?;
+        (c, k)
+    };
+
+    let fingerprint = hex::encode(Sha256::digest(&cert_bytes));
+    let cert_der = CertificateDer::from(cert_bytes);
+    let key_der = PrivatePkcs8KeyDer::from(key_bytes);
+    let config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], PrivateKeyDer::Pkcs8(key_der))
+        .map_err(|e| anyhow!("server tls config: {e}"))?;
+    Ok((TlsAcceptor::from(Arc::new(config)), fingerprint))
+}
+
 /// Build a TLS connector. With `fingerprint` set, the hub cert must match it.
 /// With `insecure` true, any cert is accepted (dev only).
 pub fn client_connector(fingerprint: Option<String>, insecure: bool) -> Result<TlsConnector> {

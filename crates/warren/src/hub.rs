@@ -37,17 +37,21 @@ pub struct HubArgs {
     #[arg(long, default_value = "0.0.0.0:8000")]
     pub proxy_listen: String,
     /// Shared enrollment token a node must present to join.
-    #[arg(long)]
+    #[arg(long, env = "WARREN_ENROLL_TOKEN")]
     pub enroll_token: String,
     /// Optional Basic-auth username required of proxy clients.
-    #[arg(long)]
+    #[arg(long, env = "WARREN_PROXY_USER")]
     pub proxy_user: Option<String>,
     /// Optional Basic-auth password required of proxy clients.
-    #[arg(long)]
+    #[arg(long, env = "WARREN_PROXY_PASS")]
     pub proxy_pass: Option<String>,
     /// Enable TLS on the node link (self-signed cert; fingerprint printed).
     #[arg(long, default_value_t = false)]
     pub tls: bool,
+    /// Persist the TLS cert under this dir so the fingerprint survives restarts.
+    /// Without it, a fresh cert is generated each boot.
+    #[arg(long, env = "WARREN_TLS_CERT_DIR")]
+    pub tls_cert_dir: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -115,7 +119,10 @@ pub async fn run(args: HubArgs) -> Result<()> {
         .with_context(|| format!("bind proxy listener {}", args.proxy_listen))?;
 
     let tls = if args.tls {
-        let (acceptor, fingerprint) = tls::server_acceptor()?;
+        let (acceptor, fingerprint) = match &args.tls_cert_dir {
+            Some(dir) => tls::server_acceptor_from_dir(dir)?,
+            None => tls::server_acceptor()?,
+        };
         println!("warren hub TLS fingerprint: {fingerprint}");
         tracing::info!(%fingerprint,
             "TLS enabled on node link; join nodes with --tls --hub-fingerprint <fingerprint>");
