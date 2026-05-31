@@ -29,8 +29,6 @@ pub const DASHBOARD: &str = r###"<!doctype html>
 <body>
 <header>
   <h1>warren admin</h1>
-  <input id="tok" type="password" placeholder="admin token" style="min-width:220px">
-  <button onclick="saveTok()">Save</button>
   <button class="ghost" onclick="loadAll()">Refresh</button>
   <span id="status"></span>
 </header>
@@ -66,15 +64,14 @@ pub const DASHBOARD: &str = r###"<!doctype html>
   </section>
 </main>
 <script>
-let TOK = localStorage.getItem('warren_admin_token') || '';
-document.getElementById('tok').value = TOK;
-function saveTok(){ TOK = document.getElementById('tok').value.trim(); localStorage.setItem('warren_admin_token', TOK); loadAll(); }
 function setStatus(m){ document.getElementById('status').textContent = m; }
 async function api(method, path, body){
-  const opt = { method, headers: { 'Authorization': 'Bearer ' + TOK } };
+  // The page is behind HTTP Basic auth, so the browser attaches credentials
+  // to these same-origin requests automatically.
+  const opt = { method, headers: {} };
   if (body){ opt.headers['Content-Type']='application/json'; opt.body = JSON.stringify(body); }
   const r = await fetch(path, opt);
-  if (r.status === 401){ setStatus('unauthorized'); throw new Error('401'); }
+  if (r.status === 401){ setStatus('unauthorized (reload to sign in)'); throw new Error('401'); }
   if (!r.ok){ setStatus('error ' + r.status); throw new Error(r.status); }
   setStatus('ok');
   const t = await r.text();
@@ -135,7 +132,7 @@ async function loadKeys(){
 }
 async function revokeKey(pk){ await api('DELETE','/api/node-keys/'+encodeURIComponent(pk)); loadKeys(); }
 async function loadAll(){ try { await loadPending(); await loadNodes(); await loadKeys(); await loadTokens(); await loadUsers(); } catch(e){} }
-if (TOK) loadAll();
+loadAll();
 </script>
 </body>
 </html>

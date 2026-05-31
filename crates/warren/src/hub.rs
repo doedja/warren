@@ -626,13 +626,36 @@ struct UserReq {
     password: String,
 }
 
+/// HTTP Basic auth: any username, password must equal the admin token.
 fn authed(headers: &HeaderMap, token: &str) -> bool {
     headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|t| t == token)
+        .and_then(crate::proxy::parse_basic)
+        .map(|(_, pass)| pass == token)
         .unwrap_or(false)
+}
+
+/// 401 with a Basic challenge, so a browser shows its login prompt.
+fn unauthorized() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        StatusCode::UNAUTHORIZED,
+        [(
+            axum::http::header::WWW_AUTHENTICATE,
+            "Basic realm=\"warren admin\"",
+        )],
+    )
+        .into_response()
+}
+
+/// Dashboard page, gated by Basic auth (nothing renders to the public).
+async fn dashboard(State(ctx): State<AdminCtx>, headers: HeaderMap) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if !authed(&headers, &ctx.token) {
+        return unauthorized();
+    }
+    Html(crate::admin_ui::DASHBOARD).into_response()
 }
 
 fn ise<E: std::fmt::Display>(e: E) -> StatusCode {
@@ -642,7 +665,7 @@ fn ise<E: std::fmt::Display>(e: E) -> StatusCode {
 
 async fn run_admin(listen: String, ctx: AdminCtx) -> Result<()> {
     let app = Router::new()
-        .route("/", get(|| async { Html(crate::admin_ui::DASHBOARD) }))
+        .route("/", get(dashboard))
         .route("/api/nodes", get(api_nodes))
         .route("/api/tokens", get(api_list_tokens).post(api_create_token))
         .route("/api/tokens/:token", delete(api_delete_token))
