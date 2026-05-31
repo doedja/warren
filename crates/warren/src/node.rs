@@ -37,7 +37,7 @@ pub struct NodeArgs {
 pub enum NodeAction {
     /// Connect to the hub and serve as a proxy node.
     Run(RunArgs),
-    /// Install warren as a boot service (systemd on Linux, launchd on macOS).
+    /// Install warren as a boot service (systemd / launchd / Windows task).
     Install(RunArgs),
     /// Remove the boot service and leave the pool.
     Uninstall,

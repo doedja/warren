@@ -98,7 +98,10 @@ SQLite file; `warren enroll --db <file>` also mints a token from the CLI.
 
 ## Install a node (one-liner)
 
-Linux x86_64 / arm64 (Armbian on a B860H, Orange Pi, a PC):
+Prebuilt binaries for Linux (x86_64/arm64 musl), macOS (x86_64/arm64), Windows
+(x86_64) from [Releases](https://github.com/doedja/warren/releases/latest).
+
+**Linux / macOS** ([`install.sh`](https://github.com/doedja/warren/blob/main/install.sh)):
 
 ```bash
 # Mode B: pre-shared token, auto-approved
@@ -106,15 +109,23 @@ curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh 
   --hub HOST:7000 --token TOKEN --tls --hub-fingerprint FP
 
 # Mode A: no token; node shows up as "pending", approve it in the dashboard
-curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh -s -- \
-  --hub HOST:7000 --tls --hub-fingerprint FP
+curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh -s -- --hub HOST:7000 --tls --hub-fingerprint FP
 ```
 
-The installer ([`install.sh`](https://github.com/doedja/warren/blob/main/install.sh))
-fetches the matching binary from [Releases](https://github.com/doedja/warren/releases/latest)
-(musl static, x86_64 + arm64) and registers a boot service. Run with no args to
-just install the binary. The admin dashboard's Connect card / per-token "copy
-install" button gives you this exact command with the host + fingerprint filled in.
+**Windows** ([`install.ps1`](https://github.com/doedja/warren/blob/main/install.ps1), elevated PowerShell):
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/doedja/warren/main/install.ps1))) `
+    -Hub HOST:7000 -Token TOKEN -Tls -HubFingerprint FP
+```
+
+Both fetch the matching release binary and register a boot service (systemd /
+launchd / Windows scheduled task). Run with no args to just install the binary.
+**Uninstall**: `warren node uninstall` (or `install.ps1 -Uninstall` on Windows).
+**Fallback** for other arches: `cargo install --git https://github.com/doedja/warren warren`.
+
+The dashboard's Connect card and per-token "copy install" button hand you the
+exact command with the host + fingerprint already filled in.
 
 ## Node identity + enrollment
 
