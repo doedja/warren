@@ -233,7 +233,10 @@ async fn routes_to_named_device_and_rejects_unknown() {
         let _ = run_agent(RunArgs {
             hub: node_addr.to_string(),
             token: Some("secret".into()),
-            key_file: Some(format!("{}/warren-e2e-named.key", std::env::temp_dir().display())),
+            key_file: Some(format!(
+                "{}/warren-e2e-named.key",
+                std::env::temp_dir().display()
+            )),
             name: "exit1".into(),
             tls: false,
             hub_fingerprint: None,
@@ -245,7 +248,8 @@ async fn routes_to_named_device_and_rejects_unknown() {
     // Once the named device is reachable via `u+exit1`, the pin works.
     let mut up = false;
     for _ in 0..50 {
-        if let Ok((200, true)) = proxy_attempt(proxy_addr, target_addr, Some(("u+exit1", "p"))).await
+        if let Ok((200, true)) =
+            proxy_attempt(proxy_addr, target_addr, Some(("u+exit1", "p"))).await
         {
             up = true;
             break;
@@ -259,7 +263,10 @@ async fn routes_to_named_device_and_rejects_unknown() {
     let (status, _) = proxy_attempt(proxy_addr, target_addr, Some(("u+ghost", "p")))
         .await
         .expect("attempt");
-    assert_eq!(status, 502, "unknown device name must not fall back to the pool");
+    assert_eq!(
+        status, 502,
+        "unknown device name must not fall back to the pool"
+    );
 }
 
 /// Returns (http_status, echo_ok). echo_ok is only meaningful on 200.
