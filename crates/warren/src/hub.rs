@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::{Context, Result};
 use axum::extract::{Path, State};
@@ -88,8 +88,12 @@ pub struct EnrollArgs {
 struct NodeEntry {
     id: NodeId,
     tx: mpsc::UnboundedSender<HubToNode>,
-    /// Consecutive dial failures; reset to 0 on a successful dial.
+    /// Consecutive dial failures (any target); reset to 0 on a successful dial.
     fails: Arc<AtomicU32>,
+    /// Per-target-host consecutive failures. Lets routing prefer nodes that are
+    /// still "fresh" on a given host (transport-level reachability). App-level
+    /// blocks like 429/403 are inside the TLS tunnel and not observable here.
+    host_fails: Arc<StdMutex<HashMap<String, u32>>>,
 }
 
 /// Runtime config independent of the CLI, so tests can drive the hub with
@@ -114,12 +118,27 @@ impl Hub {
     fn next_conn_id(&self) -> u64 {
         self.conn_seq.fetch_add(1, Ordering::Relaxed)
     }
-    async fn snapshot(&self) -> Vec<(NodeId, mpsc::UnboundedSender<HubToNode>, Arc<AtomicU32>)> {
+    #[allow(clippy::type_complexity)]
+    async fn snapshot(
+        &self,
+    ) -> Vec<(
+        NodeId,
+        mpsc::UnboundedSender<HubToNode>,
+        Arc<AtomicU32>,
+        Arc<StdMutex<HashMap<String, u32>>>,
+    )> {
         self.nodes
             .lock()
             .await
             .iter()
-            .map(|n| (n.id.clone(), n.tx.clone(), n.fails.clone()))
+            .map(|n| {
+                (
+                    n.id.clone(),
+                    n.tx.clone(),
+                    n.fails.clone(),
+                    n.host_fails.clone(),
+                )
+            })
             .collect()
     }
     async fn add_node(&self, e: NodeEntry) {
@@ -315,6 +334,7 @@ async fn handle_control(hello: Hello, mut conn: Conn, hub: Arc<Hub>) -> Result<(
         id: node_id.clone(),
         tx: tx.clone(),
         fails: Arc::new(AtomicU32::new(0)),
+        host_fails: Arc::new(StdMutex::new(HashMap::new())),
     })
     .await;
 
@@ -370,6 +390,10 @@ async fn handle_data(dh: DataHello, conn: Conn, hub: Arc<Hub>) -> Result<()> {
     Ok(())
 }
 
+fn host_fail_count(m: &StdMutex<HashMap<String, u32>>, host: &str) -> u32 {
+    m.lock().unwrap().get(host).copied().unwrap_or(0)
+}
+
 #[derive(Clone, Copy)]
 enum Proto {
     Http,
@@ -422,10 +446,17 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
     let mut order: Vec<usize> = (0..nodes.len())
         .map(|i| (start + i) % nodes.len())
         .collect();
-    order.sort_by_key(|&i| (nodes[i].2.load(Ordering::Relaxed) >= UNHEALTHY_AT) as u8);
+    // Prefer nodes fresh on THIS host: fewest host-fails first, unhealthy-on-host
+    // last, global fails as the final tie-break. Stable sort keeps round-robin
+    // order within a tier.
+    order.sort_by_key(|&i| {
+        let hf = host_fail_count(&nodes[i].3, &host);
+        let global = nodes[i].2.load(Ordering::Relaxed);
+        (hf >= UNHEALTHY_AT, hf, global)
+    });
 
     for idx in order {
-        let (node_id, node_tx, fails) = &nodes[idx];
+        let (node_id, node_tx, fails, host_fails) = &nodes[idx];
         let conn_id = hub.next_conn_id();
         let (otx, orx) = oneshot::channel::<Conn>();
         hub.insert_pending(conn_id, otx).await;
@@ -446,6 +477,7 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
         match timeout(Duration::from_secs(15), orx).await {
             Ok(Ok(mut data)) => {
                 fails.store(0, Ordering::Relaxed);
+                host_fails.lock().unwrap().remove(&host);
                 established(&mut client, proto).await?;
                 let _ = copy_bidirectional(&mut client, &mut data).await;
                 return Ok(());
@@ -453,7 +485,8 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
             _ => {
                 hub.take_pending(conn_id).await;
                 fails.fetch_add(1, Ordering::Relaxed);
-                tracing::debug!(node = %node_id.0, "dial timed out or failed, failing over");
+                *host_fails.lock().unwrap().entry(host.clone()).or_insert(0) += 1;
+                tracing::debug!(node = %node_id.0, %host, "dial failed on host, failing over");
                 continue;
             }
         }
