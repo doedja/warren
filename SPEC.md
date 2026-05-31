@@ -12,14 +12,17 @@ port on the node.
 ## Implemented vs planned
 
 Implemented: the control + on-demand-data-connection transport (plain TCP, with
-opt-in TLS + self-signed cert fingerprint pinning), HTTP CONNECT and SOCKS5
-client proxies with auth, health-aware round-robin routing with failover, node
-boot-service install (systemd/launchd), env-var config, and a Coolify deploy.
+opt-in TLS + self-signed cert fingerprint pinning, persistent cert); HTTP
+CONNECT, SOCKS5, and plain-HTTP client proxies with auth (all auto-detected on
+one port); SQLite-backed enrollment tokens + proxy users; health-aware routing
+with failover and per-target-host freshness; an admin API + web dashboard; node
+boot-service install (systemd/launchd); env-var config; and a Coolify deploy.
 
-Planned: plain-HTTP (absolute-URI) proxying, QUIC/WSS transport (the
-connection-per-request model below was chosen over the original muxed QUIC
-design for simplicity; TLS-over-TCP covers the security goal), SQLite
-persistence, and the admin API + web UI.
+Not pursued: QUIC/WSS transport. The original muxed-QUIC design was replaced by
+the connection-per-request model (simpler, deterministic, easy to test), and
+opt-in TLS-over-TCP covers the security goal, so a separate QUIC/WSS carrier
+adds complexity without a matching benefit for this model. Revisit only if the
+transport moves back to single-connection multiplexing.
 
 ## Goals
 

@@ -7,7 +7,8 @@
 //!     client handler to splice.
 //!
 //! With `--tls` the node link is wrapped in TLS (self-signed cert, fingerprint
-//! printed at startup). The client-facing proxy is always plain HTTP CONNECT.
+//! printed at startup). The client-facing proxy auto-detects HTTP CONNECT,
+//! SOCKS5, and plain-HTTP (absolute-URI) on one port.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};

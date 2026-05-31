@@ -20,24 +20,25 @@ client ──HTTP CONNECT──► hub ──control + data conns (TCP)──►
 
 ## Status
 
-Working end to end and deployable. A client proxies HTTP CONNECT or SOCKS5 through
-the hub and out a node, with health-aware round-robin selection and failover.
-Verified by integration tests and real `curl` runs through the binary.
+Working end to end and deployable. A client proxies HTTP CONNECT, SOCKS5, or
+plain HTTP through the hub and out a node, with health-aware routing and
+failover. Verified by integration tests and real `curl` runs through the binary.
 
 How it works: the node opens one **control** connection to the hub (token-auth,
-TLS optional). For each client request the hub sends a `Dial` to the healthiest
-node; the node dials the target from its own network, opens a fresh **data**
-connection tagged with the request id, and the hub splices client to data
-connection. No inbound connectivity needed on the node.
+TLS optional). For each client request the hub sends a `Dial` to the node that
+is freshest on that target host; the node dials the target from its own network,
+opens a fresh **data** connection tagged with the request id, and the hub splices
+client to data connection. No inbound connectivity needed on the node.
 
-Done: HTTP CONNECT + SOCKS5 (auto-detected on one port), Basic/SOCKS5 auth,
-TLS on the node link with self-signed cert + fingerprint pinning (persistent
-across restarts), health-aware routing with failover, `node install` boot
-service (systemd/launchd), env-var config, and a Coolify deploy
-([docker-warren](https://github.com/doedja/docker-warren)).
+Done: HTTP CONNECT + SOCKS5 + plain-HTTP (auto-detected on one port) with auth;
+opt-in TLS on the node link (self-signed cert + fingerprint pinning, persistent
+across restarts); SQLite-backed enrollment tokens + proxy users; health-aware
+routing with failover and per-target-host freshness; an admin API + web
+dashboard; `node install` boot service (systemd/launchd); env-var config; and a
+Coolify deploy ([docker-warren](https://github.com/doedja/docker-warren)).
 
-Not yet done (see [`SPEC.md`](SPEC.md)): plain-HTTP (absolute-URI) proxying,
-QUIC/WSS transport, SQLite persistence, and the admin API + web UI.
+Not pursued (see [`SPEC.md`](SPEC.md)): QUIC/WSS transport, superseded by the
+connection-per-request model + TLS-over-TCP.
 
 ## Layout
 
@@ -85,6 +86,11 @@ For a WAN deployment, add `--tls` to the hub (it prints a fingerprint) and join
 nodes with `--tls --hub-fingerprint <fp>`. Install a node as a boot service with
 `warren node install --hub ... --token ... [--tls --hub-fingerprint ...]`.
 
+Admin: run the hub with `--admin-listen 127.0.0.1:9000 --admin-token <secret>`
+for a web dashboard at that address (manage nodes, enrollment tokens, and proxy
+users). Tokens and users live in the `--db` SQLite file and persist across
+restarts; `warren enroll --db <file>` mints a token from the CLI.
+
 ## Deploy
 
 [docker-warren](https://github.com/doedja/docker-warren) (private) builds this
@@ -92,11 +98,12 @@ repo and runs the hub on Coolify with TLS, persistent cert, and env-var config.
 
 ## What is proxied (and what does not leak)
 
+- HTTP CONNECT, SOCKS5, and plain-HTTP are all proxied (auto-detected on the
+  proxy port). For plain HTTP the request is forwarded in origin form with
+  `Connection: close`.
 - HTTPS over CONNECT: fully proxied; the target sees the node's residential IP.
   The hub never sees content (it splices encrypted bytes); the node resolves DNS,
   so no DNS leak.
-- HTTP CONNECT and SOCKS5 are supported (auto-detected on the proxy port).
-  Plain-HTTP (absolute-URI, non-CONNECT) proxying is still planned.
 - Only apps pointed at the hub proxy use it (per-app, not whole-OS).
 - UDP/QUIC from a client is not carried; clients normally fall back to TCP.
   Disable QUIC/WebRTC in a browser if you need a hard guarantee.
