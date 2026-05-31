@@ -7,21 +7,52 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](#license)
 ![Platforms](https://img.shields.io/badge/platforms-linux%20%7C%20macos%20%7C%20windows-informational)
 
-Run a tiny agent on any devices you control: a home PC, a cheap Raspberry Pi or
-TV box, a spare phone, a VPS at a friend's place. Each one quietly dials out to
-your hub and waits. You point your app, scraper, or browser at a single address,
-and warren sends each request out through one of your devices, so the site sees
-that device's ordinary home IP, not yours and not a flagged datacenter range.
+Run a tiny agent on any device you control: a home PC, a cheap Raspberry Pi or
+TV box, a spare phone, a VPS at a friend's place. Each one dials out to your hub
+and waits. You point your app, scraper, or browser at a single address, and
+warren sends each request out through one of your devices, so the site sees that
+device's ordinary home IP, not yours and not a flagged datacenter range.
 
 The devices need nothing opened: no port-forwarding, no static IP, no fixed
-hostname. It works behind home routers, CGNAT, and on phones, because the
-devices only ever dial *out*.
-
-It is yours end to end: no third-party proxy service, no bandwidth marketplace,
-nobody else's traffic on your IPs. One small binary is both the hub and the node.
+hostname. They only ever dial *out*, so home routers, CGNAT, and phones all
+work. It is yours end to end: no third-party proxy service, no bandwidth
+marketplace, nobody else's traffic on your IPs. One small binary is both the hub
+and the node.
 
 > A warren is a network of connected burrows. Each device digs one burrow out to
 > the hub; the hub is the warren your apps enter through.
+
+## The whole thing in three lines
+
+```bash
+# 1. on a server, once: start the hub
+warren hub --enroll-token SECRET --proxy-user me --proxy-pass pw
+
+# 2. on each device you own: join the pool (one line)
+curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh -s -- \
+  --hub SERVER:7000 --token SECRET
+
+# 3. from anywhere: send traffic through your pool
+curl -x http://me:pw@SERVER:8000 https://api.ipify.org   # prints a device's home IP
+```
+
+That is the whole setup. No VPN to mesh, no proxy to configure on each device, no
+rotator to bolt on. Add more devices and the hub spreads requests across them and
+skips any that drop. And you do not have to type that device line by hand: the
+dashboard prints it for you with the address and token already filled in.
+
+## Why one binary
+
+The usual way to build this from your own devices is a stack: a mesh VPN
+(Tailscale or Headscale) so the hub can reach devices stuck behind home routers,
+a proxy on every device (3proxy or gost) to make the requests, a rotator in front
+(something like Rota) to spread load and fail over, and a pile of scripts to wire
+it together. Each piece is its own install, its own config, its own way to break.
+The phones still need someone to tap "allow VPN" by hand.
+
+warren is that whole stack collapsed into one binary. The device dials out, so
+there is no mesh VPN and no port-forwarding to set up. The same binary is both
+the proxy and the rotator. You install one thing, it joins the pool, done.
 
 ## How it works
 
@@ -38,90 +69,58 @@ your app ──HTTP/SOCKS5──► hub ──one outbound link per device──
                           picks a healthy device, retries another  egress = device's home IP
 ```
 
-## Quick start
+## The dashboard does the typing
 
-```bash
-# 1. on a server: run the hub (proxy on :8000, devices connect on :7000)
-warren hub --enroll-token secret --proxy-user me --proxy-pass pw \
-  --listen 0.0.0.0:7000 --proxy-listen 0.0.0.0:8000
-
-# 2. on a device you own: join the pool (one line; see Install below)
-curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh -s -- \
-  --hub SERVER:7000 --token secret
-
-# 3. from anywhere: send traffic through your pool
-curl -x http://me:pw@SERVER:8000 https://api.ipify.org   # prints your device's IP
-```
-
-That is the whole loop. Add more devices and the hub spreads requests across
-them and skips any that go offline. For a public-facing hub, turn on TLS
-(`--tls`) and use the dashboard below.
+Start the hub with `--admin-listen 0.0.0.0:9000 --admin-token SECRET` and open it
+in a browser (log in with any username and the admin token as the password). It
+shows your live devices, and a **Connect** card with a ready-to-run install line
+for new devices, address and token (and, if you use TLS, the fingerprint) already
+filled in. Copy, paste on the device, done. It also lists devices waiting for
+approval, your proxy users, and enrollment tokens, each labeled with what it does.
 
 ## What you get
 
 - One proxy endpoint for a pool of your own devices, with automatic failover.
 - **HTTP CONNECT, SOCKS5, and plain HTTP**, all on the same port, with auth.
-- A **web dashboard** (live, auto-refreshing) to add devices, approve them, and
-  copy ready-to-run install commands. See [the dashboard](#admin-dashboard).
-- **Encrypted device link** (opt-in TLS, the device pins the hub's key).
+- A **live web dashboard** to add devices, approve them, and copy install commands.
+- **Encrypted device link** (opt-in TLS; the device pins the hub's key).
 - **No inbound** on devices; runs on Linux, macOS, Windows, and tiny ARM boxes.
 - One static binary. No runtime, no database server (state is a local file).
 
-## Install a device (node)
+## Install details
 
 Prebuilt binaries for Linux (x86_64/arm64), macOS (x86_64/arm64), and Windows
-(x86_64) are on the [Releases](https://github.com/doedja/warren/releases/latest) page.
+(x86_64) are on the [Releases](https://github.com/doedja/warren/releases/latest)
+page. The `install.sh` line above downloads the right one and registers a boot
+service (systemd, launchd, or a Windows scheduled task). Run it with no extra
+arguments to just drop in the binary.
 
-**Linux / macOS** ([`install.sh`](https://github.com/doedja/warren/blob/main/install.sh)):
-
-```bash
-# with a token: the device is approved automatically
-curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh -s -- \
-  --hub HOST:7000 --token TOKEN --tls --hub-fingerprint FP
-
-# without a token: the device shows up as "pending", you approve it in the dashboard
-curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh -s -- --hub HOST:7000 --tls --hub-fingerprint FP
-```
-
-**Windows** ([`install.ps1`](https://github.com/doedja/warren/blob/main/install.ps1), elevated PowerShell):
+**Windows** (elevated PowerShell):
 
 ```powershell
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/doedja/warren/main/install.ps1))) `
-    -Hub HOST:7000 -Token TOKEN -Tls -HubFingerprint FP
+    -Hub SERVER:7000 -Token SECRET
 ```
 
-Both download the right binary and register a startup service (systemd, launchd,
-or a Windows scheduled task). Run with no extra arguments to just install the
-binary. To remove: `warren node uninstall` (or `install.ps1 -Uninstall`). No
-prebuilt binary for your arch? Build it: `cargo install --git https://github.com/doedja/warren warren`.
+To remove a device: `warren node uninstall` (or `install.ps1 -Uninstall`). No
+prebuilt binary for your arch? Build it:
+`cargo install --git https://github.com/doedja/warren warren`.
 
-The dashboard's Connect card hands you these exact commands with the address and
-fingerprint already filled in.
+## Running the hub on the public internet
 
-## Admin dashboard
+If anyone on the internet can reach your hub, turn on TLS so each device can
+confirm it is talking to *your* real hub, not an impostor:
 
-Run the hub with `--admin-listen 0.0.0.0:9000 --admin-token <secret>` for a web
-dashboard, behind HTTP Basic auth (any username, the admin token as the
-password). It refreshes itself and shows live devices, pending approvals,
-approved keys, enrollment tokens, and proxy users, plus a **Connect** card with
-copy-paste install and proxy commands. Pass `--public-node-addr HOST:7000` and
-`--public-proxy-addr HOST:8000` so the card shows your real addresses. The admin
-port is plain HTTP, so it can sit behind a domain with TLS.
+- Start the hub with `--tls`. It prints a fingerprint on first run.
+- Join devices with `--tls --hub-fingerprint FP`. The dashboard's Connect card
+  already includes this, so you still just copy and paste.
 
-## How devices are trusted
+A device makes an ed25519 key on first run and proves it owns that key when it
+connects. With `--token` the hub trusts the device right away; without a token it
+appears as **pending** and you approve it in the dashboard. You can revoke any
+device's key later, and nothing secret travels over the wire.
 
-Each device makes an ed25519 key on first run and proves it owns that key when it
-connects. It joins the pool one of two ways:
-
-- **With a token:** present `--token`; the hub trusts the device's key right away.
-- **Without a token:** the device appears as **pending** with a short code; you
-  click approve in the dashboard. Nothing secret travels over the wire, and you
-  can revoke any device's key later.
-
-## Run the hub
-
-The hub is one long-running process. Put it on any always-on host: a VPS, a home
-server, or a container platform. A minimal image:
+A container image for the hub:
 
 ```dockerfile
 FROM rust:1-bookworm AS build
@@ -134,31 +133,21 @@ CMD ["hub", "--tls", "--tls-cert-dir", "/data", "--db", "/data/warren.db", \
      "--listen", "0.0.0.0:7000", "--proxy-listen", "0.0.0.0:8000", "--admin-listen", "0.0.0.0:9000"]
 ```
 
-Mount a volume at `/data` (it holds the TLS cert and the SQLite file), set
+Mount a volume at `/data` (it holds the TLS cert and the state file) and set
 `WARREN_ENROLL_TOKEN`, `WARREN_PROXY_USER`, `WARREN_PROXY_PASS`, and
-`WARREN_ADMIN_TOKEN` in the environment, and publish the device port (7000) and
-proxy port. With `--tls` the hub prints a fingerprint; devices pin it.
+`WARREN_ADMIN_TOKEN` in the environment.
 
-## What is proxied (and what does not leak)
+## Good to know
 
-- HTTP CONNECT, SOCKS5, and plain HTTP, all auto-detected on the proxy port.
-- HTTPS over CONNECT is end to end: the target sees the device's IP, the hub only
-  relays encrypted bytes, and the device resolves DNS (so no DNS leak).
-- Only apps you point at the proxy use it. It is per-app, not whole-machine.
-- UDP and QUIC are not carried; clients fall back to TCP. Disable QUIC/WebRTC in
-  a browser if you need a hard guarantee that nothing slips around the proxy.
-
-## Failover
-
-The hub tries the device freshest on the target host first and retries another if
-one fails, skipping the failed one. If no device can serve the request it errors
-out: it never quietly falls back to your real IP.
-
-## Hardware for always-on devices
-
-See [`docs/hardware.md`](docs/hardware.md). Short version: a used Amlogic TV box
-(B860H, wired Ethernet) flashed with Armbian, or an Orange Pi Zero 2W / Zero 3,
-each run a node on roughly 1 to 5 watts.
+- **What is proxied:** HTTP CONNECT, SOCKS5, and plain HTTP, auto-detected on one
+  port. HTTPS over CONNECT is end to end: the target sees the device's IP, the hub
+  only relays encrypted bytes, and the device resolves DNS (no DNS leak). It is
+  per-app, not whole-machine, so only what you point at the proxy uses it.
+- **UDP and QUIC** are not carried; clients fall back to TCP. Disable QUIC/WebRTC
+  in a browser if you want a hard guarantee nothing slips around the proxy.
+- **Failover:** the hub tries the device freshest on the target host first and
+  retries another if one fails. If no device can serve, it errors out; it never
+  quietly falls back to your real IP.
 
 ## Build from source
 
@@ -167,9 +156,7 @@ cargo build --release   # needs rustup, stable >= 1.74; binary at target/release
 cargo test              # unit + end-to-end tests
 ```
 
-Design notes and the wire protocol are in [`SPEC.md`](SPEC.md). QUIC/WSS was
-considered and dropped in favor of the simpler connection-per-request model plus
-TLS over TCP.
+Design notes and the wire protocol are in [`SPEC.md`](SPEC.md).
 
 ## License
 

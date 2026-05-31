@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>warren: your own residential proxy pool</title>
+<meta name="description" content="Turn devices you already own into your own private residential proxy pool. One small binary: your devices dial out, you get one proxy endpoint.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=VT323&display=swap" rel="stylesheet">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' shape-rendering='crispEdges'%3E%3Crect width='16' height='16' fill='%23120d08'/%3E%3Crect x='6' y='6' width='4' height='4' fill='%23ef6a2b'/%3E%3Crect x='7' y='7' width='2' height='2' fill='%2374d96b'/%3E%3Crect x='2' y='2' width='2' height='2' fill='%23ffc15e'/%3E%3Crect x='12' y='2' width='2' height='2' fill='%23ffc15e'/%3E%3Crect x='2' y='12' width='2' height='2' fill='%23ffc15e'/%3E%3Crect x='12' y='12' width='2' height='2' fill='%23ffc15e'/%3E%3C/svg%3E">
+<style>
+  :root{
+    --bg:#120d08; --bg2:#1a130b; --panel:#1d160d; --panel2:#241a0f;
+    --line:#3d2e1b; --shadow:#070401;
+    --bone:#f2e6cf; --mut:#b09b78; --dim:#8d7c5e;
+    --amber:#ffc15e; --terra:#ef6a2b; --ok:#74d96b;
+    --pix:'Press Start 2P',monospace; --body:'VT323',monospace;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0; background:var(--bg); color:var(--bone);
+    font-family:var(--body); font-size:21px; line-height:1.35;
+    image-rendering:pixelated;
+    background-image:
+      radial-gradient(700px 420px at 80% -10%, rgba(239,106,43,.18), transparent 60%),
+      radial-gradient(620px 460px at 6% 8%, rgba(255,193,94,.07), transparent 55%),
+      repeating-linear-gradient(0deg, rgba(255,255,255,.014) 0 1px, transparent 1px 16px),
+      repeating-linear-gradient(90deg, rgba(255,255,255,.014) 0 1px, transparent 1px 16px);
+  }
+  /* CRT scanlines + faint flicker */
+  body::after{content:"";position:fixed;inset:0;pointer-events:none;z-index:50;
+    background:repeating-linear-gradient(0deg, rgba(0,0,0,.22) 0 1px, transparent 1px 3px);
+    mix-blend-mode:multiply;opacity:.6;animation:flick 4s steps(2) infinite}
+  @keyframes flick{0%,97%{opacity:.6}98%{opacity:.45}100%{opacity:.6}}
+  .wrap{max-width:1000px;margin:0 auto;padding:0 26px;position:relative;z-index:2}
+  a{color:inherit}
+  img{image-rendering:pixelated}
+
+  /* pixel dashed divider used on section tops */
+  .rule{height:4px;background:repeating-linear-gradient(90deg,var(--line) 0 8px,transparent 8px 16px);margin:0}
+
+  nav{display:flex;align-items:center;justify-content:space-between;
+    max-width:1000px;margin:0 auto;padding:20px 26px;position:relative;z-index:3}
+  .brand{font-family:var(--pix);font-size:17px;color:var(--bone);letter-spacing:1px;display:flex;align-items:center;gap:4px}
+  .brand .cur{width:11px;height:17px;background:var(--terra);display:inline-block;animation:blink 1s steps(1) infinite}
+  @keyframes blink{50%{opacity:0}}
+  nav .links{display:flex;gap:20px;font-size:20px;color:var(--mut)}
+  nav .links a{text-decoration:none}
+  nav .links a:hover{color:var(--amber)}
+
+  .hero{display:grid;grid-template-columns:1.08fr .92fr;gap:38px;align-items:center;padding:48px 0 60px}
+  @media(max-width:820px){.hero{grid-template-columns:1fr;gap:30px}}
+  .tag{display:inline-block;font-family:var(--pix);font-size:9px;line-height:1.7;letter-spacing:1px;
+    color:var(--terra);border:2px solid var(--line);padding:7px 11px;margin-bottom:22px;text-transform:uppercase}
+  h1{font-family:var(--pix);font-size:clamp(20px,3.4vw,34px);line-height:1.45;margin:0 0 22px;color:var(--bone)}
+  h1 .u{color:var(--amber)}
+  h1 .t{color:var(--terra)}
+  .lede{font-size:23px;color:#d7c9ac;max-width:24em;margin:0 0 28px;line-height:1.3}
+  .cta{display:flex;gap:16px;flex-wrap:wrap}
+  .btn{font-family:var(--pix);font-size:11px;text-decoration:none;padding:14px 18px;
+    border:0;cursor:pointer;display:inline-block;transition:transform .04s steps(1),box-shadow .04s steps(1)}
+  .btn.primary{background:var(--terra);color:#1a0d04;box-shadow:0 5px 0 #8a3410, inset 0 0 0 2px #ff8a4d}
+  .btn.primary:hover{background:var(--amber);box-shadow:0 5px 0 #9a6a16, inset 0 0 0 2px #ffd98c}
+  .btn.primary:active{transform:translateY(5px);box-shadow:0 0 0 #8a3410, inset 0 0 0 2px #ff8a4d}
+  .btn.ghost{background:var(--panel);color:var(--bone);box-shadow:0 5px 0 var(--shadow), inset 0 0 0 2px var(--line)}
+  .btn.ghost:hover{color:var(--amber);box-shadow:0 5px 0 var(--shadow), inset 0 0 0 2px var(--amber)}
+  .btn.ghost:active{transform:translateY(5px);box-shadow:0 0 0 var(--shadow), inset 0 0 0 2px var(--line)}
+
+  .mesh{width:100%;max-width:360px;margin-left:auto;display:block}
+  .mesh *{shape-rendering:crispEdges}
+  .mesh .link{stroke:var(--line);stroke-width:2;fill:none;stroke-dasharray:3 3;animation:march .55s steps(3) infinite}
+  .mesh .link.b{animation-delay:.1s}.mesh .link.c{animation-delay:.2s}
+  .mesh .link.d{animation-delay:.15s}.mesh .link.e{animation-delay:.25s}
+  @keyframes march{to{stroke-dashoffset:-6}}
+  .mesh .screen{fill:var(--panel2);stroke:var(--amber);stroke-width:2}
+  .mesh .led{fill:var(--ok);animation:blink 1.2s steps(1) infinite}
+  .mesh .led.b{animation-delay:.4s}.mesh .led.c{animation-delay:.8s}.mesh .led.d{animation-delay:.2s}.mesh .led.e{animation-delay:.6s}
+  .mesh text{font-family:var(--pix);font-size:7px;fill:var(--mut)}
+  .mesh .hub{fill:#2a1a0d;stroke:var(--terra);stroke-width:3}
+  .mesh .hubled{fill:var(--ok);animation:blink .7s steps(1) infinite}
+  .mesh .hubtxt{fill:var(--amber)}
+  .mesh .ring{fill:none;stroke:var(--terra);stroke-width:2;opacity:.5;animation:ring 1.6s steps(4) infinite}
+  @keyframes ring{0%{opacity:.55}100%{opacity:0;transform:scale(1.7)}}
+
+  section{padding:48px 0}
+  h2{font-family:var(--pix);font-size:clamp(16px,2.6vw,22px);margin:0 0 14px;color:var(--bone)}
+  h2 .b{color:var(--terra)}
+  .sub{color:var(--mut);margin:0 0 28px;max-width:32em;font-size:21px}
+
+  .vs{display:grid;grid-template-columns:1fr auto 1fr;gap:22px;align-items:stretch}
+  .col{background:var(--panel);padding:20px;box-shadow:0 5px 0 var(--shadow), inset 0 0 0 2px var(--line)}
+  .col h3{font-family:var(--pix);font-size:10px;margin:0 0 16px;color:var(--mut);text-transform:uppercase;letter-spacing:1px}
+  .col.new{box-shadow:0 5px 0 var(--shadow), inset 0 0 0 2px var(--terra)}
+  .col.new h3{color:var(--amber)}
+  .col ul{list-style:none;margin:0;padding:0}
+  .col li{padding:8px 0;font-size:20px;display:flex;gap:9px;align-items:flex-start;line-height:1.25}
+  .col.old li{color:#9a8c72}
+  .col.old .x{color:var(--terra);font-family:var(--pix);font-size:11px}
+  .new .k{color:var(--ok);font-family:var(--pix);font-size:9px;margin-top:3px}
+  .vsmid{display:flex;align-items:center;justify-content:center;color:var(--terra);font-family:var(--pix);font-size:18px}
+  @media(max-width:760px){.vs{grid-template-columns:1fr}.vsmid{padding:6px 0}}
+
+  .steps{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}
+  .step{background:var(--panel);padding:20px;box-shadow:0 5px 0 var(--shadow), inset 0 0 0 2px var(--line);counter-increment:s}
+  .steps{counter-reset:s}
+  .step .n{font-family:var(--pix);font-size:20px;color:var(--terra);display:block;margin-bottom:14px}
+  .step .n::before{content:"0" counter(s)}
+  .step h3{font-family:var(--pix);font-size:11px;line-height:1.5;margin:0 0 10px;color:var(--bone)}
+  .step p{margin:0;color:var(--mut);font-size:20px;line-height:1.3}
+  @media(max-width:760px){.steps{grid-template-columns:1fr}}
+
+  .feat{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}
+  .feat div{padding:16px 18px;font-size:20px;line-height:1.3;color:#d7c9ac;
+    background:var(--panel);box-shadow:0 4px 0 var(--shadow), inset 0 0 0 2px var(--line)}
+  .feat b{color:var(--amber);font-family:var(--pix);font-size:10px;line-height:1.7;display:block;margin-bottom:6px}
+  @media(max-width:640px){.feat{grid-template-columns:1fr}}
+
+  .code{background:#0b0805;box-shadow:inset 0 0 0 2px var(--line);padding:16px;position:relative;overflow:auto;margin:12px 0}
+  .code pre{margin:0;white-space:pre;font-size:18px;line-height:1.4;color:#e3d6bd;font-family:var(--body)}
+  .code .cmt{color:var(--dim)}
+  .sub code{color:var(--amber);font-size:18px;background:var(--panel);padding:1px 6px;box-shadow:inset 0 0 0 2px var(--line)}
+  .stepnum{color:var(--amber);font-family:var(--pix);font-size:9px;margin-right:6px}
+  .copy{position:absolute;top:10px;right:10px;background:var(--panel);color:var(--mut);
+    box-shadow:inset 0 0 0 2px var(--line);border:0;font-family:var(--pix);font-size:8px;padding:7px 9px;cursor:pointer}
+  .copy:hover{color:var(--amber);box-shadow:inset 0 0 0 2px var(--amber)}
+
+  footer{padding:28px 0 56px;color:var(--mut);font-size:19px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px}
+  footer a{color:var(--amber);text-decoration:none}
+
+  .reveal{opacity:0;transform:translateY(10px)}
+  .reveal.in{opacity:1;transform:none;transition:opacity .01s,transform .25s steps(5)}
+</style>
+</head>
+<body>
+<nav>
+  <div class="brand">warren<span class="cur"></span></div>
+  <div class="links">
+    <a href="#how">how it works</a>
+    <a href="#install">install</a>
+    <a href="https://github.com/doedja/warren">github &#8599;</a>
+  </div>
+</nav>
+
+<div class="wrap">
+  <header class="hero">
+    <div>
+      <span class="tag">self-hosted &middot; residential &middot; one binary</span>
+      <h1>Your own <span class="u">residential</span> <span class="t">proxy pool</span>.</h1>
+      <p class="lede">Run a tiny agent on devices you already own. They dial out to your hub; you point an app at one address and each request leaves through one of your devices, on its ordinary home IP.</p>
+      <div class="cta">
+        <a class="btn primary" href="#install">GET STARTED</a>
+        <a class="btn ghost" href="https://github.com/doedja/warren">GITHUB</a>
+      </div>
+    </div>
+    <div>
+      <svg class="mesh" viewBox="0 0 200 210" role="img" aria-label="devices dialing out to a central hub">
+        <!-- orthogonal circuit links into the hub -->
+        <polyline class="link"   points="36,48 36,100 86,100"/>
+        <polyline class="link b" points="164,52 164,100 114,100"/>
+        <polyline class="link c" points="30,156 30,100 86,100"/>
+        <polyline class="link d" points="170,160 170,100 114,100"/>
+        <polyline class="link e" points="100,184 100,114"/>
+
+        <!-- device sprites -->
+        <g><rect class="screen" x="26" y="38" width="20" height="14"/><rect class="led"   x="29" y="41" width="3" height="3"/><text x="22" y="62">PC</text></g>
+        <g><rect class="screen" x="154" y="42" width="20" height="14"/><rect class="led b" x="157" y="45" width="3" height="3"/><text x="152" y="66">PI</text></g>
+        <g><rect class="screen" x="20" y="146" width="20" height="14"/><rect class="led c" x="23" y="149" width="3" height="3"/><text x="16" y="172">BOX</text></g>
+        <g><rect class="screen" x="160" y="150" width="20" height="14"/><rect class="led d" x="163" y="153" width="3" height="3"/><text x="156" y="176">VPS</text></g>
+        <g><rect class="screen" x="90" y="172" width="20" height="14"/><rect class="led e" x="93" y="175" width="3" height="3"/><text x="84" y="204">PHONE</text></g>
+
+        <!-- hub -->
+        <rect class="ring" x="80" y="80" width="40" height="40" style="transform-box:fill-box;transform-origin:center"/>
+        <rect class="hub" x="84" y="84" width="32" height="32"/>
+        <rect class="hubled" x="96" y="96" width="8" height="8"/>
+        <text class="hubtxt" x="86" y="132">HUB</text>
+      </svg>
+    </div>
+  </header>
+</div>
+
+<div class="rule"></div>
+<div class="wrap">
+  <section id="why">
+    <h2>Why<span class="b">_</span></h2>
+    <p class="sub">Building a proxy pool from your own devices used to mean gluing a stack of tools together. warren is that stack as one binary.</p>
+    <div class="vs">
+      <div class="col old">
+        <h3>The usual stack</h3>
+        <ul>
+          <li><span class="x">+</span> a mesh VPN (Tailscale / Headscale) for NAT traversal</li>
+          <li><span class="x">+</span> a proxy on every device (3proxy / gost)</li>
+          <li><span class="x">+</span> a rotator in front (Rota and friends)</li>
+          <li><span class="x">+</span> glue scripts to wire and sync it all</li>
+          <li><span class="x">+</span> tap "allow VPN" on every phone, by hand</li>
+        </ul>
+      </div>
+      <div class="vsmid">&gt;&gt;</div>
+      <div class="col new">
+        <h3>warren</h3>
+        <ul>
+          <li><span class="k">&gt;</span> devices dial out: no mesh VPN, no port-forward</li>
+          <li><span class="k">&gt;</span> the one binary is the proxy and the rotator</li>
+          <li><span class="k">&gt;</span> install once, it joins the pool, done</li>
+          <li><span class="k">&gt;</span> approve a new device from the web dashboard</li>
+          <li><span class="k">&gt;</span> no third party, no bandwidth marketplace</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+</div>
+
+<div class="rule"></div>
+<div class="wrap">
+  <section id="how">
+    <h2>How it works<span class="b">_</span></h2>
+    <p class="sub">Three moving parts, and the devices never accept a connection.</p>
+    <div class="steps">
+      <div class="step"><span class="n"></span><h3>Devices dial out</h3><p>Each device keeps one outbound link to the hub. Nothing listens on it, so home routers and CGNAT are fine.</p></div>
+      <div class="step"><span class="n"></span><h3>The hub is the door</h3><p>Your app hits the hub's proxy (HTTP or SOCKS5, with a login). The hub picks a healthy device and retries another if one drops.</p></div>
+      <div class="step"><span class="n"></span><h3>The device requests</h3><p>It connects to the site from its own network, so the site sees its home IP. For HTTPS the hub only relays encrypted bytes.</p></div>
+    </div>
+  </section>
+</div>
+
+<div class="rule"></div>
+<div class="wrap">
+  <section id="feat">
+    <h2>What you get<span class="b">_</span></h2>
+    <div class="feat">
+      <div><b>One endpoint, a pool of devices</b> Automatic, health-aware failover across everything you own.</div>
+      <div><b>HTTP, SOCKS5, plain HTTP</b> All on one port, with username and password auth.</div>
+      <div><b>Live web dashboard</b> Add devices, approve them, copy ready-to-run install commands.</div>
+      <div><b>Encrypted device link</b> Opt-in TLS; the device pins the hub's key. No shared secret on the wire.</div>
+      <div><b>Runs anywhere</b> Linux, macOS, Windows, and tiny ARM boxes at a couple of watts.</div>
+      <div><b>One static binary</b> No runtime, no database server. State is a single local file.</div>
+    </div>
+  </section>
+</div>
+
+<div class="rule"></div>
+<div class="wrap">
+  <section id="install">
+    <h2>Get started<span class="b">_</span></h2>
+    <p class="sub">One command on a server, one paste per device. The dashboard writes the device line for you, so you never assemble flags by hand.</p>
+
+    <p class="sub" style="margin:14px 0 4px"><span class="stepnum">01</span>start the hub, on any always-on host</p>
+    <div class="code"><button class="copy" onclick="cp(this)">COPY</button>
+<pre>warren hub --enroll-token SECRET --proxy-user me --proxy-pass pw</pre></div>
+
+    <p class="sub" style="margin:16px 0 4px"><span class="stepnum">02</span>join a device you own, one line</p>
+    <div class="code"><button class="copy" onclick="cp(this)">COPY</button>
+<pre>curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh -s -- \
+  --hub SERVER:7000 --token SECRET</pre></div>
+
+    <p class="sub" style="margin:16px 0 4px"><span class="stepnum">03</span>send traffic through your pool</p>
+    <div class="code"><button class="copy" onclick="cp(this)">COPY</button>
+<pre>curl -x http://me:pw@SERVER:8000 https://api.ipify.org   <span class="cmt"># prints a device IP</span></pre></div>
+
+    <p class="sub" style="margin-top:20px">On Windows, run <code>install.ps1</code> instead. Hub on the public internet? Add <code>--tls</code> and the device pins it, the dashboard hands you the fingerprint. Full docs and prebuilt binaries on <a href="https://github.com/doedja/warren" style="color:var(--amber)">GitHub</a>.</p>
+  </section>
+</div>
+
+<div class="rule"></div>
+<div class="wrap">
+  <footer>
+    <span>warren &middot; self-hosted, for devices you own</span>
+    <span><a href="https://github.com/doedja/warren">github.com/doedja/warren</a> &middot; Apache-2.0</span>
+  </footer>
+</div>
+
+<script>
+function cp(btn){
+  const t = btn.parentElement.querySelector('pre').innerText;
+  navigator.clipboard.writeText(t).then(()=>{ const o=btn.textContent; btn.textContent='COPIED'; setTimeout(()=>btn.textContent=o,1200); });
+}
+document.querySelectorAll('section, .hero > div').forEach(el=>el.classList.add('reveal'));
+const io = new IntersectionObserver((es)=>{es.forEach(e=>{ if(e.isIntersecting){ e.target.classList.add('in'); io.unobserve(e.target); }});},{threshold:.1});
+document.querySelectorAll('.reveal').forEach(s=>io.observe(s));
+</script>
+</body>
+</html>
