@@ -10,7 +10,7 @@
 //! printed at startup). The client-facing proxy is always plain HTTP CONNECT.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -25,8 +25,13 @@ use warren_proto::{DataHello, Greeting, Hello, HelloReply, HubToNode, NodeId, No
 
 use crate::conn::Conn;
 use crate::proxy;
+use crate::socks5;
 use crate::tls;
 use crate::wire::{read_msg, write_msg};
+
+/// A node is skipped (tried only as last resort) once its consecutive-failure
+/// count reaches this.
+const UNHEALTHY_AT: u32 = 3;
 
 #[derive(Args, Debug)]
 pub struct HubArgs {
@@ -64,6 +69,8 @@ pub struct EnrollArgs {
 struct NodeEntry {
     id: NodeId,
     tx: mpsc::UnboundedSender<HubToNode>,
+    /// Consecutive dial failures; reset to 0 on a successful dial.
+    fails: Arc<AtomicU32>,
 }
 
 /// Runtime config independent of the CLI, so tests can drive the hub with
@@ -88,12 +95,12 @@ impl Hub {
     fn next_conn_id(&self) -> u64 {
         self.conn_seq.fetch_add(1, Ordering::Relaxed)
     }
-    async fn snapshot(&self) -> Vec<(NodeId, mpsc::UnboundedSender<HubToNode>)> {
+    async fn snapshot(&self) -> Vec<(NodeId, mpsc::UnboundedSender<HubToNode>, Arc<AtomicU32>)> {
         self.nodes
             .lock()
             .await
             .iter()
-            .map(|n| (n.id.clone(), n.tx.clone()))
+            .map(|n| (n.id.clone(), n.tx.clone(), n.fails.clone()))
             .collect()
     }
     async fn add_node(&self, e: NodeEntry) {
@@ -241,6 +248,7 @@ async fn handle_control(hello: Hello, mut conn: Conn, hub: Arc<Hub>) -> Result<(
     hub.add_node(NodeEntry {
         id: node_id.clone(),
         tx: tx.clone(),
+        fails: Arc::new(AtomicU32::new(0)),
     })
     .await;
 
@@ -296,22 +304,49 @@ async fn handle_data(dh: DataHello, conn: Conn, hub: Arc<Hub>) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum Proto {
+    Http,
+    Socks5,
+}
+
 async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
-    let req = proxy::read_connect_request(&mut client).await?;
-    if !proxy::check_proxy_auth(&req, hub.proxy_creds.as_ref()) {
-        proxy::write_auth_required(&mut client).await?;
+    // Detect the client protocol by peeking the first byte (0x05 = SOCKS5).
+    let mut peek = [0u8; 1];
+    if client.peek(&mut peek).await? == 0 {
         return Ok(());
     }
+
+    let (proto, host, port) = if peek[0] == 0x05 {
+        match socks5::negotiate(&mut client, hub.proxy_creds.as_ref()).await? {
+            Some((h, p)) => (Proto::Socks5, h, p),
+            None => return Ok(()), // rejected, reply already sent
+        }
+    } else {
+        let req = proxy::read_connect_request(&mut client).await?;
+        if !proxy::check_proxy_auth(&req, hub.proxy_creds.as_ref()) {
+            proxy::write_auth_required(&mut client).await?;
+            return Ok(());
+        }
+        (Proto::Http, req.host, req.port)
+    };
 
     let nodes = hub.snapshot().await;
     if nodes.is_empty() {
-        proxy::write_bad_gateway(&mut client).await?;
+        reject(&mut client, proto).await?;
         return Ok(());
     }
 
+    // Round-robin order, but try healthy nodes before unhealthy ones. The sort
+    // is stable, so rotation is preserved within each health tier.
     let start = hub.rr.fetch_add(1, Ordering::Relaxed);
-    for i in 0..nodes.len() {
-        let (node_id, node_tx) = &nodes[(start + i) % nodes.len()];
+    let mut order: Vec<usize> = (0..nodes.len())
+        .map(|i| (start + i) % nodes.len())
+        .collect();
+    order.sort_by_key(|&i| (nodes[i].2.load(Ordering::Relaxed) >= UNHEALTHY_AT) as u8);
+
+    for idx in order {
+        let (node_id, node_tx, fails) = &nodes[idx];
         let conn_id = hub.next_conn_id();
         let (otx, orx) = oneshot::channel::<Conn>();
         hub.insert_pending(conn_id, otx).await;
@@ -319,31 +354,48 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
         if node_tx
             .send(HubToNode::Dial {
                 conn_id,
-                host: req.host.clone(),
-                port: req.port,
+                host: host.clone(),
+                port,
             })
             .is_err()
         {
             hub.take_pending(conn_id).await;
+            fails.fetch_add(1, Ordering::Relaxed);
             continue;
         }
 
         match timeout(Duration::from_secs(15), orx).await {
             Ok(Ok(mut data)) => {
-                proxy::write_established(&mut client).await?;
+                fails.store(0, Ordering::Relaxed);
+                established(&mut client, proto).await?;
                 let _ = copy_bidirectional(&mut client, &mut data).await;
                 return Ok(());
             }
             _ => {
                 hub.take_pending(conn_id).await;
+                fails.fetch_add(1, Ordering::Relaxed);
                 tracing::debug!(node = %node_id.0, "dial timed out or failed, failing over");
                 continue;
             }
         }
     }
 
-    proxy::write_bad_gateway(&mut client).await?;
+    reject(&mut client, proto).await?;
     Ok(())
+}
+
+async fn established(client: &mut TcpStream, proto: Proto) -> std::io::Result<()> {
+    match proto {
+        Proto::Http => proxy::write_established(client).await,
+        Proto::Socks5 => socks5::write_reply(client, socks5::REP_SUCCESS).await,
+    }
+}
+
+async fn reject(client: &mut TcpStream, proto: Proto) -> std::io::Result<()> {
+    match proto {
+        Proto::Http => proxy::write_bad_gateway(client).await,
+        Proto::Socks5 => socks5::write_reply(client, socks5::REP_GENERAL_FAILURE).await,
+    }
 }
 
 pub async fn enroll(args: EnrollArgs) -> Result<()> {
