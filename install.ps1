@@ -38,8 +38,7 @@ if ($arch -ne 'AMD64') {
   Write-Error "warren: only x86_64 Windows binary is published (got $arch). Build from source: cargo install --git https://github.com/$repo warren"
   return
 }
-$target = 'x86_64-pc-windows-msvc'
-$url = "https://github.com/$repo/releases/latest/download/warren-$target.zip"
+$url = "https://github.com/$repo/releases/latest/download/warren-windows-x86_64.zip"
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 New-Item -ItemType Directory -Force -Path $dir | Out-Null

@@ -29,25 +29,26 @@ fallback() {
   exit 1
 }
 
+# asset = warren-<os>-<arch>.tar.gz (see .github/workflows/release.yml)
 case "$os" in
   Linux)
     case "$arch" in
-      x86_64) target="x86_64-unknown-linux-musl" ;;
-      aarch64 | arm64) target="aarch64-unknown-linux-musl" ;;
+      x86_64) asset="linux-x86_64" ;;
+      aarch64 | arm64) asset="linux-arm64" ;;
       *) fallback ;;
     esac
     ;;
   Darwin)
     case "$arch" in
-      x86_64) target="x86_64-apple-darwin" ;;
-      arm64 | aarch64) target="aarch64-apple-darwin" ;;
+      x86_64) asset="macos-x86_64" ;;
+      arm64 | aarch64) asset="macos-arm64" ;;
       *) fallback ;;
     esac
     ;;
   *) fallback ;;
 esac
 
-url="https://github.com/$REPO/releases/latest/download/warren-$target.tar.gz"
+url="https://github.com/$REPO/releases/latest/download/warren-$asset.tar.gz"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
