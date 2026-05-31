@@ -64,17 +64,18 @@ if [ "$(id -u)" != "0" ] && command -v sudo >/dev/null 2>&1; then
   sudo="sudo"
 fi
 
-dest="/usr/local/bin/warren"
-if [ -w /usr/local/bin ] || [ "$(id -u)" = "0" ]; then
+# Install to /usr/local/bin when root or it is writable; otherwise to
+# ~/.local/bin (no sudo prompt for a plain binary install).
+if [ "$(id -u)" = "0" ] || [ -w /usr/local/bin ]; then
+  dest="/usr/local/bin/warren"
   cp "$bin" "$dest"
-elif [ -n "$sudo" ]; then
-  $sudo cp "$bin" "$dest"
 else
   mkdir -p "$HOME/.local/bin"
   dest="$HOME/.local/bin/warren"
   cp "$bin" "$dest"
   echo "warren: installed to $dest (add \$HOME/.local/bin to PATH)." >&2
 fi
+chmod +x "$dest"
 echo "warren: installed at $dest" >&2
 
 if [ "$#" -gt 0 ]; then
