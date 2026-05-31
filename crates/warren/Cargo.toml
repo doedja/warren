@@ -1,0 +1,31 @@
+[package]
+name = "warren"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Residential proxy pool from your own devices. Single binary: hub + node modes."
+
+[[bin]]
+name = "warren"
+path = "src/main.rs"
+
+[dependencies]
+warren-proto = { path = "../warren-proto" }
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+base64 = "0.22"
+rand = "0.8"
+
+# Milestone 2+ deps (add when implementing the data path):
+#   quinn, rustls, rcgen            -- QUIC transport + TLS
+#   tokio-tungstenite, yamux        -- WSS fallback transport
+#   hyper, http                     -- client-facing HTTP CONNECT proxy
+#   axum                            -- admin JSON API + embedded UI
+#   rusqlite (or sqlx)              -- SQLite store
+#   postcard (or ciborium)          -- wire serialization

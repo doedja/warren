@@ -1,0 +1,10 @@
+[package]
+name = "warren-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "transport-agnostic wire messages between hub and node, serialized with postcard; length-prefixed framing is done by the warren crate, not here."
+
+[dependencies]
+serde.workspace = true
+postcard = { version = "1", features = ["alloc"] }

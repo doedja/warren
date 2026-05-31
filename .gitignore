@@ -1,0 +1,13 @@
+/target
+
+# Keep Cargo.lock in repository (workspace with binaries)
+
+.DS_Store
+.idea/
+*.swp
+
+# Local scratch directories
+out/
+out-ci/
+out-wire/
+out-proxy/
