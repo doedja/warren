@@ -9,6 +9,18 @@ port on the node.
 > Metaphor: a warren is a network of interconnected burrows. Each node digs one
 > burrow out to the hub; the hub is the warren that clients enter through.
 
+## Implemented vs planned
+
+Implemented: the control + on-demand-data-connection transport (plain TCP, with
+opt-in TLS + self-signed cert fingerprint pinning), HTTP CONNECT and SOCKS5
+client proxies with auth, health-aware round-robin routing with failover, node
+boot-service install (systemd/launchd), env-var config, and a Coolify deploy.
+
+Planned: plain-HTTP (absolute-URI) proxying, QUIC/WSS transport (the
+connection-per-request model below was chosen over the original muxed QUIC
+design for simplicity; TLS-over-TCP covers the security goal), SQLite
+persistence, and the admin API + web UI.
+
 ## Goals
 
 - One static binary, `warren`, with `hub` and `node` modes.

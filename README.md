@@ -20,20 +20,24 @@ client ──HTTP CONNECT──► hub ──control + data conns (TCP)──►
 
 ## Status
 
-Working end to end. A client can proxy HTTPS through the hub and out a node, with
-round-robin selection and failover across nodes. Verified by an integration test
-(`crates/warren/tests/e2e.rs`) and a real `curl` through the running binary.
+Working end to end and deployable. A client proxies HTTP CONNECT or SOCKS5 through
+the hub and out a node, with health-aware round-robin selection and failover.
+Verified by integration tests and real `curl` runs through the binary.
 
-How it works today: the node opens one **control** TCP connection to the hub
-(token-authenticated). For each client `CONNECT`, the hub sends a `Dial` to a
-node; the node dials the target from its own network, opens a fresh **data** TCP
-connection to the hub tagged with the request id, and the hub splices client to
-data connection. No inbound connectivity needed on the node.
+How it works: the node opens one **control** connection to the hub (token-auth,
+TLS optional). For each client request the hub sends a `Dial` to the healthiest
+node; the node dials the target from its own network, opens a fresh **data**
+connection tagged with the request id, and the hub splices client to data
+connection. No inbound connectivity needed on the node.
 
-Not yet done (see [`SPEC.md`](SPEC.md)): TLS on the node-hub link (plain TCP for
-now, gated by the enrollment token), QUIC/WSS transport, SOCKS5 and plain-HTTP
-proxying (CONNECT only today), SQLite persistence and the admin UI, and the
-self-installing boot service (`node install` is a stub).
+Done: HTTP CONNECT + SOCKS5 (auto-detected on one port), Basic/SOCKS5 auth,
+TLS on the node link with self-signed cert + fingerprint pinning (persistent
+across restarts), health-aware routing with failover, `node install` boot
+service (systemd/launchd), env-var config, and a Coolify deploy
+([docker-warren](https://github.com/doedja/docker-warren)).
+
+Not yet done (see [`SPEC.md`](SPEC.md)): plain-HTTP (absolute-URI) proxying,
+QUIC/WSS transport, SQLite persistence, and the admin API + web UI.
 
 ## Layout
 
@@ -68,20 +72,31 @@ warren hub --enroll-token secret --listen 0.0.0.0:7000 --proxy-listen 0.0.0.0:80
 # 2. node: dial the hub, become a residential exit
 warren node run --hub <hub-host>:7000 --token secret --name livingroom
 
-# 3. client: proxy HTTPS through the pool
-curl -x http://127.0.0.1:8000 https://api.ipify.org      # prints the node's IP
+# 3. client: proxy HTTPS through the pool (HTTP CONNECT or SOCKS5, same port)
+curl -x http://127.0.0.1:8000 https://api.ipify.org           # prints the node's IP
+curl -x socks5h://127.0.0.1:8000 https://api.ipify.org        # SOCKS5, remote DNS
 ```
 
-`warren enroll` prints a random token to use for `--enroll-token` / `--token`.
-Require client auth with `--proxy-user U --proxy-pass P` on the hub, then
-`curl -x http://U:P@host:8000 ...`.
+`warren enroll` prints a random token for `--enroll-token` / `--token`. Require
+client auth with `--proxy-user U --proxy-pass P` on the hub, then
+`curl -x http://U:P@host:8000 ...` (or `socks5h://U:P@host:8000`).
+
+For a WAN deployment, add `--tls` to the hub (it prints a fingerprint) and join
+nodes with `--tls --hub-fingerprint <fp>`. Install a node as a boot service with
+`warren node install --hub ... --token ... [--tls --hub-fingerprint ...]`.
+
+## Deploy
+
+[docker-warren](https://github.com/doedja/docker-warren) (private) builds this
+repo and runs the hub on Coolify with TLS, persistent cert, and env-var config.
 
 ## What is proxied (and what does not leak)
 
 - HTTPS over CONNECT: fully proxied; the target sees the node's residential IP.
   The hub never sees content (it splices encrypted bytes); the node resolves DNS,
   so no DNS leak.
-- CONNECT only today. Plain-HTTP (absolute-URI) proxying and SOCKS5 are planned.
+- HTTP CONNECT and SOCKS5 are supported (auto-detected on the proxy port).
+  Plain-HTTP (absolute-URI, non-CONNECT) proxying is still planned.
 - Only apps pointed at the hub proxy use it (per-app, not whole-OS).
 - UDP/QUIC from a client is not carried; clients normally fall back to TCP.
   Disable QUIC/WebRTC in a browser if you need a hard guarantee.
