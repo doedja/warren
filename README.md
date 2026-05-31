@@ -31,6 +31,9 @@ token, so there is no secret to invent.
 curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh && warren hub --proxy-user me --proxy-pass YOURPASSWORD
 ```
 
+This runs in the foreground for a quick try. For an always-on server, run it as a
+container ([compose example](examples/docker-compose.yml)) or behind a service.
+
 **2. On each device you own, join the pool.** `JOINKEY` is the token the hub
 printed (or copy the whole line from the dashboard, address and token filled in).
 
@@ -129,10 +132,12 @@ if you want the hub to forget it. No prebuilt binary for your arch? Build it:
 
 ## Running the hub on the public internet
 
-If anyone on the internet can reach your hub, turn on TLS so each device can
-confirm it is talking to *your* real hub, not an impostor:
+**Do I need TLS?** On a private hub (localhost, a LAN, a tailnet), no. If anyone
+on the internet can reach the hub, yes: turn on TLS so each device can confirm it
+is talking to *your* real hub, not an impostor.
 
-- Start the hub with `--tls`. It prints a fingerprint on first run.
+- Start the hub with `--tls`. It prints a fingerprint on first run; use
+  `--tls-cert-dir` to keep that fingerprint stable across restarts.
 - Join devices with `--tls --hub-fingerprint FP`. The dashboard's Connect card
   already includes this, so you still just copy and paste.
 
@@ -141,22 +146,21 @@ connects. With `--token` the hub trusts the device right away; without a token i
 appears as **pending** and you approve it in the dashboard. You can revoke any
 device's key later, and nothing secret travels over the wire.
 
-A container image for the hub:
+### As a container
 
-```dockerfile
-FROM rust:1-bookworm AS build
-RUN git clone https://github.com/doedja/warren /src && cd /src && cargo build --release --bin warren
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=build /src/target/release/warren /usr/local/bin/warren
-ENTRYPOINT ["warren"]
-CMD ["hub", "--tls", "--tls-cert-dir", "/data", "--db", "/data/warren.db", \
-     "--listen", "0.0.0.0:7000", "--proxy-listen", "0.0.0.0:8000", "--admin-listen", "0.0.0.0:9000"]
+A [`Dockerfile`](Dockerfile) is at the repo root (it builds the hub and runs it
+with TLS, a `/data` volume for the cert and state, and the device, proxy, and
+admin ports). [`examples/docker-compose.yml`](examples/docker-compose.yml) wires
+it up end to end:
+
+```bash
+WARREN_PROXY_USER=me WARREN_PROXY_PASS=secret WARREN_ADMIN_TOKEN=admin \
+  docker compose -f examples/docker-compose.yml up --build
 ```
 
-Mount a volume at `/data` (it holds the TLS cert and the state file) and set
-`WARREN_ENROLL_TOKEN`, `WARREN_PROXY_USER`, `WARREN_PROXY_PASS`, and
-`WARREN_ADMIN_TOKEN` in the environment.
+Set `WARREN_ENROLL_TOKEN`, `WARREN_PROXY_USER`, `WARREN_PROXY_PASS`, and
+`WARREN_ADMIN_TOKEN` in the environment (omit the enroll token to have the hub
+mint one on first run, printed in the logs).
 
 ## Good to know
 
@@ -164,11 +168,17 @@ Mount a volume at `/data` (it holds the TLS cert and the state file) and set
   port. HTTPS over CONNECT is end to end: the target sees the device's IP, the hub
   only relays encrypted bytes, and the device resolves DNS (no DNS leak). It is
   per-app, not whole-machine, so only what you point at the proxy uses it.
-- **UDP and QUIC** are not carried; clients fall back to TCP. Disable QUIC/WebRTC
-  in a browser if you want a hard guarantee nothing slips around the proxy.
-- **Failover:** the hub tries the device freshest on the target host first and
-  retries another if one fails. If no device can serve, it errors out; it never
-  quietly falls back to your real IP.
+- **TCP only.** SOCKS5 supports CONNECT, not UDP-associate, so UDP and QUIC are
+  not carried; clients fall back to TCP. Disable QUIC/WebRTC in a browser if you
+  want a hard guarantee nothing slips around the proxy.
+- **How a device is chosen:** round-robin across the pool, biased toward devices
+  that are healthy and recently succeeded on the target host. A device that fails
+  three dials in a row is skipped until it recovers. `user+name` overrides this
+  and pins one named device.
+- **Failover:** the hub tries the freshest device first and retries another if one
+  fails. If no device can serve, it errors out; it never quietly falls back to
+  your real IP. (A pinned `user+name` request fails rather than using a different
+  device.)
 
 ## Commands
 
@@ -188,9 +198,11 @@ One binary, three subcommands. Run any with `--help` for the full list.
 | `--db` | `warren.db` | SQLite file (tokens + proxy users + device keys) |
 | `--public-node-addr` / `--public-proxy-addr` | none | addresses shown in the dashboard's commands |
 
-Every flag also reads an env var (`WARREN_ENROLL_TOKEN`, `WARREN_PROXY_USER`,
-`WARREN_PROXY_PASS`, `WARREN_ADMIN_LISTEN`, `WARREN_ADMIN_TOKEN`, `WARREN_DB`, ...),
-which is how the container image is configured.
+Most of these also read an env var (`WARREN_ENROLL_TOKEN`, `WARREN_PROXY_USER`,
+`WARREN_PROXY_PASS`, `WARREN_ADMIN_LISTEN`, `WARREN_ADMIN_TOKEN`, `WARREN_DB`,
+`WARREN_TLS_CERT_DIR`, `WARREN_PUBLIC_NODE_ADDR`, `WARREN_PUBLIC_PROXY_ADDR`),
+which is how the container image is configured. `--listen`, `--proxy-listen`, and
+`--tls` are flags only.
 
 **`warren node run --hub HOST:7000`** runs the agent on a device.
 
@@ -199,6 +211,7 @@ which is how the container image is configured.
 | `--token` | join automatically (Mode B); omit to wait for dashboard approval (Mode A) |
 | `--name` | the device's name in the pool (defaults to its hostname); this is the name used in `user+name` |
 | `--tls` `--hub-fingerprint FP` | use TLS and pin the hub (required if the hub uses `--tls`) |
+| `--insecure` | with `--tls`, skip fingerprint pinning. Dev only; do not use against a real hub |
 | `--key-file` | where the device keeps its identity key (default `~/.warren/node.key`) |
 
 **`warren node install ...`** takes the same flags as `node run` and registers a

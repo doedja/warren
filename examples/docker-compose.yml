@@ -1,0 +1,27 @@
+# Run the warren hub with Docker Compose. From the repo root:
+#
+#   WARREN_PROXY_USER=me WARREN_PROXY_PASS=secret WARREN_ADMIN_TOKEN=admin \
+#     docker compose -f examples/docker-compose.yml up --build
+#
+# The hub prints an enrollment token on first run (see the logs); join a device
+# with it. Put the admin port (9000) behind TLS / a reverse proxy if it is
+# reachable from outside your network.
+services:
+  warren-hub:
+    build:
+      context: ..            # builds the Dockerfile at the repo root
+    restart: unless-stopped
+    volumes:
+      - warren-data:/data    # TLS cert + SQLite state, kept across restarts
+    environment:
+      # Omit WARREN_ENROLL_TOKEN to have the hub mint one on first run.
+      WARREN_ENROLL_TOKEN: ${WARREN_ENROLL_TOKEN:-}
+      WARREN_PROXY_USER: ${WARREN_PROXY_USER:?set a proxy username}
+      WARREN_PROXY_PASS: ${WARREN_PROXY_PASS:?set a proxy password}
+      WARREN_ADMIN_TOKEN: ${WARREN_ADMIN_TOKEN:?set an admin token}
+    ports:
+      - "7000:7000"          # devices dial in here
+      - "8000:8000"          # proxy clients connect here
+      - "9000:9000"          # admin dashboard
+volumes:
+  warren-data:

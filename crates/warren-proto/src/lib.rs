@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Protocol version. Bump on any breaking change to the message shapes.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Stable identity the hub assigns to a node at enrollment.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -61,14 +61,15 @@ pub enum HelloReply {
 pub enum HubToNode {
     Dial {
         conn_id: u64,
+        /// Random per-dial secret. The node must echo it in [`DataHello`] so the
+        /// hub can prove the data connection came from the node it asked to
+        /// dial, not from anyone who guessed `conn_id`.
+        nonce: u64,
         host: String,
         port: u16,
     },
     Ping {
         nonce: u64,
-    },
-    Drain {
-        reason: String,
     },
 }
 
@@ -84,6 +85,8 @@ pub enum NodeToHub {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataHello {
     pub conn_id: u64,
+    /// Echoes the `nonce` from the matching [`HubToNode::Dial`].
+    pub nonce: u64,
 }
 
 /// First framed message on ANY node-to-hub connection. Tells the hub whether
@@ -126,7 +129,7 @@ mod tests {
 
     #[test]
     fn test_protocol_version() {
-        assert_eq!(PROTOCOL_VERSION, 2);
+        assert_eq!(PROTOCOL_VERSION, 3);
     }
 
     #[test]

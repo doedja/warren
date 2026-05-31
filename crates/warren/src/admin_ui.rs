@@ -44,25 +44,21 @@ pub const DASHBOARD: &str = r###"<!doctype html>
   <span id="status"></span>
 </header>
 <main>
+  <p class="desc" style="margin:0 0 4px">New here? Three steps: add a <b>proxy user</b> (a login for your apps), create an <b>enrollment token</b> and run it on a device, then use a command from <b>Connect</b>. The cards below follow that order.</p>
   <section class="card">
     <h2>Connect</h2>
-    <p class="desc">Your hub's addresses, plus ready-to-run commands. Copy a command, fill in a token or password, and run it on a device or client. The fingerprint is your hub's public ID: devices pin it to be sure they reached you, so it is safe to share.</p>
+    <p class="desc">Your hub's addresses, plus ready-to-run commands. Copy one, fill in a token or password, run it on a device or client. The fingerprint is your hub's public ID: devices pin it to be sure they reached you, so it is safe to share.</p>
     <div id="connect">loading...</div>
   </section>
   <section class="card">
-    <h2>Pending approval</h2>
-    <p class="desc">Devices that connected without an enrollment token. Approve one to let it serve traffic, or deny it. Match the short code against the device to be sure it is yours.</p>
-    <table><thead><tr><th>Code</th><th>Name</th><th>Key</th><th></th></tr></thead><tbody id="pending"></tbody></table>
-  </section>
-  <section class="card">
-    <h2>Live nodes</h2>
-    <p class="desc">Devices connected right now and ready to carry requests. Fails counts recent dial errors; the hub skips a device that keeps failing. Copy a device's command to send traffic out only through that one device.</p>
-    <table><thead><tr><th>Node</th><th>Fails</th><th>Use just this device</th></tr></thead><tbody id="nodes"></tbody></table>
-  </section>
-  <section class="card">
-    <h2>Approved keys</h2>
-    <p class="desc">Device identities the hub trusts (each device made its own key on first run). Revoke one to kick that device out of the pool for good.</p>
-    <table><thead><tr><th>Name</th><th>Key</th><th>Approved</th><th></th></tr></thead><tbody id="keys"></tbody></table>
+    <h2>Proxy users</h2>
+    <p class="desc">Logins for apps that send traffic through the pool: the username and password you put in curl, your browser, or a scraper. Note: this is not the password you typed to open this dashboard (that one is the admin token). A `+` is not allowed in a username; it is reserved for picking one device (user+device).</p>
+    <div class="row">
+      <input id="uname" placeholder="username">
+      <input id="upass" type="password" placeholder="password">
+      <button onclick="addUser()">Add user</button>
+    </div>
+    <table><thead><tr><th>Username</th><th></th></tr></thead><tbody id="users"></tbody></table>
   </section>
   <section class="card">
     <h2>Enrollment tokens</h2>
@@ -74,14 +70,19 @@ pub const DASHBOARD: &str = r###"<!doctype html>
     <table><thead><tr><th>Name</th><th>Token</th><th>Created</th><th></th></tr></thead><tbody id="tokens"></tbody></table>
   </section>
   <section class="card">
-    <h2>Proxy users</h2>
-    <p class="desc">Logins for apps that send traffic through the pool: the proxy username and password you put in curl, your browser, or a scraper.</p>
-    <div class="row">
-      <input id="uname" placeholder="username">
-      <input id="upass" type="password" placeholder="password">
-      <button onclick="addUser()">Add user</button>
-    </div>
-    <table><thead><tr><th>Username</th><th></th></tr></thead><tbody id="users"></tbody></table>
+    <h2>Live nodes</h2>
+    <p class="desc">Devices connected right now and ready to carry requests. Up since is when each connected. Fails counts recent dial errors; the hub deprioritizes a device once it reaches 3. Copy a device's command to send traffic out only through that one device.</p>
+    <table><thead><tr><th>Node</th><th>Up since</th><th>Fails</th><th>Use just this device</th></tr></thead><tbody id="nodes"></tbody></table>
+  </section>
+  <section class="card">
+    <h2>Pending approval</h2>
+    <p class="desc">Devices that connected without an enrollment token. Approve one to let it serve traffic, or deny it. Match the short code against the device to be sure it is yours.</p>
+    <table><thead><tr><th>Code</th><th>Name</th><th>Key</th><th>First seen</th><th></th></tr></thead><tbody id="pending"></tbody></table>
+  </section>
+  <section class="card">
+    <h2>Approved keys</h2>
+    <p class="desc">Device identities the hub trusts (each device made its own key on first run). Revoke one to kick that device out of the pool for good.</p>
+    <table><thead><tr><th>Name</th><th>Key</th><th>Approved</th><th></th></tr></thead><tbody id="keys"></tbody></table>
   </section>
 </main>
 <script>
@@ -99,8 +100,10 @@ async function api(method, path, body){
   const t = await r.text();
   return t ? JSON.parse(t) : null;
 }
-function esc(s){ return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
-function fmtDate(s){ return s ? new Date(s*1000).toISOString().slice(0,19).replace('T',' ') : ''; }
+// Escapes for both HTML text and single/double-quoted attribute contexts, so a
+// device-supplied node name cannot break out of an inline onclick handler.
+function esc(s){ return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function fmtDate(s){ return s ? new Date(s*1000).toLocaleString() : ''; }
 function shortKey(pk){ return pk && pk.length > 16 ? pk.slice(0,16)+'...' : (pk||''); }
 function copyEl(btn){
   const c = btn.parentElement.querySelector('code').textContent;
@@ -118,7 +121,9 @@ async function loadInfo(){
   const node = i.node_addr || '<hub-host>:7000';
   const proxy = i.proxy_addr || '<hub-host>:18080';
   const puser = i.proxy_user || 'USER';
-  let html = kv('Node link', node) + kv('Proxy', proxy);
+  let html = '';
+  if (!i.proxy_user) html += `<p class="desc" style="color:var(--acc)">No proxy user yet. Add one under Proxy users below first, or the proxy commands will not authenticate.</p>`;
+  html += kv('Node link', node) + kv('Proxy', proxy);
   if (i.fingerprint) html += kv('Fingerprint (hub ID)', i.fingerprint);
   html += cmd('Add a node (installer, fill in a token from below)', installCmd('<ENROLL_TOKEN>'));
   html += cmd('Add a node (existing binary)', `warren node run --hub ${node} --token <ENROLL_TOKEN>${tlsFlags()}`);
@@ -130,10 +135,10 @@ async function loadInfo(){
 async function loadPending(){
   const rows = await api('GET','/api/pending');
   document.getElementById('pending').innerHTML = rows.map(p =>
-    `<tr><td><code>${esc(p.code)}</code></td><td>${esc(p.name)}</td><td>${esc(shortKey(p.pubkey))}</td>`+
+    `<tr><td><code>${esc(p.code)}</code></td><td>${esc(p.name)}</td><td>${esc(shortKey(p.pubkey))}</td><td>${fmtDate(p.first_seen)}</td>`+
     `<td><button onclick="approve('${esc(p.pubkey)}')">approve</button> `+
     `<button class="ghost" onclick="denyNode('${esc(p.pubkey)}')">deny</button></td></tr>`).join('')
-    || '<tr><td colspan=4>none</td></tr>';
+    || '<tr><td colspan=5>Nothing waiting. Devices that join with a token appear under Live nodes directly.</td></tr>';
 }
 async function approve(pk){ await api('POST','/api/pending/'+encodeURIComponent(pk)+'/approve'); loadPending(); loadKeys(); }
 async function denyNode(pk){ await api('DELETE','/api/pending/'+encodeURIComponent(pk)); loadPending(); }
@@ -143,9 +148,10 @@ async function loadNodes(){
   const proxy = INFO.proxy_addr || '<hub-host>:18080';
   document.getElementById('nodes').innerHTML = rows.map(n => {
     const c = `curl -x http://${puser}+${n.name}:<PASSWORD>@${proxy} https://api.ipify.org`;
-    return `<tr><td>${esc(n.id)}</td><td>${n.fails}</td>`+
-      `<td><button class="ghost" onclick='copyText(${JSON.stringify(c)})'>copy proxy cmd</button></td></tr>`;
-  }).join('') || '<tr><td colspan=3>no nodes</td></tr>';
+    const fail = n.fails >= 3 ? `<span style="color:#e0564b">${n.fails} / 3</span>` : `${n.fails} / 3`;
+    return `<tr><td>${esc(n.id)}</td><td>${fmtDate(n.since)}</td><td>${fail}</td>`+
+      `<td><button class="ghost" onclick='copyText(${esc(JSON.stringify(c))})'>copy proxy cmd</button></td></tr>`;
+  }).join('') || '<tr><td colspan=4>No devices online yet. Create a token below and run the install line on a device.</td></tr>';
 }
 function copyText(t){ navigator.clipboard.writeText(t); setStatus('proxy command copied'); }
 async function loadKeys(){
@@ -160,9 +166,9 @@ async function loadTokens(){
   const rows = await api('GET','/api/tokens');
   document.getElementById('tokens').innerHTML = rows.map(t =>
     `<tr><td>${esc(t.name)}</td><td><code>${esc(t.token)}</code></td><td>${fmtDate(t.created)}</td>`+
-    `<td><button class="ghost" onclick='copyInstall(${JSON.stringify(t.token)})'>copy install</button> `+
+    `<td><button class="ghost" onclick='copyInstall(${esc(JSON.stringify(t.token))})'>copy install</button> `+
     `<button class="ghost" onclick="delToken('${esc(t.token)}')">delete</button></td></tr>`).join('')
-    || '<tr><td colspan=4>no tokens</td></tr>';
+    || '<tr><td colspan=4>No tokens yet. Create one to let a device join automatically.</td></tr>';
 }
 function copyInstall(token){ navigator.clipboard.writeText(installCmd(token)); setStatus('install command copied for token'); }
 async function addToken(){
@@ -176,18 +182,21 @@ async function loadUsers(){
   const rows = await api('GET','/api/users');
   document.getElementById('users').innerHTML = rows.map(u =>
     `<tr><td>${esc(u)}</td><td><button class="ghost" onclick="delUser('${esc(u)}')">delete</button></td></tr>`).join('')
-    || '<tr><td colspan=2>no users</td></tr>';
+    || '<tr><td colspan=2>No proxy users yet. Add one so apps can authenticate to the proxy.</td></tr>';
 }
 async function addUser(){
   const username = document.getElementById('uname').value.trim();
   const password = document.getElementById('upass').value;
-  if (!username) return;
+  if (!username || !password){ setStatus('username and password are both required'); return; }
+  if (username.includes('+')){ setStatus("username cannot contain '+' (reserved for device selection)"); return; }
   await api('POST','/api/users',{username,password});
   document.getElementById('uname').value=''; document.getElementById('upass').value=''; loadUsers();
 }
 async function delUser(u){ await api('DELETE','/api/users/'+encodeURIComponent(u)); loadUsers(); }
+function setLive(ok){ const el=document.getElementById('live'); if(!el) return; el.textContent = ok?'live':'stale'; el.style.color = ok?'var(--ok)':'var(--mut)'; }
 async function loadAll(){
-  try { await loadInfo(); await loadPending(); await loadNodes(); await loadKeys(); await loadTokens(); await loadUsers(); } catch(e){}
+  try { await loadInfo(); await loadPending(); await loadNodes(); await loadKeys(); await loadTokens(); await loadUsers(); setLive(true); }
+  catch(e){ setLive(false); }
 }
 loadAll();
 setInterval(loadAll, 5000);

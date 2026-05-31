@@ -42,6 +42,9 @@ use crate::wire::{read_msg, write_msg};
 /// count reaches this.
 const UNHEALTHY_AT: u32 = 3;
 
+/// Cap on distinct hosts tracked per node before low-count entries are dropped.
+const HOST_FAIL_CAP: usize = 256;
+
 #[derive(Args, Debug)]
 pub struct HubArgs {
     /// Node-facing listen address (control + data connections).
@@ -99,6 +102,8 @@ struct NodeEntry {
     /// select a single device by putting this after a `+` in the proxy
     /// username, e.g. `user+phone`.
     name: String,
+    /// Unix seconds when this control connection enrolled (for "up since").
+    since: i64,
     tx: mpsc::UnboundedSender<HubToNode>,
     /// Consecutive dial failures (any target); reset to 0 on a successful dial.
     fails: Arc<AtomicU32>,
@@ -127,7 +132,10 @@ struct Hub {
     public_proxy_addr: Option<String>,
     fingerprint: Option<String>,
     nodes: Mutex<Vec<NodeEntry>>,
-    pending: Mutex<HashMap<u64, oneshot::Sender<Conn>>>,
+    /// conn_id -> (expected data-conn nonce, waker for the client). The nonce
+    /// authenticates the data connection: only the node we sent the Dial to
+    /// knows it, so a guessed conn_id alone cannot hijack the splice.
+    pending: Mutex<HashMap<u64, (u64, oneshot::Sender<Conn>)>>,
     rr: AtomicUsize,
     conn_seq: AtomicU64,
 }
@@ -171,10 +179,10 @@ impl Hub {
     async fn remove_node(&self, id: &NodeId) {
         self.nodes.lock().await.retain(|n| &n.id != id);
     }
-    async fn insert_pending(&self, id: u64, tx: oneshot::Sender<Conn>) {
-        self.pending.lock().await.insert(id, tx);
+    async fn insert_pending(&self, id: u64, nonce: u64, tx: oneshot::Sender<Conn>) {
+        self.pending.lock().await.insert(id, (nonce, tx));
     }
-    async fn take_pending(&self, id: u64) -> Option<oneshot::Sender<Conn>> {
+    async fn take_pending(&self, id: u64) -> Option<(u64, oneshot::Sender<Conn>)> {
         self.pending.lock().await.remove(&id)
     }
     async fn list_node_info(&self) -> Vec<NodeInfo> {
@@ -186,6 +194,7 @@ impl Hub {
                 id: n.id.0.clone(),
                 name: n.name.clone(),
                 fails: n.fails.load(Ordering::Relaxed),
+                since: n.since,
             })
             .collect()
     }
@@ -365,6 +374,23 @@ async fn handle_node_conn(stream: TcpStream, hub: Arc<Hub>) -> Result<()> {
 }
 
 async fn handle_control(hello: Hello, mut conn: Conn, hub: Arc<Hub>) -> Result<()> {
+    // 0. Refuse a node speaking a different protocol version, with a clear
+    //    reason instead of a confusing decode failure later.
+    if hello.protocol_version != warren_proto::PROTOCOL_VERSION {
+        let _ = write_msg(
+            &mut conn,
+            &HelloReply::Reject {
+                reason: format!(
+                    "protocol version mismatch: hub speaks {}, node speaks {}; update the node",
+                    warren_proto::PROTOCOL_VERSION,
+                    hello.protocol_version
+                ),
+            },
+        )
+        .await;
+        return Ok(());
+    }
+
     // 1. The node must own its key and present a fresh timestamp.
     if !identity::verify_auth(&hello.pubkey, hello.timestamp, &hello.signature) {
         let _ = write_msg(
@@ -423,6 +449,7 @@ async fn handle_control(hello: Hello, mut conn: Conn, hub: Arc<Hub>) -> Result<(
     hub.add_node(NodeEntry {
         id: node_id.clone(),
         name: hello.node_name.clone(),
+        since: unix_now(),
         tx: tx.clone(),
         fails: Arc::new(AtomicU32::new(0)),
         host_fails: Arc::new(StdMutex::new(HashMap::new())),
@@ -473,8 +500,14 @@ async fn handle_control(hello: Hello, mut conn: Conn, hub: Arc<Hub>) -> Result<(
 
 async fn handle_data(dh: DataHello, conn: Conn, hub: Arc<Hub>) -> Result<()> {
     match hub.take_pending(dh.conn_id).await {
-        Some(tx) => {
+        Some((nonce, tx)) if nonce == dh.nonce => {
             let _ = tx.send(conn);
+        }
+        Some((nonce, tx)) => {
+            // Right conn_id, wrong nonce: not the node we dialed. Drop it and
+            // put the waker back so the real node's data conn can still arrive.
+            tracing::warn!(conn_id = dh.conn_id, "data conn nonce mismatch; dropped");
+            hub.pending.lock().await.insert(dh.conn_id, (nonce, tx));
         }
         None => tracing::debug!(conn_id = dh.conn_id, "data conn with no pending dial"),
     }
@@ -598,12 +631,14 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
     for idx in order {
         let (node_id, node_tx, fails, host_fails) = &nodes[idx];
         let conn_id = hub.next_conn_id();
+        let nonce = rand::random::<u64>();
         let (otx, orx) = oneshot::channel::<Conn>();
-        hub.insert_pending(conn_id, otx).await;
+        hub.insert_pending(conn_id, nonce, otx).await;
 
         if node_tx
             .send(HubToNode::Dial {
                 conn_id,
+                nonce,
                 host: host.clone(),
                 port,
             })
@@ -629,7 +664,17 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
             _ => {
                 hub.take_pending(conn_id).await;
                 fails.fetch_add(1, Ordering::Relaxed);
-                *host_fails.lock().unwrap().entry(host.clone()).or_insert(0) += 1;
+                {
+                    let mut hf = host_fails.lock().unwrap();
+                    *hf.entry(host.clone()).or_insert(0) += 1;
+                    // Bound the map: a node used for many one-off hosts would
+                    // otherwise accumulate an entry per host. Only counts at or
+                    // above the unhealthy threshold affect routing, so drop the
+                    // rest once the map gets large.
+                    if hf.len() > HOST_FAIL_CAP {
+                        hf.retain(|_, &mut c| c >= UNHEALTHY_AT);
+                    }
+                }
                 tracing::debug!(node = %node_id.0, %host, "dial failed on host, failing over");
                 continue;
             }
@@ -674,6 +719,7 @@ struct NodeInfo {
     id: String,
     name: String,
     fails: u32,
+    since: i64,
 }
 
 #[derive(Serialize)]

@@ -91,6 +91,14 @@ impl Store {
     }
 
     pub fn add_user(&self, username: &str, password: &str) -> Result<()> {
+        // `+` is reserved: clients put a device name after it (user+device) to
+        // route through one device, so a username containing `+` would be
+        // ambiguous at proxy-auth time. Reject it where the name is created.
+        if username.contains('+') {
+            anyhow::bail!(
+                "proxy username may not contain '+' (it is reserved for device selection)"
+            );
+        }
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO proxy_users (username, password) VALUES (?1, ?2)",
@@ -259,5 +267,14 @@ mod tests {
         assert!(store.delete_token("t")?);
         assert!(!store.token_valid("t")?);
         Ok(())
+    }
+
+    #[test]
+    fn rejects_plus_in_username() {
+        let store = Store::open(":memory:").unwrap();
+        // `+` is reserved for device selection (user+device), so it must not be
+        // a valid username, otherwise auth would be ambiguous.
+        assert!(store.add_user("me+phone", "p").is_err());
+        assert!(store.add_user("me", "p").is_ok());
     }
 }

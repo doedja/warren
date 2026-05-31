@@ -181,12 +181,9 @@ async fn connect_once(
                 HubToNode::Ping { nonce } => {
                     let _ = ntx.send(NodeToHub::Pong { nonce });
                 }
-                HubToNode::Drain { reason } => {
-                    tracing::info!(%reason, "hub asked node to drain");
-                    break;
-                }
                 HubToNode::Dial {
                     conn_id,
+                    nonce,
                     host,
                     port,
                 } => {
@@ -194,12 +191,11 @@ async fn connect_once(
                     let conn_tor = connector.clone();
                     let ntx2 = ntx.clone();
                     tokio::spawn(async move {
-                        handle_dial(addr, conn_tor, conn_id, host, port, ntx2).await;
+                        handle_dial(addr, conn_tor, conn_id, nonce, host, port, ntx2).await;
                     });
                 }
             }
         }
-        Ok(())
     }
     .await;
 
@@ -211,6 +207,7 @@ async fn handle_dial(
     hub_addr: String,
     connector: Option<TlsConnector>,
     conn_id: u64,
+    nonce: u64,
     host: String,
     port: u16,
     ntx: mpsc::UnboundedSender<NodeToHub>,
@@ -238,7 +235,7 @@ async fn handle_dial(
             return;
         }
     };
-    if let Err(e) = write_msg(&mut data, &Greeting::Data(DataHello { conn_id })).await {
+    if let Err(e) = write_msg(&mut data, &Greeting::Data(DataHello { conn_id, nonce })).await {
         let _ = ntx.send(NodeToHub::DialFailed {
             conn_id,
             reason: format!("data hello: {e}"),
@@ -432,12 +429,12 @@ fn remove_node_state() {
         // A running .exe cannot delete itself on Windows; the PowerShell
         // uninstaller removes the install dir, so just point at it here.
         Ok(exe) if cfg!(windows) => println!("remove the binary to finish: {}", exe.display()),
-        // On Unix, unlinking the running binary is fine.
+        // On Unix, unlinking the running binary is fine (the inode lives until
+        // the process exits). Announce it before the unlink.
         Ok(exe) => {
-            if std::fs::remove_file(&exe).is_ok() {
-                println!("removed binary: {}", exe.display());
-            } else {
-                println!("binary left at {} (remove it to finish)", exe.display());
+            println!("removing binary: {}", exe.display());
+            if std::fs::remove_file(&exe).is_err() {
+                println!("could not remove {}; delete it to finish", exe.display());
             }
         }
         Err(_) => {}

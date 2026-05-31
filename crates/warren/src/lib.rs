@@ -3,8 +3,6 @@
 //! Exposed as a lib (in addition to the `warren` binary) so integration tests
 //! under `tests/` can drive the hub and node directly.
 
-#![allow(dead_code)]
-
 pub mod admin_ui;
 pub mod conn;
 pub mod hub;
