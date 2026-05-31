@@ -91,6 +91,34 @@ for a web dashboard at that address (manage nodes, enrollment tokens, and proxy
 users). Tokens and users live in the `--db` SQLite file and persist across
 restarts; `warren enroll --db <file>` mints a token from the CLI.
 
+## Install a node (one-liner)
+
+Linux x86_64 / arm64 (Armbian on a B860H, Orange Pi, a PC):
+
+```bash
+# Mode B: pre-shared token, auto-approved
+curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh -s -- \
+  --hub HOST:7000 --token TOKEN --tls --hub-fingerprint FP
+
+# Mode A: no token; node shows up as "pending", approve it in the dashboard
+curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh -s -- \
+  --hub HOST:7000 --tls --hub-fingerprint FP
+```
+
+The installer fetches the release binary and registers a boot service. Run with
+no args to just install the binary.
+
+## Node identity + enrollment
+
+Each node holds an ed25519 key (generated on first run, stored at the key file).
+It proves possession by signing a timestamp; the hub trusts it once the pubkey is
+approved. Two ways to approve:
+
+- **Mode B (token):** node presents `--token`; the hub auto-approves its key.
+- **Mode A (no token):** node appears as **pending** with a short code; approve
+  it in the dashboard (or `DELETE` to deny). Approved keys are listed and can be
+  revoked. No long-lived shared secret travels in Mode A.
+
 ## Deploy
 
 [docker-warren](https://github.com/doedja/docker-warren) (private) builds this
