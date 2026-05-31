@@ -36,9 +36,9 @@ pub struct NodeArgs {
 pub enum NodeAction {
     /// Connect to the hub and serve as a proxy node.
     Run(RunArgs),
-    /// Install warren as a boot service on this OS (later milestone).
+    /// Install warren as a boot service (systemd on Linux, launchd on macOS).
     Install(RunArgs),
-    /// Remove the boot service and leave the pool (later milestone).
+    /// Remove the boot service and leave the pool.
     Uninstall,
 }
 
@@ -219,13 +219,133 @@ async fn handle_dial(
     let _ = copy_bidirectional(&mut data, &mut target).await;
 }
 
-async fn install_service(_args: RunArgs) -> Result<()> {
-    tracing::info!("install: per-OS boot service lands in a later milestone");
+const SYSTEMD_UNIT: &str = "/etc/systemd/system/warren-node.service";
+const LAUNCHD_LABEL: &str = "com.warren.node";
+
+/// Build the argv for `warren node run ...` from the install args.
+fn node_run_argv(exe: &str, a: &RunArgs) -> Vec<String> {
+    let mut v = vec![
+        exe.to_string(),
+        "node".into(),
+        "run".into(),
+        "--hub".into(),
+        a.hub.clone(),
+        "--token".into(),
+        a.token.clone(),
+    ];
+    if !a.name.is_empty() {
+        v.push("--name".into());
+        v.push(a.name.clone());
+    }
+    if a.tls {
+        v.push("--tls".into());
+        if let Some(fp) = &a.hub_fingerprint {
+            v.push("--hub-fingerprint".into());
+            v.push(fp.clone());
+        }
+        if a.insecure {
+            v.push("--insecure".into());
+        }
+    }
+    v
+}
+
+fn run_cmd(cmd: &str, args: &[&str]) -> Result<()> {
+    let status = std::process::Command::new(cmd)
+        .args(args)
+        .status()
+        .with_context(|| format!("run {cmd}"))?;
+    if !status.success() {
+        anyhow::bail!("{cmd} {args:?} exited with {status}");
+    }
     Ok(())
 }
 
+async fn install_service(args: RunArgs) -> Result<()> {
+    let exe = std::env::current_exe()?.to_string_lossy().to_string();
+    let argv = node_run_argv(&exe, &args);
+    match current_platform() {
+        Platform::Linux => install_systemd(&argv),
+        Platform::MacOs => install_launchd(&argv),
+        _ => {
+            println!(
+                "Automatic install supports Linux (systemd) and macOS (launchd).\n\
+                 On Windows, run this via a Scheduled Task or NSSM:\n  {}",
+                argv.join(" ")
+            );
+            Ok(())
+        }
+    }
+}
+
+fn install_systemd(argv: &[String]) -> Result<()> {
+    let unit = format!(
+        "[Unit]\n\
+         Description=warren proxy node\n\
+         After=network-online.target\n\
+         Wants=network-online.target\n\n\
+         [Service]\n\
+         ExecStart={}\n\
+         Restart=always\n\
+         RestartSec=3\n\n\
+         [Install]\n\
+         WantedBy=multi-user.target\n",
+        argv.join(" ")
+    );
+    std::fs::write(SYSTEMD_UNIT, unit)
+        .with_context(|| format!("write {SYSTEMD_UNIT} (need root? re-run with sudo)"))?;
+    run_cmd("systemctl", &["daemon-reload"])?;
+    run_cmd("systemctl", &["enable", "--now", "warren-node"])?;
+    println!("installed and started systemd service: warren-node");
+    Ok(())
+}
+
+fn install_launchd(argv: &[String]) -> Result<()> {
+    let plist_path = launchd_path()?;
+    let args_xml: String = argv
+        .iter()
+        .map(|a| format!("    <string>{a}</string>\n"))
+        .collect();
+    let plist = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+         <plist version=\"1.0\"><dict>\n\
+         <key>Label</key><string>{LAUNCHD_LABEL}</string>\n\
+         <key>ProgramArguments</key><array>\n{args_xml}</array>\n\
+         <key>RunAtLoad</key><true/>\n\
+         <key>KeepAlive</key><true/>\n\
+         </dict></plist>\n"
+    );
+    if let Some(dir) = std::path::Path::new(&plist_path).parent() {
+        std::fs::create_dir_all(dir).ok();
+    }
+    std::fs::write(&plist_path, plist).with_context(|| format!("write {plist_path}"))?;
+    run_cmd("launchctl", &["load", "-w", &plist_path])?;
+    println!("installed and loaded launchd agent: {plist_path}");
+    Ok(())
+}
+
+fn launchd_path() -> Result<String> {
+    let home = std::env::var("HOME").context("HOME not set")?;
+    Ok(format!("{home}/Library/LaunchAgents/{LAUNCHD_LABEL}.plist"))
+}
+
 async fn uninstall_service() -> Result<()> {
-    tracing::info!("uninstall: lands in a later milestone");
+    match current_platform() {
+        Platform::Linux => {
+            let _ = run_cmd("systemctl", &["disable", "--now", "warren-node"]);
+            std::fs::remove_file(SYSTEMD_UNIT).ok();
+            let _ = run_cmd("systemctl", &["daemon-reload"]);
+            println!("removed systemd service: warren-node");
+        }
+        Platform::MacOs => {
+            let plist_path = launchd_path()?;
+            let _ = run_cmd("launchctl", &["unload", "-w", &plist_path]);
+            std::fs::remove_file(&plist_path).ok();
+            println!("removed launchd agent: {plist_path}");
+        }
+        _ => println!("nothing to uninstall on this platform"),
+    }
     Ok(())
 }
 
