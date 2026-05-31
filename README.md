@@ -34,8 +34,9 @@ Done: HTTP CONNECT + SOCKS5 + plain-HTTP (auto-detected on one port) with auth;
 opt-in TLS on the node link (self-signed cert + fingerprint pinning, persistent
 across restarts); SQLite-backed enrollment tokens + proxy users; health-aware
 routing with failover and per-target-host freshness; an admin API + web
-dashboard; `node install` boot service (systemd/launchd); env-var config; and a
-Coolify deploy ([docker-warren](https://github.com/doedja/docker-warren)).
+dashboard; `node install` boot service (systemd / launchd / Windows); env-var
+config; one-line installers for Linux/macOS/Windows; and a container image for
+self-hosting the hub (any Docker/Compose host or Coolify).
 
 Not pursued (see [`SPEC.md`](SPEC.md)): QUIC/WSS transport, superseded by the
 connection-per-request model + TLS-over-TCP.
@@ -138,10 +139,27 @@ approved. Two ways to approve:
   it in the dashboard (or `DELETE` to deny). Approved keys are listed and can be
   revoked. No long-lived shared secret travels in Mode A.
 
-## Deploy
+## Deploy the hub
 
-[docker-warren](https://github.com/doedja/docker-warren) (private) builds this
-repo and runs the hub on Coolify with TLS, persistent cert, and env-var config.
+The hub is a single long-running process; run it on any always-on host (a VPS,
+a home server, Docker/Compose, or a PaaS like Coolify). A minimal container:
+
+```dockerfile
+FROM rust:1-bookworm AS build
+RUN git clone https://github.com/doedja/warren /src && cd /src && cargo build --release --bin warren
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/target/release/warren /usr/local/bin/warren
+ENTRYPOINT ["warren"]
+CMD ["hub", "--tls", "--tls-cert-dir", "/data", "--db", "/data/warren.db", \
+     "--listen", "0.0.0.0:7000", "--proxy-listen", "0.0.0.0:8000", "--admin-listen", "0.0.0.0:9000"]
+```
+
+Mount a volume at `/data` (persists the TLS cert + SQLite), set
+`WARREN_ENROLL_TOKEN` / `WARREN_PROXY_USER` / `WARREN_PROXY_PASS` /
+`WARREN_ADMIN_TOKEN` in the environment, and publish the node + proxy ports.
+The admin port (9000) is plain HTTP, so it can sit behind a reverse proxy /
+domain with TLS; the node link and proxy are raw TCP and are published directly.
 
 ## What is proxied (and what does not leak)
 
