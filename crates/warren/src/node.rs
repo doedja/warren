@@ -4,19 +4,26 @@
 //! requests: for each, dial the target from THIS machine (residential egress),
 //! open a fresh data connection to the hub tagged with the conn_id, and splice
 //! the target to that data connection. Reconnects on drop.
+//!
+//! With `--tls` the node link is TLS; the hub cert is pinned by
+//! `--hub-fingerprint` (or accepted blindly with `--insecure`, dev only).
 
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Args, Subcommand};
-use tokio::io::copy_bidirectional;
+use tokio::io::{copy_bidirectional, split};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio_rustls::rustls::pki_types::ServerName;
+use tokio_rustls::TlsConnector;
 
 use warren_proto::{
     DataHello, Greeting, Hello, HelloReply, HubToNode, NodeToHub, Platform, PROTOCOL_VERSION,
 };
 
+use crate::conn::Conn;
+use crate::tls;
 use crate::wire::{read_msg, write_msg};
 
 #[derive(Args, Debug)]
@@ -46,6 +53,15 @@ pub struct RunArgs {
     /// Name this node shows up as in the hub.
     #[arg(long, default_value = "")]
     pub name: String,
+    /// Use TLS to the hub.
+    #[arg(long, default_value_t = false)]
+    pub tls: bool,
+    /// Pinned hub cert SHA256 (hex), required with --tls unless --insecure.
+    #[arg(long)]
+    pub hub_fingerprint: Option<String>,
+    /// Accept any hub cert (dev only).
+    #[arg(long, default_value_t = false)]
+    pub insecure: bool,
 }
 
 pub async fn run(args: NodeArgs) -> Result<()> {
@@ -62,8 +78,16 @@ pub async fn run_agent(args: RunArgs) -> Result<()> {
     } else {
         args.name.clone()
     };
+    let connector = if args.tls {
+        Some(tls::client_connector(
+            args.hub_fingerprint.clone(),
+            args.insecure,
+        )?)
+    } else {
+        None
+    };
     loop {
-        match connect_once(&args, &name).await {
+        match connect_once(&args, &name, &connector).await {
             Ok(()) => tracing::warn!("control connection closed; reconnecting in 3s"),
             Err(e) => tracing::warn!(error = %e, "control connection error; reconnecting in 3s"),
         }
@@ -71,10 +95,24 @@ pub async fn run_agent(args: RunArgs) -> Result<()> {
     }
 }
 
-async fn connect_once(args: &RunArgs, name: &str) -> Result<()> {
-    let mut stream = TcpStream::connect(&args.hub)
+/// TCP-connect to `addr`, wrapping in TLS if a connector is configured.
+async fn dial_conn(addr: &str, connector: &Option<TlsConnector>) -> Result<Conn> {
+    let tcp = TcpStream::connect(addr)
         .await
-        .with_context(|| format!("connect hub {}", args.hub))?;
+        .with_context(|| format!("connect {addr}"))?;
+    match connector {
+        Some(c) => {
+            // "warren" is a 'static str, so this ServerName is 'static. The
+            // pinned/insecure verifier ignores the name anyway.
+            let domain = ServerName::try_from("warren").map_err(|_| anyhow!("bad servername"))?;
+            Ok(Conn::ClientTls(c.connect(domain, tcp).await?))
+        }
+        None => Ok(Conn::Plain(tcp)),
+    }
+}
+
+async fn connect_once(args: &RunArgs, name: &str, connector: &Option<TlsConnector>) -> Result<()> {
+    let mut conn = dial_conn(&args.hub, connector).await?;
 
     let hello = Hello {
         protocol_version: PROTOCOL_VERSION,
@@ -83,9 +121,9 @@ async fn connect_once(args: &RunArgs, name: &str) -> Result<()> {
         platform: current_platform(),
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
     };
-    write_msg(&mut stream, &Greeting::Control(hello)).await?;
+    write_msg(&mut conn, &Greeting::Control(hello)).await?;
 
-    let reply: HelloReply = read_msg(&mut stream).await?;
+    let reply: HelloReply = read_msg(&mut conn).await?;
     match reply {
         HelloReply::Welcome { node_id } => {
             tracing::info!(node = %node_id.0, hub = %args.hub, "enrolled")
@@ -93,7 +131,7 @@ async fn connect_once(args: &RunArgs, name: &str) -> Result<()> {
         HelloReply::Reject { reason } => anyhow::bail!("hub rejected node: {reason}"),
     }
 
-    let (mut rd, mut wr) = stream.into_split();
+    let (mut rd, mut wr) = split(conn);
     let (ntx, mut nrx) = mpsc::unbounded_channel::<NodeToHub>();
 
     let writer = tokio::spawn(async move {
@@ -105,6 +143,7 @@ async fn connect_once(args: &RunArgs, name: &str) -> Result<()> {
     });
 
     let hub_addr = args.hub.clone();
+    let connector = connector.clone();
     let res: Result<()> = async {
         loop {
             let msg: HubToNode = read_msg(&mut rd).await?;
@@ -122,9 +161,10 @@ async fn connect_once(args: &RunArgs, name: &str) -> Result<()> {
                     port,
                 } => {
                     let addr = hub_addr.clone();
+                    let conn_tor = connector.clone();
                     let ntx2 = ntx.clone();
                     tokio::spawn(async move {
-                        handle_dial(addr, conn_id, host, port, ntx2).await;
+                        handle_dial(addr, conn_tor, conn_id, host, port, ntx2).await;
                     });
                 }
             }
@@ -139,6 +179,7 @@ async fn connect_once(args: &RunArgs, name: &str) -> Result<()> {
 
 async fn handle_dial(
     hub_addr: String,
+    connector: Option<TlsConnector>,
     conn_id: u64,
     host: String,
     port: u16,
@@ -157,7 +198,7 @@ async fn handle_dial(
     };
 
     // Open a fresh data connection back to the hub, tagged with conn_id.
-    let mut data = match TcpStream::connect(&hub_addr).await {
+    let mut data = match dial_conn(&hub_addr, &connector).await {
         Ok(d) => d,
         Err(e) => {
             let _ = ntx.send(NodeToHub::DialFailed {

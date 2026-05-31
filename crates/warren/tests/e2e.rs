@@ -45,6 +45,7 @@ async fn end_to_end_proxy_through_node() {
             HubConfig {
                 enroll_token: "secret".into(),
                 proxy_creds: None,
+                tls: None,
             },
         )
         .await;
@@ -56,6 +57,9 @@ async fn end_to_end_proxy_through_node() {
             hub: node_addr.to_string(),
             token: "secret".into(),
             name: "test-node".into(),
+            tls: false,
+            hub_fingerprint: None,
+            insecure: false,
         })
         .await;
     });
@@ -135,6 +139,7 @@ async fn rejects_bad_auth_and_allows_good() {
             HubConfig {
                 enroll_token: "secret".into(),
                 proxy_creds: Some(("u".into(), "p".into())),
+                tls: None,
             },
         )
         .await;
@@ -144,6 +149,9 @@ async fn rejects_bad_auth_and_allows_good() {
             hub: node_addr.to_string(),
             token: "secret".into(),
             name: "auth-node".into(),
+            tls: false,
+            hub_fingerprint: None,
+            insecure: false,
         })
         .await;
     });

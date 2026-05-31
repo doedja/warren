@@ -6,9 +6,8 @@
 //!   - Data: a fresh socket tagged with a conn_id, handed to the waiting
 //!     client handler to splice.
 //!
-//! Client flow: read CONNECT, auth, pick a node (round-robin), send Dial,
-//! await the matching data connection, write 200, splice. On failure try the
-//! next node; if all fail, 502.
+//! With `--tls` the node link is wrapped in TLS (self-signed cert, fingerprint
+//! printed at startup). The client-facing proxy is always plain HTTP CONNECT.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -16,14 +15,17 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Args;
-use tokio::io::copy_bidirectional;
+use tokio::io::{copy_bidirectional, split};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::{timeout, Duration};
+use tokio_rustls::TlsAcceptor;
 
 use warren_proto::{DataHello, Greeting, Hello, HelloReply, HubToNode, NodeId, NodeToHub};
 
+use crate::conn::Conn;
 use crate::proxy;
+use crate::tls;
 use crate::wire::{read_msg, write_msg};
 
 #[derive(Args, Debug)]
@@ -43,6 +45,9 @@ pub struct HubArgs {
     /// Optional Basic-auth password required of proxy clients.
     #[arg(long)]
     pub proxy_pass: Option<String>,
+    /// Enable TLS on the node link (self-signed cert; fingerprint printed).
+    #[arg(long, default_value_t = false)]
+    pub tls: bool,
 }
 
 #[derive(Args, Debug)]
@@ -57,11 +62,20 @@ struct NodeEntry {
     tx: mpsc::UnboundedSender<HubToNode>,
 }
 
+/// Runtime config independent of the CLI, so tests can drive the hub with
+/// pre-bound listeners on ephemeral ports.
+pub struct HubConfig {
+    pub enroll_token: String,
+    pub proxy_creds: Option<(String, String)>,
+    pub tls: Option<TlsAcceptor>,
+}
+
 struct Hub {
     enroll_token: String,
     proxy_creds: Option<(String, String)>,
+    tls: Option<TlsAcceptor>,
     nodes: Mutex<Vec<NodeEntry>>,
-    pending: Mutex<HashMap<u64, oneshot::Sender<TcpStream>>>,
+    pending: Mutex<HashMap<u64, oneshot::Sender<Conn>>>,
     rr: AtomicUsize,
     conn_seq: AtomicU64,
 }
@@ -84,19 +98,12 @@ impl Hub {
     async fn remove_node(&self, id: &NodeId) {
         self.nodes.lock().await.retain(|n| &n.id != id);
     }
-    async fn insert_pending(&self, id: u64, tx: oneshot::Sender<TcpStream>) {
+    async fn insert_pending(&self, id: u64, tx: oneshot::Sender<Conn>) {
         self.pending.lock().await.insert(id, tx);
     }
-    async fn take_pending(&self, id: u64) -> Option<oneshot::Sender<TcpStream>> {
+    async fn take_pending(&self, id: u64) -> Option<oneshot::Sender<Conn>> {
         self.pending.lock().await.remove(&id)
     }
-}
-
-/// Runtime config independent of the CLI, so tests can drive the hub with
-/// pre-bound listeners on ephemeral ports.
-pub struct HubConfig {
-    pub enroll_token: String,
-    pub proxy_creds: Option<(String, String)>,
 }
 
 pub async fn run(args: HubArgs) -> Result<()> {
@@ -106,12 +113,25 @@ pub async fn run(args: HubArgs) -> Result<()> {
     let proxy_listener = TcpListener::bind(&args.proxy_listen)
         .await
         .with_context(|| format!("bind proxy listener {}", args.proxy_listen))?;
+
+    let tls = if args.tls {
+        let (acceptor, fingerprint) = tls::server_acceptor()?;
+        println!("warren hub TLS fingerprint: {fingerprint}");
+        tracing::info!(%fingerprint,
+            "TLS enabled on node link; join nodes with --tls --hub-fingerprint <fingerprint>");
+        Some(acceptor)
+    } else {
+        tracing::warn!("node link is PLAINTEXT (no --tls); use only on localhost or a tailnet");
+        None
+    };
+
     let cfg = HubConfig {
         enroll_token: args.enroll_token,
         proxy_creds: match (args.proxy_user, args.proxy_pass) {
             (Some(u), Some(p)) => Some((u, p)),
             _ => None,
         },
+        tls,
     };
     run_with_listeners(node_listener, proxy_listener, cfg).await
 }
@@ -124,6 +144,7 @@ pub async fn run_with_listeners(
     let hub = Arc::new(Hub {
         enroll_token: cfg.enroll_token,
         proxy_creds: cfg.proxy_creds,
+        tls: cfg.tls,
         nodes: Mutex::new(Vec::new()),
         pending: Mutex::new(HashMap::new()),
         rr: AtomicUsize::new(0),
@@ -134,6 +155,7 @@ pub async fn run_with_listeners(
         node_listen = ?node_listener.local_addr().ok(),
         proxy_listen = ?proxy_listener.local_addr().ok(),
         auth = hub.proxy_creds.is_some(),
+        tls = hub.tls.is_some(),
         "warren hub up"
     );
 
@@ -175,18 +197,22 @@ pub async fn run_with_listeners(
     Ok(())
 }
 
-async fn handle_node_conn(mut stream: TcpStream, hub: Arc<Hub>) -> Result<()> {
-    let greeting: Greeting = read_msg(&mut stream).await?;
+async fn handle_node_conn(stream: TcpStream, hub: Arc<Hub>) -> Result<()> {
+    let mut conn = match &hub.tls {
+        Some(acceptor) => Conn::ServerTls(acceptor.accept(stream).await?),
+        None => Conn::Plain(stream),
+    };
+    let greeting: Greeting = read_msg(&mut conn).await?;
     match greeting {
-        Greeting::Control(hello) => handle_control(hello, stream, hub).await,
-        Greeting::Data(dh) => handle_data(dh, stream, hub).await,
+        Greeting::Control(hello) => handle_control(hello, conn, hub).await,
+        Greeting::Data(dh) => handle_data(dh, conn, hub).await,
     }
 }
 
-async fn handle_control(hello: Hello, mut stream: TcpStream, hub: Arc<Hub>) -> Result<()> {
+async fn handle_control(hello: Hello, mut conn: Conn, hub: Arc<Hub>) -> Result<()> {
     if hello.token != hub.enroll_token {
         let _ = write_msg(
-            &mut stream,
+            &mut conn,
             &HelloReply::Reject {
                 reason: "bad token".into(),
             },
@@ -196,7 +222,7 @@ async fn handle_control(hello: Hello, mut stream: TcpStream, hub: Arc<Hub>) -> R
     }
     let node_id = NodeId(format!("{}-{}", hello.node_name, hub.next_conn_id()));
     write_msg(
-        &mut stream,
+        &mut conn,
         &HelloReply::Welcome {
             node_id: node_id.clone(),
         },
@@ -211,7 +237,7 @@ async fn handle_control(hello: Hello, mut stream: TcpStream, hub: Arc<Hub>) -> R
     })
     .await;
 
-    let (mut rd, mut wr) = stream.into_split();
+    let (mut rd, mut wr) = split(conn);
 
     let ping_tx = tx.clone();
     let pinger = tokio::spawn(async move {
@@ -239,7 +265,6 @@ async fn handle_control(hello: Hello, mut stream: TcpStream, hub: Arc<Hub>) -> R
                 NodeToHub::Pong { .. } => {}
                 NodeToHub::DialFailed { conn_id, reason } => {
                     tracing::debug!(node = %node_id.0, conn_id, %reason, "node reported dial failed");
-                    // Drop the pending sender so the client handler fails over.
                     let _ = hub.take_pending(conn_id).await;
                 }
             }
@@ -254,12 +279,10 @@ async fn handle_control(hello: Hello, mut stream: TcpStream, hub: Arc<Hub>) -> R
     res
 }
 
-async fn handle_data(dh: DataHello, stream: TcpStream, hub: Arc<Hub>) -> Result<()> {
+async fn handle_data(dh: DataHello, conn: Conn, hub: Arc<Hub>) -> Result<()> {
     match hub.take_pending(dh.conn_id).await {
         Some(tx) => {
-            // Hand the socket to the waiting client handler. If it already gave
-            // up (timeout), the send fails and we just drop the socket.
-            let _ = tx.send(stream);
+            let _ = tx.send(conn);
         }
         None => tracing::debug!(conn_id = dh.conn_id, "data conn with no pending dial"),
     }
@@ -283,7 +306,7 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
     for i in 0..nodes.len() {
         let (node_id, node_tx) = &nodes[(start + i) % nodes.len()];
         let conn_id = hub.next_conn_id();
-        let (otx, orx) = oneshot::channel::<TcpStream>();
+        let (otx, orx) = oneshot::channel::<Conn>();
         hub.insert_pending(conn_id, otx).await;
 
         if node_tx
@@ -294,7 +317,7 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
             })
             .is_err()
         {
-            hub.take_pending(conn_id).await; // node gone since snapshot
+            hub.take_pending(conn_id).await;
             continue;
         }
 
