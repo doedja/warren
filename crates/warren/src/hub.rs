@@ -1,10 +1,10 @@
 //! Hub mode: client-facing HTTP CONNECT proxy + node control plane.
 //!
-//! Node-facing listener accepts two kinds of connection, distinguished by the
-//! first framed [`Greeting`]:
-//!   - Control: a node enrolls, then we keep the link for Dial/Ping/Pong.
-//!   - Data: a fresh socket tagged with a conn_id, handed to the waiting
-//!     client handler to splice.
+//! Each node holds ONE yamux-multiplexed connection to the hub. The hub accepts
+//! logical streams off it, distinguished by the first framed [`Greeting`]:
+//!   - Control: the first stream; the node enrolls, then it carries Dial/Ping/Pong.
+//!   - Data: one stream per proxied request, tagged with a conn_id, handed to the
+//!     waiting client handler to splice.
 //!
 //! The node link is TLS by default (self-signed cert, fingerprint printed at
 //! startup; `--no-tls` drops to plaintext for localhost). The client-facing
@@ -33,6 +33,7 @@ use warren_proto::{DataHello, Greeting, Hello, HelloReply, HubToNode, NodeId, No
 
 use crate::conn::Conn;
 use crate::identity;
+use crate::mux::{self, MuxStream};
 use crate::proxy;
 use crate::socks5;
 use crate::store::Store;
@@ -43,6 +44,9 @@ use crate::wire::{read_msg, write_msg};
 /// count reaches this.
 const UNHEALTHY_AT: u32 = 3;
 
+/// Per-node cap on concurrent in-flight dials.
+const MAX_INFLIGHT_PER_NODE: u32 = 64;
+
 /// Cap on distinct hosts tracked per node before low-count entries are dropped.
 const HOST_FAIL_CAP: usize = 256;
 
@@ -51,9 +55,16 @@ const SESSION_TTL: Duration = Duration::from_secs(600);
 /// Cap on tracked sessions before expired ones are swept.
 const SESSION_CAP: usize = 10_000;
 
+/// Bound on enrollment (control stream open + Hello) so a peer that finishes TLS
+/// then stalls cannot pin a connection + driver task indefinitely.
+const ENROLL_TIMEOUT: Duration = Duration::from_secs(20);
+/// Bound on a data stream sending its DataHello before we give up on it, so a
+/// stream opened but never identified cannot leak a task + open stream.
+const DATA_HELLO_TIMEOUT: Duration = Duration::from_secs(15);
+
 #[derive(Args, Debug)]
 pub struct HubArgs {
-    /// Node-facing listen address (control + data connections).
+    /// Node-facing listen address (one multiplexed connection per node).
     #[arg(long, default_value = "0.0.0.0:7000")]
     pub listen: String,
     /// Client-facing proxy listen address (HTTP CONNECT).
@@ -120,6 +131,8 @@ struct NodeEntry {
     /// still "fresh" on a given host (transport-level reachability). App-level
     /// blocks like 429/403 are inside the TLS tunnel and not observable here.
     host_fails: Arc<StdMutex<HashMap<String, u32>>>,
+    /// Number of in-flight dials currently being handled by this node.
+    in_flight: Arc<AtomicU32>,
     /// Public egress IP + geo, self-reported by the node (best-effort, may be
     /// empty until the first report arrives).
     info: Arc<StdMutex<NodeReport>>,
@@ -155,7 +168,7 @@ struct Hub {
     /// conn_id -> (expected data-conn nonce, waker for the client). The nonce
     /// authenticates the data connection: only the node we sent the Dial to
     /// knows it, so a guessed conn_id alone cannot hijack the splice.
-    pending: Mutex<HashMap<u64, (u64, oneshot::Sender<Conn>)>>,
+    pending: Mutex<HashMap<u64, (u64, oneshot::Sender<MuxStream>)>>,
     rr: AtomicUsize,
     conn_seq: AtomicU64,
     /// Sticky sessions: session key -> (node name, last use). A `user-session-K`
@@ -164,13 +177,20 @@ struct Hub {
     /// Cumulative bytes relayed per node id and per proxy user (in-memory).
     node_bytes: Mutex<HashMap<String, u64>>,
     user_bytes: Mutex<HashMap<String, u64>>,
+    /// Per node id: (successful dials, total dials, last error reason). For the
+    /// dashboard's success-rate + last-error display.
+    node_stats: Mutex<NodeStats>,
 }
+
+/// Per node id -> (ok dials, total dials, last error). Aliased to keep the
+/// `Hub` field readable (clippy::type_complexity).
+type NodeStats = HashMap<String, (u32, u32, Option<String>)>;
 
 impl Hub {
     fn next_conn_id(&self) -> u64 {
         self.conn_seq.fetch_add(1, Ordering::Relaxed)
     }
-    /// Snapshot of connected nodes (id, name, tx, fails, host_fails). When `sel`
+    /// Snapshot of connected nodes (id, name, tx, fails, host_fails, in_flight). When `sel`
     /// is `Some(name)`, only nodes with that exact device name are returned, so a
     /// client can route through one specific device (and gets nothing, not a
     /// fallback, if it is offline).
@@ -185,6 +205,7 @@ impl Hub {
         mpsc::UnboundedSender<HubToNode>,
         Arc<AtomicU32>,
         Arc<StdMutex<HashMap<String, u32>>>,
+        Arc<AtomicU32>,
     )> {
         self.nodes
             .lock()
@@ -198,6 +219,7 @@ impl Hub {
                     n.tx.clone(),
                     n.fails.clone(),
                     n.host_fails.clone(),
+                    n.in_flight.clone(),
                 )
             })
             .collect()
@@ -239,6 +261,18 @@ impl Hub {
                 .or_insert(0) += n;
         }
     }
+    /// Record a dial outcome for a node: bumps total, bumps ok on success, sets
+    /// the last error reason on failure. Feeds the dashboard success-rate column.
+    async fn record_dial(&self, node_id: &str, ok: bool, reason: Option<&str>) {
+        let mut m = self.node_stats.lock().await;
+        let e = m.entry(node_id.to_string()).or_insert((0, 0, None));
+        e.1 += 1;
+        if ok {
+            e.0 += 1;
+        } else {
+            e.2 = reason.map(str::to_string);
+        }
+    }
     /// Snapshot of nodes whose reported geo country matches `country`
     /// (case-insensitive). Same tuple shape as [`snapshot`].
     #[allow(clippy::type_complexity)]
@@ -251,6 +285,7 @@ impl Hub {
         mpsc::UnboundedSender<HubToNode>,
         Arc<AtomicU32>,
         Arc<StdMutex<HashMap<String, u32>>>,
+        Arc<AtomicU32>,
     )> {
         self.nodes
             .lock()
@@ -271,6 +306,7 @@ impl Hub {
                     n.tx.clone(),
                     n.fails.clone(),
                     n.host_fails.clone(),
+                    n.in_flight.clone(),
                 )
             })
             .collect()
@@ -281,21 +317,25 @@ impl Hub {
     async fn remove_node(&self, id: &NodeId) {
         self.nodes.lock().await.retain(|n| &n.id != id);
         self.node_bytes.lock().await.remove(&id.0);
+        self.node_stats.lock().await.remove(&id.0);
     }
-    async fn insert_pending(&self, id: u64, nonce: u64, tx: oneshot::Sender<Conn>) {
+    async fn insert_pending(&self, id: u64, nonce: u64, tx: oneshot::Sender<MuxStream>) {
         self.pending.lock().await.insert(id, (nonce, tx));
     }
-    async fn take_pending(&self, id: u64) -> Option<(u64, oneshot::Sender<Conn>)> {
+    async fn take_pending(&self, id: u64) -> Option<(u64, oneshot::Sender<MuxStream>)> {
         self.pending.lock().await.remove(&id)
     }
     async fn list_node_info(&self) -> Vec<NodeInfo> {
         let bytes = self.node_bytes.lock().await.clone();
+        let stats = self.node_stats.lock().await.clone();
         self.nodes
             .lock()
             .await
             .iter()
             .map(|n| {
                 let r = n.info.lock().unwrap().clone();
+                let (ok, total, last_error) = stats.get(&n.id.0).cloned().unwrap_or((0, 0, None));
+                let success_rate = success_pct(ok, total);
                 NodeInfo {
                     id: n.id.0.clone(),
                     name: n.name.clone(),
@@ -306,6 +346,9 @@ impl Hub {
                     city: r.city,
                     latency_ms: r.latency_ms,
                     bytes: bytes.get(&n.id.0).copied().unwrap_or(0),
+                    success_rate,
+                    dials: total,
+                    last_error,
                 }
             })
             .collect()
@@ -317,6 +360,12 @@ fn unix_now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Success rate as a percent, or None until at least one dial has been tried
+/// (avoids divide-by-zero and shows a dash in the dashboard for fresh nodes).
+fn success_pct(ok: u32, total: u32) -> Option<f64> {
+    (total > 0).then(|| (ok as f64 / total as f64) * 100.0)
 }
 
 /// Random lowercase-alnum token (32 chars).
@@ -481,6 +530,7 @@ pub async fn run_with_listeners(
         sessions: Mutex::new(HashMap::new()),
         node_bytes: Mutex::new(HashMap::new()),
         user_bytes: Mutex::new(HashMap::new()),
+        node_stats: Mutex::new(HashMap::new()),
     });
 
     tracing::info!(
@@ -545,88 +595,47 @@ pub async fn run_with_listeners(
 }
 
 async fn handle_node_conn(stream: TcpStream, hub: Arc<Hub>) -> Result<()> {
-    let mut conn = match &hub.tls {
+    let conn = match &hub.tls {
         Some(acceptor) => Conn::ServerTls(acceptor.accept(stream).await?),
         None => Conn::Plain(stream),
     };
-    let greeting: Greeting = read_msg(&mut conn).await?;
-    match greeting {
-        Greeting::Control(hello) => handle_control(hello, conn, hub).await,
-        Greeting::Data(dh) => handle_data(dh, conn, hub).await,
-    }
-}
+    // The node<->hub link is one yamux connection. The hub only accepts streams;
+    // the first is the control channel, each later one is a data stream for a
+    // pending dial. The driver continuously polls the connection (yamux only
+    // makes progress while polled) and forwards inbound streams over the channel,
+    // so the connection stays live even while we read Hello / splice. Its handle
+    // aborts the driver on drop, so every return below tears the link down.
+    let (mut stream_rx, _driver) = mux::server(conn);
 
-async fn handle_control(hello: Hello, mut conn: Conn, hub: Arc<Hub>) -> Result<()> {
-    // 0. Refuse a node speaking a different protocol version, with a clear
-    //    reason instead of a confusing decode failure later.
-    if hello.protocol_version != warren_proto::PROTOCOL_VERSION {
-        let _ = write_msg(
-            &mut conn,
-            &HelloReply::Reject {
-                reason: format!(
-                    "protocol version mismatch: hub speaks {}, node speaks {}; update the node",
-                    warren_proto::PROTOCOL_VERSION,
-                    hello.protocol_version
-                ),
-            },
-        )
-        .await;
-        return Ok(());
-    }
-
-    // 1. The node must own its key and present a fresh timestamp.
-    if !identity::verify_auth(&hello.pubkey, hello.timestamp, &hello.signature) {
-        let _ = write_msg(
-            &mut conn,
-            &HelloReply::Reject {
-                reason: "bad signature".into(),
-            },
-        )
-        .await;
-        return Ok(());
-    }
-    let skew = (unix_now() - hello.timestamp as i64).abs();
-    if skew > 120 {
-        let _ = write_msg(
-            &mut conn,
-            &HelloReply::Reject {
-                reason: "stale timestamp".into(),
-            },
-        )
-        .await;
-        return Ok(());
-    }
-
-    // 2. Enrollment: an already-approved key, or a valid token (auto-approve),
-    //    otherwise record as pending and ask for admin approval.
-    let pk_hex = identity::fingerprint(&hello.pubkey);
-    let code = identity::short_code(&hello.pubkey);
-    if !hub.store.is_node_approved(&pk_hex).unwrap_or(false) {
-        let by_token = hello
-            .token
-            .as_deref()
-            .map(|t| hub.store.token_valid(t).unwrap_or(false))
-            .unwrap_or(false);
-        if by_token {
-            let _ = hub.store.approve_node(&pk_hex, &hello.node_name);
-            tracing::info!(%code, name = %hello.node_name, "node approved via token");
-        } else {
-            let _ = hub.store.add_pending(&pk_hex, &hello.node_name, &code);
-            let _ = write_msg(&mut conn, &HelloReply::Pending { code: code.clone() }).await;
-            tracing::info!(%code, name = %hello.node_name, "node pending admin approval");
-            return Ok(());
+    // Enroll on the first inbound stream (the control channel), bounded so a
+    // peer that finishes TLS then stalls cannot pin the driver task + socket.
+    // Any early exit (timeout, decode error, reject, wrong first stream) drops
+    // the driver handle and tears down; only a Welcome falls through.
+    let enrolled = timeout(ENROLL_TIMEOUT, async {
+        let mut ctrl = match stream_rx.recv().await {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let hello = match read_msg::<_, Greeting>(&mut ctrl).await? {
+            Greeting::Control(h) => h,
+            Greeting::Data(_) => {
+                tracing::warn!("node's first stream was not control; dropping connection");
+                return Ok(None);
+            }
+        };
+        // On reject/pending the reply is already sent inside enroll_node.
+        match enroll_node(&hello, &mut ctrl, &hub).await? {
+            Some(id) => Ok::<_, anyhow::Error>(Some((ctrl, hello, id))),
+            None => Ok(None),
         }
-    }
-
-    let node_id = NodeId(format!("{}-{}", hello.node_name, code));
-    write_msg(
-        &mut conn,
-        &HelloReply::Welcome {
-            node_id: node_id.clone(),
-        },
-    )
-    .await?;
-    tracing::info!(node = %node_id.0, "node enrolled");
+    })
+    .await;
+    let (ctrl, hello, node_id) = match enrolled {
+        Ok(Ok(Some(v))) => v,
+        // timeout, decode error, reject/pending, or non-control first stream:
+        // dropping _driver aborts the connection.
+        _ => return Ok(()),
+    };
 
     let (tx, mut rx) = mpsc::unbounded_channel::<HubToNode>();
     let info = Arc::new(StdMutex::new(NodeReport::default()));
@@ -637,11 +646,13 @@ async fn handle_control(hello: Hello, mut conn: Conn, hub: Arc<Hub>) -> Result<(
         tx: tx.clone(),
         fails: Arc::new(AtomicU32::new(0)),
         host_fails: Arc::new(StdMutex::new(HashMap::new())),
+        in_flight: Arc::new(AtomicU32::new(0)),
         info: info.clone(),
     })
     .await;
+    tracing::info!(node = %node_id.0, "node enrolled");
 
-    let (mut rd, mut wr) = split(conn);
+    let (mut rd, mut wr) = split(ctrl);
 
     let ping_tx = tx.clone();
     let pinger = tokio::spawn(async move {
@@ -662,49 +673,167 @@ async fn handle_control(hello: Hello, mut conn: Conn, hub: Arc<Hub>) -> Result<(
         }
     });
 
-    let res: Result<()> = async {
-        loop {
-            let msg: NodeToHub = read_msg(&mut rd).await?;
+    // Control receive loop runs as its own task: read_msg is not cancel-safe, so
+    // it cannot share a tokio::select with the data-accept loop below. A dead peer
+    // (no traffic for NODE_READ_TIMEOUT, ~3 missed pings) ends it and tears down.
+    let ctrl_info = info.clone();
+    let ctrl_hub = hub.clone();
+    let mut ctrl_loop = tokio::spawn(async move {
+        // Loop ends (and the node is torn down) on a decode error or a dead-peer
+        // timeout: no NodeToHub traffic for LINK_READ_TIMEOUT, ~3 missed pings.
+        while let Ok(Ok(msg)) =
+            timeout(mux::LINK_READ_TIMEOUT, read_msg::<_, NodeToHub>(&mut rd)).await
+        {
             match msg {
                 NodeToHub::Pong { .. } => {}
                 NodeToHub::DialFailed { conn_id, reason } => {
-                    tracing::debug!(node = %node_id.0, conn_id, %reason, "node reported dial failed");
-                    let _ = hub.take_pending(conn_id).await;
+                    tracing::debug!(conn_id, %reason, "node reported dial failed");
+                    let _ = ctrl_hub.take_pending(conn_id).await;
                 }
                 NodeToHub::Info {
                     public_ip,
                     country,
                     city,
                 } => {
-                    let mut r = info.lock().unwrap();
+                    let mut r = ctrl_info.lock().unwrap();
                     r.ip = public_ip;
                     r.country = country;
                     r.city = city;
                 }
                 NodeToHub::Latency { ms } => {
-                    info.lock().unwrap().latency_ms = Some(ms);
+                    ctrl_info.lock().unwrap().latency_ms = Some(ms);
                 }
             }
         }
+    });
+
+    // Data-accept loop: each later inbound stream is a data connection for a
+    // pending dial. Streams arrive from the driver via the channel; recv returns
+    // None when the driver stops (connection closed).
+    let accept_hub = hub.clone();
+    let accept = async {
+        while let Some(stream) = stream_rx.recv().await {
+            let h = accept_hub.clone();
+            tokio::spawn(async move {
+                let _ = handle_data_stream(stream, h).await;
+            });
+        }
+    };
+
+    // Whichever ends first (connection died, or control loop hit error/timeout)
+    // tears the node down.
+    tokio::select! {
+        _ = accept => {}
+        _ = &mut ctrl_loop => {}
     }
-    .await;
 
     hub.remove_node(&node_id).await;
     pinger.abort();
     writer.abort();
+    ctrl_loop.abort();
+    // _driver's DriverHandle aborts the yamux driver when it drops here.
     tracing::info!(node = %node_id.0, "node disconnected");
-    res
+    Ok(())
 }
 
-async fn handle_data(dh: DataHello, conn: Conn, hub: Arc<Hub>) -> Result<()> {
+/// A data stream's first frame identifies which pending dial it serves. The read
+/// is bounded so a stream opened but never identified cannot leak this task.
+async fn handle_data_stream(mut s: MuxStream, hub: Arc<Hub>) -> Result<()> {
+    match timeout(DATA_HELLO_TIMEOUT, read_msg::<_, Greeting>(&mut s)).await?? {
+        Greeting::Data(dh) => handle_data(dh, s, hub).await,
+        // A second control stream is unexpected; ignore it.
+        Greeting::Control(_) => Ok(()),
+    }
+}
+
+/// Validate a node's Hello on the control stream and reply. Returns the node's
+/// id on success (Welcome sent); None if rejected or left pending (reply sent).
+async fn enroll_node(
+    hello: &Hello,
+    conn: &mut MuxStream,
+    hub: &Arc<Hub>,
+) -> Result<Option<NodeId>> {
+    // 0. Refuse a node speaking a different protocol version, with a clear
+    //    reason instead of a confusing decode failure later.
+    if hello.protocol_version != warren_proto::PROTOCOL_VERSION {
+        let _ = write_msg(
+            conn,
+            &HelloReply::Reject {
+                reason: format!(
+                    "protocol version mismatch: hub speaks {}, node speaks {}; update the node",
+                    warren_proto::PROTOCOL_VERSION,
+                    hello.protocol_version
+                ),
+            },
+        )
+        .await;
+        return Ok(None);
+    }
+
+    // 1. The node must own its key and present a fresh timestamp.
+    if !identity::verify_auth(&hello.pubkey, hello.timestamp, &hello.signature) {
+        let _ = write_msg(
+            conn,
+            &HelloReply::Reject {
+                reason: "bad signature".into(),
+            },
+        )
+        .await;
+        return Ok(None);
+    }
+    let skew = (unix_now() - hello.timestamp as i64).abs();
+    if skew > 120 {
+        let _ = write_msg(
+            conn,
+            &HelloReply::Reject {
+                reason: "stale timestamp".into(),
+            },
+        )
+        .await;
+        return Ok(None);
+    }
+
+    // 2. Enrollment: an already-approved key, or a valid token (auto-approve),
+    //    otherwise record as pending and ask for admin approval.
+    let pk_hex = identity::fingerprint(&hello.pubkey);
+    let code = identity::short_code(&hello.pubkey);
+    if !hub.store.is_node_approved(&pk_hex).unwrap_or(false) {
+        let by_token = hello
+            .token
+            .as_deref()
+            .map(|t| hub.store.token_valid(t).unwrap_or(false))
+            .unwrap_or(false);
+        if by_token {
+            let _ = hub.store.approve_node(&pk_hex, &hello.node_name);
+            tracing::info!(%code, name = %hello.node_name, "node approved via token");
+        } else {
+            let _ = hub.store.add_pending(&pk_hex, &hello.node_name, &code);
+            let _ = write_msg(conn, &HelloReply::Pending { code: code.clone() }).await;
+            tracing::info!(%code, name = %hello.node_name, "node pending admin approval");
+            return Ok(None);
+        }
+    }
+
+    let node_id = NodeId(format!("{}-{}", hello.node_name, code));
+    write_msg(
+        conn,
+        &HelloReply::Welcome {
+            node_id: node_id.clone(),
+        },
+    )
+    .await?;
+    Ok(Some(node_id))
+}
+
+async fn handle_data(dh: DataHello, conn: MuxStream, hub: Arc<Hub>) -> Result<()> {
     match hub.take_pending(dh.conn_id).await {
         Some((nonce, tx)) if nonce == dh.nonce => {
             let _ = tx.send(conn);
         }
         Some((nonce, tx)) => {
             // Right conn_id, wrong nonce: not the node we dialed. Drop it and
-            // put the waker back so the real node's data conn can still arrive.
-            tracing::warn!(conn_id = dh.conn_id, "data conn nonce mismatch; dropped");
+            // put the waker back so the real node's data stream can still arrive.
+            tracing::warn!(conn_id = dh.conn_id, "data stream nonce mismatch; dropped");
             hub.pending.lock().await.insert(dh.conn_id, (nonce, tx));
         }
         None => tracing::debug!(conn_id = dh.conn_id, "data conn with no pending dial"),
@@ -866,16 +995,35 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
     // last, global fails as the final tie-break. Stable sort keeps round-robin
     // order within a tier.
     order.sort_by_key(|&i| {
-        let hf = host_fail_count(&nodes[i].4, &host);
-        let global = nodes[i].3.load(Ordering::Relaxed);
-        (hf >= UNHEALTHY_AT, hf, global)
+        let node_fails = nodes[i].3.load(Ordering::Relaxed);
+        let node_host_fails = host_fail_count(&nodes[i].4, &host);
+        let node_in_flight = nodes[i].5.load(Ordering::Relaxed);
+        (
+            node_fails >= UNHEALTHY_AT,
+            node_host_fails >= UNHEALTHY_AT,
+            node_in_flight,
+            node_host_fails,
+            node_fails,
+        )
     });
 
-    for idx in order {
-        let (node_id, node_name, node_tx, fails, host_fails) = &nodes[idx];
+    let mut uncapped_idx: Vec<usize> = Vec::new();
+    let mut capped_idx: Vec<usize> = Vec::new();
+    for &i in &order {
+        if nodes[i].5.load(Ordering::Relaxed) >= MAX_INFLIGHT_PER_NODE {
+            capped_idx.push(i);
+        } else {
+            uncapped_idx.push(i);
+        }
+    }
+
+    for idx in uncapped_idx.iter().chain(capped_idx.iter()).copied() {
+        let (node_id, node_name, node_tx, fails, host_fails, in_flight) = &nodes[idx];
+        let _g = mux::InFlightGuard::new(in_flight.clone());
+
         let conn_id = hub.next_conn_id();
         let nonce = rand::random::<u64>();
-        let (otx, orx) = oneshot::channel::<Conn>();
+        let (otx, orx) = oneshot::channel::<MuxStream>();
         hub.insert_pending(conn_id, nonce, otx).await;
 
         if node_tx
@@ -889,6 +1037,8 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
         {
             hub.take_pending(conn_id).await;
             fails.fetch_add(1, Ordering::Relaxed);
+            hub.record_dial(&node_id.0, false, Some("dial send failed"))
+                .await;
             continue;
         }
 
@@ -896,6 +1046,7 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
             Ok(Ok(mut data)) => {
                 fails.store(0, Ordering::Relaxed);
                 host_fails.lock().unwrap().remove(&host);
+                hub.record_dial(&node_id.0, true, None).await;
                 // This device served the request: stick the session to it.
                 if let Some(key) = &session_key {
                     hub.set_session(key, node_name).await;
@@ -913,6 +1064,8 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
             _ => {
                 hub.take_pending(conn_id).await;
                 fails.fetch_add(1, Ordering::Relaxed);
+                hub.record_dial(&node_id.0, false, Some("dial timed out"))
+                    .await;
                 {
                     let mut hf = host_fails.lock().unwrap();
                     *hf.entry(host.clone()).or_insert(0) += 1;
@@ -974,6 +1127,9 @@ struct NodeInfo {
     city: Option<String>,
     latency_ms: Option<u32>,
     bytes: u64,
+    success_rate: Option<f64>,
+    dials: u32,
+    last_error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1074,6 +1230,8 @@ struct InfoJson {
     /// than the enroll/admin tokens already shown.
     proxy_pass: Option<String>,
     install_url: String,
+    /// Hub binary version, shown in the dashboard header.
+    version: String,
 }
 
 async fn api_info(
@@ -1095,6 +1253,7 @@ async fn api_info(
         proxy_user,
         proxy_pass,
         install_url: "https://raw.githubusercontent.com/doedja/warren/main/install.sh".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
     }))
 }
 
@@ -1318,7 +1477,22 @@ async fn api_delete_node_key(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_route, Route};
+    use super::{parse_route, success_pct, Route};
+
+    #[test]
+    fn success_pct_no_dials_is_none() {
+        // Fresh node, no dials yet: dash in the dashboard, never a divide-by-zero.
+        assert_eq!(success_pct(0, 0), None);
+        assert_eq!(success_pct(5, 0), None); // total drives it, not ok
+    }
+
+    #[test]
+    fn success_pct_math() {
+        assert_eq!(success_pct(1, 1), Some(100.0));
+        assert_eq!(success_pct(0, 1), Some(0.0));
+        assert_eq!(success_pct(1, 2), Some(50.0));
+        assert_eq!(success_pct(98, 100), Some(98.0));
+    }
 
     #[test]
     fn route_parsing() {

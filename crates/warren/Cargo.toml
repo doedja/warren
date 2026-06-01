@@ -34,3 +34,12 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 # Persistence + admin surface.
 rusqlite = { version = "0.32", features = ["bundled"] }
 axum = "0.7"
+# Stream multiplexing on the node<->hub link: one connection carries the control
+# channel plus one logical stream per proxied request (replaces conn-per-request).
+yamux = "0.13"
+futures = "0.3"
+tokio-util = { version = "0.7", features = ["compat"] }
+
+[dev-dependencies]
+# test-util enables tokio's paused clock (start_paused) for fast drain tests.
+tokio = { version = "1", features = ["full", "test-util"] }

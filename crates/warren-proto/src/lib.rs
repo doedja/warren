@@ -3,8 +3,11 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Protocol version. Bump on any breaking change to the message shapes.
-pub const PROTOCOL_VERSION: u16 = 3;
+/// Protocol version. Bump on any breaking change to the message shapes OR the
+/// transport framing. v4: the node<->hub link is now a single yamux-multiplexed
+/// connection (one logical stream per request) instead of one TCP connection
+/// per request. The message shapes below are unchanged; only the framing moved.
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// Stable identity the hub assigns to a node at enrollment.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -149,7 +152,7 @@ mod tests {
 
     #[test]
     fn test_protocol_version() {
-        assert_eq!(PROTOCOL_VERSION, 3);
+        assert_eq!(PROTOCOL_VERSION, 4);
     }
 
     #[test]

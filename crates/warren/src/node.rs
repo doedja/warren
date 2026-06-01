@@ -1,21 +1,24 @@
 //! Node mode: the outbound-only agent that runs on each device.
 //!
-//! Opens one control connection to the hub (Hello + token), then serves Dial
-//! requests: for each, dial the target from THIS machine (residential egress),
-//! open a fresh data connection to the hub tagged with the conn_id, and splice
-//! the target to that data connection. Reconnects on drop.
+//! Dials ONE yamux-multiplexed connection to the hub, opens a control stream
+//! (Hello + token), then serves Dial requests: for each, dial the target from
+//! THIS machine (residential egress), open a fresh logical stream to the hub
+//! tagged with the conn_id, and splice the target to that stream. Opening a
+//! stream is cheap (no new TCP/TLS handshake). Reconnects on drop.
 //!
 //! With `--tls` the node link is TLS; the hub cert is pinned by
 //! `--hub-fingerprint` (or accepted blindly with `--insecure`, dev only).
 
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Subcommand};
+use rand::Rng;
 use tokio::io::{copy_bidirectional, split};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::TlsConnector;
 
@@ -25,8 +28,14 @@ use warren_proto::{
 
 use crate::conn::Conn;
 use crate::identity::Identity;
+use crate::mux;
 use crate::tls;
 use crate::wire::{read_msg, write_msg};
+
+/// On SIGTERM/SIGINT the node stops taking new dials and waits up to this long
+/// for in-flight splices to finish before exiting, so a redeploy does not cut
+/// live requests.
+const DRAIN_BUDGET: Duration = Duration::from_secs(20);
 
 #[derive(Args, Debug)]
 pub struct NodeArgs {
@@ -133,13 +142,109 @@ pub async fn run_agent(args: RunArgs) -> Result<()> {
     let identity =
         Identity::load_or_create(&key_path).with_context(|| format!("node key {key_path}"))?;
     tracing::info!(code = %crate::identity::short_code(&identity.pubkey()), key = %key_path, "node identity ready");
+
+    // Drain on shutdown: a watch channel flips to true on SIGTERM/SIGINT; the
+    // control read loop breaks on it, the reconnect loop exits instead of
+    // dialing again, and in-flight splices get DRAIN_BUDGET to finish.
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let in_flight = Arc::new(AtomicU32::new(0));
+    // On unix the signal task owns the sender. On non-unix there is no SIGTERM,
+    // so keep the sender alive here (dropping it would make rx.changed() error
+    // out immediately and spin the read loop).
+    #[cfg(unix)]
+    spawn_signal_handler(shutdown_tx);
+    #[cfg(not(unix))]
+    let _shutdown_tx_keepalive = shutdown_tx;
+
+    let mut delay_ms: u64 = 0;
     loop {
-        match connect_once(&r, &name, &connector, &identity).await {
-            Ok(()) => tracing::warn!("control connection closed; reconnecting in 3s"),
-            Err(e) => tracing::warn!(error = %e, "control connection error; reconnecting in 3s"),
+        let res = connect_once(
+            &r,
+            &name,
+            &connector,
+            &identity,
+            shutdown_rx.clone(),
+            in_flight.clone(),
+        )
+        .await;
+        if *shutdown_rx.borrow() {
+            break;
         }
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        match res {
+            Ok(()) => {
+                tracing::warn!("control connection closed; reconnecting immediately");
+                delay_ms = 0;
+            }
+            Err(e) => {
+                let sleep = backoff_sleep(&mut delay_ms);
+                tracing::warn!(error = %e, backoff_ms = sleep.as_millis() as u64, "control connection error; reconnecting");
+                tokio::time::sleep(sleep).await;
+            }
+        }
     }
+
+    // connect_once drains in-flight splices on shutdown (while its yamux driver
+    // is still alive), so by the time we break out there is nothing left to wait
+    // for here.
+    Ok(())
+}
+
+/// Wait up to DRAIN_BUDGET for in-flight dials to finish, then return so the
+/// process can exit. Logs how many were still running if the budget elapses.
+async fn drain_in_flight(in_flight: &AtomicU32) {
+    let n = in_flight.load(Ordering::Relaxed);
+    if n == 0 {
+        return;
+    }
+    tracing::info!(in_flight = n, "draining in-flight requests before exit");
+    let deadline = tokio::time::Instant::now() + DRAIN_BUDGET;
+    while in_flight.load(Ordering::Relaxed) > 0 {
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                remaining = in_flight.load(Ordering::Relaxed),
+                "drain budget elapsed; exiting with requests still in flight"
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    tracing::info!("drain complete; exiting");
+}
+
+/// Flip the shutdown watch on the first SIGTERM/SIGINT. On non-unix there is no
+/// SIGTERM, so drain is skipped (the process is killed directly).
+#[cfg(unix)]
+fn spawn_signal_handler(tx: watch::Sender<bool>) {
+    tokio::spawn(async move {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let mut intr = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = intr.recv() => {}
+        }
+        tracing::info!("shutdown signal received; starting graceful drain");
+        let _ = tx.send(true);
+    });
+}
+
+fn backoff_sleep(delay_ms: &mut u64) -> Duration {
+    const BASE: u64 = 1_000;
+    const CAP: u64 = 30_000;
+    if *delay_ms == 0 {
+        *delay_ms = BASE;
+        return Duration::ZERO;
+    }
+    let wait = (*delay_ms).min(CAP);
+    let j = rand::thread_rng().gen_range(0..=(wait / 4));
+    *delay_ms = (*delay_ms * 2).min(CAP);
+    Duration::from_millis(wait + j)
 }
 
 fn default_key_file() -> String {
@@ -171,8 +276,17 @@ async fn connect_once(
     name: &str,
     connector: &Option<TlsConnector>,
     identity: &Identity,
+    mut shutdown_rx: watch::Receiver<bool>,
+    in_flight: Arc<AtomicU32>,
 ) -> Result<()> {
-    let mut conn = dial_conn(&r.hub, connector).await?;
+    let conn = dial_conn(&r.hub, connector).await?;
+    // One yamux connection carries everything. The node opens streams: the
+    // control stream first, then one per Dial. The driver task owns the yamux
+    // Connection and serves these opens; its handle aborts the driver on drop,
+    // so every return path below tears the connection down without a manual call.
+    let (opener, _driver) = mux::client(conn);
+
+    let mut ctrl = mux::open(&opener).await?;
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -188,9 +302,9 @@ async fn connect_once(
         platform: current_platform(),
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
     };
-    write_msg(&mut conn, &Greeting::Control(hello)).await?;
+    write_msg(&mut ctrl, &Greeting::Control(hello)).await?;
 
-    let reply: HelloReply = read_msg(&mut conn).await?;
+    let reply: HelloReply = read_msg(&mut ctrl).await?;
     match reply {
         HelloReply::Welcome { node_id } => {
             tracing::info!(node = %node_id.0, hub = %r.hub, "enrolled")
@@ -198,10 +312,12 @@ async fn connect_once(
         HelloReply::Pending { code } => {
             anyhow::bail!("pending admin approval (code {code}); approve it in the hub dashboard")
         }
-        HelloReply::Reject { reason } => anyhow::bail!("hub rejected node: {reason}"),
+        HelloReply::Reject { reason } => {
+            anyhow::bail!("hub rejected node: {reason}")
+        }
     }
 
-    let (mut rd, mut wr) = split(conn);
+    let (mut rd, mut wr) = split(ctrl);
     let (ntx, mut nrx) = mpsc::unbounded_channel::<NodeToHub>();
 
     let writer = tokio::spawn(async move {
@@ -229,61 +345,55 @@ async fn connect_once(
         }
     });
 
-    let hub_addr = r.hub.clone();
-    let connector = connector.clone();
-
-    // Pool of pre-dialed (TLS-done) data connections kept warm so a Dial skips
-    // the connect+handshake on the node->hub leg. A refiller keeps ~3 ready; a
-    // Dial pops one (or dials fresh on miss/stale). Node-side only: the hub just
-    // waits for the DataHello frame on each connection as before.
-    let pool: Arc<StdMutex<Vec<Conn>>> = Arc::new(StdMutex::new(Vec::new()));
-    let fill_pool = pool.clone();
-    let fill_addr = hub_addr.clone();
-    let fill_conn = connector.clone();
-    let filler = tokio::spawn(async move {
-        const TARGET: usize = 3;
-        loop {
-            let n = fill_pool.lock().unwrap().len();
-            if n < TARGET {
-                match dial_conn(&fill_addr, &fill_conn).await {
-                    Ok(c) => fill_pool.lock().unwrap().push(c),
-                    Err(_) => tokio::time::sleep(Duration::from_secs(2)).await,
-                }
-            } else {
-                tokio::time::sleep(Duration::from_millis(500)).await;
+    let res: Result<()> = (async {
+        'read: loop {
+            // Already draining: stop taking new dials, let the loop exit cleanly.
+            if *shutdown_rx.borrow() {
+                break 'read Ok(());
+            }
+            tokio::select! {
+                _ = shutdown_rx.changed() => break 'read Ok(()),
+                r = tokio::time::timeout(mux::LINK_READ_TIMEOUT, read_msg(&mut rd)) => match r {
+                    Ok(Ok(msg)) => match msg {
+                        HubToNode::Ping { nonce } => {
+                            let _ = ntx.send(NodeToHub::Pong { nonce });
+                        }
+                        HubToNode::Dial {
+                            conn_id,
+                            nonce,
+                            host,
+                            port,
+                        } => {
+                            let opener = opener.clone();
+                            let ntx2 = ntx.clone();
+                            // RAII guard so the count is decremented even if the
+                            // dial task panics; drain accounting relies on it.
+                            let guard = mux::InFlightGuard::new(in_flight.clone());
+                            tokio::spawn(async move {
+                                let _g = guard;
+                                handle_dial(opener, conn_id, nonce, host, port, ntx2).await;
+                            });
+                        }
+                    },
+                    Ok(Err(e)) => break 'read Err(e.into()),
+                    Err(_) => break 'read Err(anyhow!("node<->hub read timed out (dead hub)")),
+                },
             }
         }
-    });
-
-    let res: Result<()> = async {
-        loop {
-            let msg: HubToNode = read_msg(&mut rd).await?;
-            match msg {
-                HubToNode::Ping { nonce } => {
-                    let _ = ntx.send(NodeToHub::Pong { nonce });
-                }
-                HubToNode::Dial {
-                    conn_id,
-                    nonce,
-                    host,
-                    port,
-                } => {
-                    let addr = hub_addr.clone();
-                    let conn_tor = connector.clone();
-                    let ntx2 = ntx.clone();
-                    let pool2 = pool.clone();
-                    tokio::spawn(async move {
-                        handle_dial(addr, conn_tor, pool2, conn_id, nonce, host, port, ntx2).await;
-                    });
-                }
-            }
-        }
-    }
+    })
     .await;
+
+    // Graceful drain: if we are shutting down, in-flight splices still ride the
+    // yamux driver, so let them finish (up to the budget) BEFORE aborting it.
+    // The read loop already exited, so no new dials are accepted meanwhile.
+    if *shutdown_rx.borrow() {
+        drain_in_flight(&in_flight).await;
+    }
 
     writer.abort();
     reporter.abort();
-    filler.abort();
+    // _driver's DriverHandle aborts the yamux driver when it drops here (after
+    // the drain above, so in-flight splices were not cut short on shutdown).
     res
 }
 
@@ -322,9 +432,7 @@ async fn fetch_public_info() -> Option<(String, Option<String>, Option<String>, 
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_dial(
-    hub_addr: String,
-    connector: Option<TlsConnector>,
-    pool: Arc<StdMutex<Vec<Conn>>>,
+    opener: mux::Opener,
     conn_id: u64,
     nonce: u64,
     host: String,
@@ -346,43 +454,25 @@ async fn handle_dial(
         }
     };
 
-    // Data connection back to the hub, tagged with conn_id: a warm pooled one if
-    // available, else dial fresh. Pop is sync (no await while locked).
-    let pooled = pool.lock().unwrap().pop();
-    let dh = Greeting::Data(DataHello { conn_id, nonce });
-    let mut data = match pooled {
-        Some(c) => c,
-        None => match dial_conn(&hub_addr, &connector).await {
-            Ok(d) => d,
-            Err(e) => {
-                let _ = ntx.send(NodeToHub::DialFailed {
-                    conn_id,
-                    reason: format!("data dial: {e}"),
-                });
-                return;
-            }
-        },
-    };
-    // A pooled connection may have gone stale (hub restart, idle close); if the
-    // DataHello write fails, dial a fresh one and retry once.
-    if write_msg(&mut data, &dh).await.is_err() {
-        data = match dial_conn(&hub_addr, &connector).await {
-            Ok(d) => d,
-            Err(e) => {
-                let _ = ntx.send(NodeToHub::DialFailed {
-                    conn_id,
-                    reason: format!("data dial: {e}"),
-                });
-                return;
-            }
-        };
-        if let Err(e) = write_msg(&mut data, &dh).await {
+    // Open a fresh logical stream back to the hub, tagged with conn_id+nonce. No
+    // TCP/TLS handshake: it is multiplexed over the existing connection.
+    let mut data = match mux::open(&opener).await {
+        Ok(s) => s,
+        Err(e) => {
             let _ = ntx.send(NodeToHub::DialFailed {
                 conn_id,
-                reason: format!("data hello: {e}"),
+                reason: format!("open data stream: {e}"),
             });
             return;
         }
+    };
+    let dh = Greeting::Data(DataHello { conn_id, nonce });
+    if let Err(e) = write_msg(&mut data, &dh).await {
+        let _ = ntx.send(NodeToHub::DialFailed {
+            conn_id,
+            reason: format!("data hello: {e}"),
+        });
+        return;
     }
 
     let _ = copy_bidirectional(&mut data, &mut target).await;
@@ -601,5 +691,77 @@ fn current_platform() -> Platform {
         Platform::MacOs
     } else {
         Platform::Other
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{backoff_sleep, drain_in_flight, DRAIN_BUDGET};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    // Zero in-flight: drain returns at once, no waiting.
+    #[tokio::test(start_paused = true)]
+    async fn drain_returns_immediately_when_idle() {
+        let n = Arc::new(AtomicU32::new(0));
+        let start = tokio::time::Instant::now();
+        drain_in_flight(&n).await;
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    // In-flight count falls to zero before the budget: drain returns early.
+    #[tokio::test(start_paused = true)]
+    async fn drain_waits_until_in_flight_clears() {
+        let n = Arc::new(AtomicU32::new(2));
+        let n2 = n.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            n2.store(0, Ordering::Relaxed);
+        });
+        let start = tokio::time::Instant::now();
+        drain_in_flight(&n).await;
+        let waited = start.elapsed();
+        // Cleared at ~1s, well under the budget, and not instant.
+        assert!(waited >= Duration::from_secs(1));
+        assert!(waited < DRAIN_BUDGET);
+    }
+
+    // In-flight never clears: drain gives up after the budget elapses.
+    #[tokio::test(start_paused = true)]
+    async fn drain_gives_up_after_budget() {
+        let n = Arc::new(AtomicU32::new(1));
+        let start = tokio::time::Instant::now();
+        drain_in_flight(&n).await;
+        let waited = start.elapsed();
+        assert!(waited >= DRAIN_BUDGET);
+        // It still exits (does not hang forever); cap the upper bound generously.
+        assert!(waited < DRAIN_BUDGET + Duration::from_secs(1));
+    }
+
+    #[test]
+    fn backoff_from_zero() {
+        let mut delay_ms = 0;
+        let d = backoff_sleep(&mut delay_ms);
+        assert_eq!(d, Duration::ZERO);
+        assert_eq!(delay_ms, 1000);
+    }
+
+    #[test]
+    fn backoff_doubles_and_jitters() {
+        let mut delay_ms = 1000;
+        let d = backoff_sleep(&mut delay_ms);
+        let ms = d.as_millis() as u64;
+        assert!((1000..=1250).contains(&ms));
+        assert_eq!(delay_ms, 2000);
+    }
+
+    #[test]
+    fn backoff_caps() {
+        let mut delay_ms = 30000;
+        let d = backoff_sleep(&mut delay_ms);
+        let ms = d.as_millis() as u64;
+        assert!((30000..=37500).contains(&ms));
+        assert_eq!(delay_ms, 30000);
     }
 }

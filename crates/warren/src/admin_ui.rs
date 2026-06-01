@@ -7,56 +7,126 @@ pub const DASHBOARD: &str = r###"<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>warren admin</title>
 <style>
-  :root { --bg:#0d0f12; --card:#161a20; --line:#262c36; --fg:#e6e9ef; --mut:#8a93a3; --acc:#5fa8ff; --ok:#46c46e; }
+  :root {
+    --bg:#0a0b0d; --panel:#131519; --panel2:#0d0f12; --line:#23262e;
+    --fg:#e7eaf0; --mut:#828b99; --faint:#565d69;
+    --acc:#5fb0ff; --ok:#4ec77a; --warn:#e0a23a; --bad:#e8584c;
+    --radius:9px; --radius-sm:6px;
+  }
   * { box-sizing:border-box; }
-  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
-  header { padding:16px 20px; border-bottom:1px solid var(--line); display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
-  h1 { font-size:16px; margin:0 8px 0 0; }
-  h2 { font-size:13px; color:var(--mut); margin:0 0 4px; text-transform:uppercase; letter-spacing:.05em; }
-  .desc { color:var(--mut); font-size:12px; margin:0 0 12px; line-height:1.45; max-width:62ch; }
+  html { -webkit-text-size-adjust:100%; }
+  body {
+    margin:0; background:var(--bg); color:var(--fg);
+    font:13px/1.5 ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
+    background-image:radial-gradient(1100px 420px at 78% -8%, rgba(95,176,255,.07), transparent 60%);
+    background-attachment:fixed;
+  }
+  a { color:var(--acc); }
+  /* Header */
+  header {
+    position:sticky; top:0; z-index:5;
+    padding:13px 22px; border-bottom:1px solid var(--line);
+    display:flex; gap:12px; align-items:center; flex-wrap:wrap;
+    background:rgba(10,11,13,.82); backdrop-filter:blur(8px);
+  }
+  .brand { display:flex; align-items:center; gap:9px; margin-right:4px; }
+  .mark { width:18px; height:18px; border-radius:5px; background:linear-gradient(135deg,var(--acc),#2c6fc4); box-shadow:0 0 0 1px rgba(95,176,255,.25), 0 4px 14px -4px rgba(95,176,255,.5); position:relative; }
+  .mark::after { content:""; position:absolute; inset:5px 5px auto 5px; height:2px; border-radius:2px; background:rgba(8,12,20,.65); box-shadow:0 4px 0 rgba(8,12,20,.65); }
+  h1 { font-size:15px; margin:0; letter-spacing:.02em; font-weight:600; }
+  h1 b { color:var(--acc); font-weight:600; }
+  .ver { color:var(--faint); font-size:11px; align-self:center; }
+  h2 { font-size:12px; color:var(--fg); margin:0 0 3px; letter-spacing:.04em; font-weight:600; display:flex; align-items:center; gap:8px; }
+  h2::before { content:""; width:3px; height:13px; border-radius:2px; background:var(--acc); opacity:.8; }
+  .desc { color:var(--mut); font-size:12px; margin:0 0 12px; line-height:1.5; max-width:74ch; }
   .hint { color:var(--acc); cursor:help; border-bottom:1px dotted var(--acc); }
-  .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; vertical-align:middle; }
-  .dot.ok { background:#46c46e; }
-  .dot.warn { background:#e0a23a; }
-  .dot.bad { background:#e0564b; }
-  main { padding:20px; display:grid; gap:18px; max-width:920px; margin:0 auto; }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:16px; }
-  input { background:#0b0d10; border:1px solid var(--line); color:var(--fg); padding:6px 8px; border-radius:5px; font:inherit; }
-  button { background:var(--acc); border:0; color:#06121f; padding:6px 12px; border-radius:5px; font:inherit; cursor:pointer; }
-  button.ghost { background:transparent; color:var(--mut); border:1px solid var(--line); }
-  table { width:100%; border-collapse:collapse; margin-top:10px; }
-  th,td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); font-size:13px; vertical-align:top; }
-  th { color:var(--mut); font-weight:600; }
+  .spacer { flex:1; }
+  /* Status dots + pills */
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; vertical-align:middle; }
+  .dot.ok { background:var(--ok); box-shadow:0 0 7px -1px var(--ok); }
+  .dot.warn { background:var(--warn); box-shadow:0 0 7px -1px var(--warn); }
+  .dot.bad { background:var(--bad); box-shadow:0 0 7px -1px var(--bad); }
+  .live { color:var(--ok); font-size:11px; border:1px solid var(--line); border-radius:999px; padding:2px 10px; display:inline-flex; align-items:center; gap:6px; }
+  .live::before { content:""; width:6px; height:6px; border-radius:50%; background:currentColor; box-shadow:0 0 7px -1px currentColor; }
+  #status { color:var(--mut); font-size:11px; }
+  /* Layout */
+  main { padding:20px 22px 40px; display:grid; gap:16px; max-width:960px; margin:0 auto; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); padding:16px 18px; }
+  /* Stat strip */
+  .stats { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; }
+  .stat { background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); padding:12px 14px; min-width:0; }
+  .stat-k { color:var(--mut); font-size:10.5px; text-transform:uppercase; letter-spacing:.07em; margin-bottom:5px; }
+  .stat-v { font-size:18px; font-weight:600; color:var(--fg); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .stat-v small { font-size:12px; color:var(--mut); font-weight:400; }
+  .stat-v.mono { font-size:13px; font-weight:500; }
+  .stat-copy { cursor:pointer; color:var(--acc); border-bottom:1px dotted var(--acc); }
+  /* Inputs + buttons */
+  input { background:var(--panel2); border:1px solid var(--line); color:var(--fg); padding:7px 9px; border-radius:var(--radius-sm); font:inherit; outline:none; transition:border-color .12s,box-shadow .12s; }
+  input:focus { border-color:var(--acc); box-shadow:0 0 0 3px rgba(95,176,255,.13); }
+  input::placeholder { color:var(--faint); }
+  button { background:var(--acc); border:0; color:#06121f; padding:7px 13px; border-radius:var(--radius-sm); font:inherit; font-weight:600; cursor:pointer; transition:filter .12s,transform .04s; }
+  button:hover { filter:brightness(1.08); }
+  button:active { transform:translateY(1px); }
+  button.ghost { background:transparent; color:var(--mut); border:1px solid var(--line); font-weight:500; }
+  button.ghost:hover { color:var(--fg); border-color:var(--faint); filter:none; }
+  button.danger:hover { color:var(--bad); border-color:var(--bad); }
+  /* Tables */
+  table { width:100%; border-collapse:collapse; margin-top:12px; }
+  th,td { text-align:left; padding:8px 9px; border-bottom:1px solid var(--line); font-size:12.5px; vertical-align:middle; }
+  th { color:var(--faint); font-weight:600; text-transform:uppercase; letter-spacing:.05em; font-size:10.5px; }
+  tbody tr { transition:background .1s; }
+  tbody tr:hover { background:rgba(255,255,255,.018); }
+  tbody tr:last-child td { border-bottom:0; }
+  td.empty { color:var(--faint); text-align:center; padding:18px 9px; }
   .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
   code { color:var(--acc); word-break:break-all; }
-  #status { color:var(--mut); margin-left:auto; }
-  .live { color:var(--ok); font-size:11px; border:1px solid var(--line); border-radius:10px; padding:1px 8px; }
-  .kv { display:flex; gap:10px; padding:3px 0; }
-  .kv b { color:var(--mut); min-width:110px; font-weight:600; }
+  .muted { color:var(--mut); }
+  /* Connect block */
+  .kv { display:flex; gap:10px; padding:3px 0; align-items:baseline; }
+  .kv b { color:var(--mut); min-width:120px; font-weight:500; flex:0 0 auto; }
   .cmd { margin:10px 0; }
-  .cmdlabel { color:var(--mut); font-size:12px; margin-bottom:4px; }
-  .cmdrow { display:flex; gap:8px; align-items:flex-start; background:#0b0d10; border:1px solid var(--line); border-radius:6px; padding:8px 10px; }
+  .cmdlabel { color:var(--mut); font-size:11.5px; margin-bottom:5px; }
+  .cmdrow { display:flex; gap:8px; align-items:flex-start; background:var(--panel2); border:1px solid var(--line); border-radius:var(--radius-sm); padding:9px 11px; }
   .cmdrow code { flex:1; white-space:pre-wrap; }
   .cmdrow button { flex:0 0 auto; }
+  /* Setup stepper */
+  .steps { display:flex; flex-wrap:wrap; gap:10px 18px; color:var(--mut); font-size:12px; margin:2px 0 2px; }
+  .steps span { display:inline-flex; align-items:center; gap:7px; }
+  .steps i { font-style:normal; width:18px; height:18px; border-radius:50%; border:1px solid var(--line); color:var(--acc); display:inline-flex; align-items:center; justify-content:center; font-size:11px; }
+  .steps b { color:var(--fg); font-weight:600; }
+  @media (max-width:680px){ .stats { grid-template-columns:repeat(2,1fr); } }
 </style>
 </head>
 <body>
 <header>
-  <h1>warren admin</h1>
+  <span class="brand"><span class="mark"></span><h1>warren <b>admin</b></h1></span>
+  <span class="ver" id="ver"></span>
+  <span class="spacer"></span>
   <span id="live" class="live">live</span>
   <button class="ghost" onclick="loadAll()">Refresh</button>
   <span id="status"></span>
 </header>
 <main>
-  <p class="desc" style="margin:0 0 4px">New here? Three steps: add a <b>proxy user</b> (a login for your apps), create an <b>enrollment token</b> and run it on a device, then use a command from <b>Connect</b>. The cards below follow that order.</p>
+  <div class="stats">
+    <div class="stat"><div class="stat-k">Nodes online</div><div class="stat-v" id="stat-nodes">-</div></div>
+    <div class="stat"><div class="stat-k">Traffic relayed</div><div class="stat-v" id="stat-traffic">-</div></div>
+    <div class="stat"><div class="stat-k">Proxy endpoint</div><div class="stat-v mono" id="stat-proxy">-</div></div>
+    <div class="stat"><div class="stat-k">Proxy users</div><div class="stat-v" id="stat-users">-</div></div>
+  </div>
+
   <section class="card">
     <h2>Connect</h2>
-    <p class="desc">Your hub's addresses, plus ready-to-run commands. Copy one, fill in a token or password, run it on a device or client. The fingerprint is your hub's public ID: devices pin it to be sure they reached you, so it is safe to share.</p>
+    <div class="steps">
+      <span><i>1</i> add a <b>proxy user</b></span>
+      <span><i>2</i> create a <b>token</b>, run it on a device</span>
+      <span><i>3</i> copy a command below</span>
+    </div>
+    <p class="desc" style="margin-top:10px">Your hub's addresses and ready-to-run commands. The fingerprint is the hub's public ID (safe to share); devices pin it to confirm they reached you.</p>
     <div id="connect">loading...</div>
   </section>
+
   <section class="card">
     <h2>Proxy users</h2>
-    <p class="desc">Logins for apps that send traffic through the pool: the username and password you put in curl, your browser, or a scraper. Note: this is not the password you typed to open this dashboard (that one is the admin token). A `+` is not allowed in a username; it is reserved for picking one device (user+device).</p>
+    <p class="desc">Logins your apps put in curl / browser / scraper to send traffic through the pool. Not the admin token you used to open this page. A <code>+</code> is reserved for picking one device (<code>user+device</code>).</p>
     <div class="row">
       <input id="uname" placeholder="username">
       <input id="upass" type="password" placeholder="password">
@@ -64,28 +134,32 @@ pub const DASHBOARD: &str = r###"<!doctype html>
     </div>
     <table><thead><tr><th>Username</th><th>Traffic</th><th></th></tr></thead><tbody id="users"></tbody></table>
   </section>
+
   <section class="card">
     <h2>Enrollment tokens</h2>
-    <p class="desc">A secret that lets a new device join automatically (no manual approval). Hand it to a device with --token. Delete it to stop new devices joining with it. <span class="hint" title="On the hub, run:  warren enroll --name device&#10;That mints a fresh token. Hand it out, then delete the old token here to cut off any device that still has the old one.">How do I rotate it?</span></p>
+    <p class="desc">A secret that lets a new device join automatically (no manual approval). Delete it to cut off devices still holding it. <span class="hint" title="On the hub, run:  warren enroll --name device&#10;That mints a fresh token. Hand it out, then delete the old token here to cut off any device that still has the old one.">How do I rotate it?</span></p>
     <div class="row">
       <input id="tname" placeholder="node name">
       <button onclick="addToken()">Create token</button>
     </div>
     <table><thead><tr><th>Name</th><th>Token</th><th>Created</th><th></th></tr></thead><tbody id="tokens"></tbody></table>
   </section>
+
   <section class="card">
     <h2>Live nodes</h2>
-    <p class="desc">Devices connected right now and ready to carry requests. Up since is when each connected. Fails counts recent dial errors; the hub deprioritizes a device once it reaches 3. Copy a device's command to send traffic out only through that one device.</p>
-    <table><thead><tr><th>Node</th><th>Exit IP</th><th>Location</th><th>Up since</th><th>Health</th><th>Traffic</th><th>Use just this device</th></tr></thead><tbody id="nodes"></tbody></table>
+    <p class="desc">Devices connected and ready to carry requests. <b>Health</b> tracks recent dial errors (deprioritized at 3/3). <b>Success</b> is the dial success rate. Copy a device's command to route only through it.</p>
+    <table><thead><tr><th>Node</th><th>Exit IP</th><th>Location</th><th>Up since</th><th>Health</th><th>Success</th><th>Traffic</th><th></th></tr></thead><tbody id="nodes"></tbody></table>
   </section>
+
   <section class="card" id="card-pending">
     <h2>Pending approval</h2>
-    <p class="desc">Devices that connected without an enrollment token. Approve one to let it serve traffic, or deny it. Match the short code against the device to be sure it is yours.</p>
+    <p class="desc">Devices that connected without a token. Match the short code against the device, then approve or deny.</p>
     <table><thead><tr><th>Code</th><th>Name</th><th>Key</th><th>First seen</th><th></th></tr></thead><tbody id="pending"></tbody></table>
   </section>
+
   <section class="card" id="card-keys">
     <h2>Approved keys</h2>
-    <p class="desc">Device identities the hub trusts (each device made its own key on first run). Revoke one to kick that device out of the pool for good.</p>
+    <p class="desc">Device identities the hub trusts (each device made its own key on first run). Revoke one to remove that device for good.</p>
     <table><thead><tr><th>Name</th><th>Key</th><th>Approved</th><th></th></tr></thead><tbody id="keys"></tbody></table>
   </section>
 </main>
@@ -108,12 +182,17 @@ async function api(method, path, body){
 // device-supplied node name cannot break out of an inline onclick handler.
 function esc(s){ return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function fmtDate(s){ return s ? new Date(s*1000).toLocaleString() : ''; }
+function fmtAgo(s){ if(!s) return ''; let d=Math.max(0,Date.now()/1000-s); if(d<60)return Math.floor(d)+'s'; if(d<3600)return Math.floor(d/60)+'m'; if(d<86400)return Math.floor(d/3600)+'h'; return Math.floor(d/86400)+'d'; }
 function fmtBytes(n){ n = n||0; if (n < 1024) return n + ' B'; const u=['KB','MB','GB','TB']; let i=-1; do { n/=1024; i++; } while (n >= 1024 && i < u.length-1); return n.toFixed(1) + ' ' + u[i]; }
 function shortKey(pk){ return pk && pk.length > 16 ? pk.slice(0,16)+'...' : (pk||''); }
+function flash(btn, label){ const o=btn.textContent; btn.textContent=label||'copied'; setTimeout(()=>btn.textContent=o,1200); }
 function copyEl(btn){
   const c = btn.parentElement.querySelector('code').textContent;
-  navigator.clipboard.writeText(c).then(()=>{ btn.textContent='copied'; setTimeout(()=>btn.textContent='copy',1200); });
+  navigator.clipboard.writeText(c).then(()=>flash(btn));
 }
+// Copy an explicit string (table rows where the text is not a sibling <code>).
+function copyVal(btn, t){ navigator.clipboard.writeText(t).then(()=>flash(btn)); setStatus('copied'); }
+function copyText(t){ navigator.clipboard.writeText(t); setStatus('copied'); }
 function kv(k,v){ return `<div class="kv"><b>${k}</b><code>${esc(v)}</code></div>`; }
 function cmd(label, c){ return `<div class="cmd"><div class="cmdlabel">${label}</div><div class="cmdrow"><code>${esc(c)}</code><button class="ghost" onclick="copyEl(this)">copy</button></div></div>`; }
 function tlsFlags(){ return (INFO.tls && INFO.fingerprint) ? ` --tls --hub-fingerprint ${INFO.fingerprint}` : ''; }
@@ -131,24 +210,29 @@ async function loadInfo(){
   const proxy = i.proxy_addr || '<hub-host>:18080';
   const puser = i.proxy_user || 'USER';
   const ppass = i.proxy_pass || '<PASSWORD>';
+  document.getElementById('ver').textContent = i.version ? 'v'+i.version : '';
+  // Proxy endpoint stat (click to copy).
+  const sp = document.getElementById('stat-proxy');
+  sp.innerHTML = `<span class="stat-copy" title="click to copy">${esc(proxy)}</span>`;
+  sp.querySelector('.stat-copy').onclick = ()=>copyText(proxy);
   let html = '';
-  if (!i.proxy_user) html += `<p class="desc" style="color:var(--acc)">No proxy user yet. Add one under Proxy users below first, or the proxy commands will not authenticate.</p>`;
+  if (!i.proxy_user) html += `<p class="desc" style="color:var(--acc)">No proxy user yet. Add one under Proxy users below, or the proxy commands will not authenticate.</p>`;
   html += kv('Node link', node) + kv('Proxy', proxy);
   if (i.fingerprint) html += kv('Fingerprint (hub ID)', i.fingerprint);
-  html += `<p class="desc">To add a device, use the <b>copy install</b> button on a token under Enrollment tokens below: it is one paste, no flags to fill in. The manual form is:</p>`;
+  html += `<p class="desc" style="margin-top:10px">To add a device, use a <b>copy install</b> button on a token below (one paste, no flags). The manual form:</p>`;
   html += cmd('Add a node (manual)', `warren node run --hub ${node} --token <ENROLL_TOKEN>${tlsFlags()}`);
   html += cmd('Use the pool (HTTPS / CONNECT, auto-picks a device)', `curl -x http://${puser}:${ppass}@${proxy} https://api.ipify.org`);
   html += cmd('Use the pool (SOCKS5)', `curl -x socks5h://${puser}:${ppass}@${proxy} https://api.ipify.org`);
-  html += cmd('Use ONE device (put its name after +, see Live nodes)', `curl -x http://${puser}+DEVICE:${ppass}@${proxy} https://api.ipify.org`);
+  html += cmd('Use ONE device (name after +, see Live nodes)', `curl -x http://${puser}+DEVICE:${ppass}@${proxy} https://api.ipify.org`);
   document.getElementById('connect').innerHTML = html;
 }
 async function loadPending(){
   const rows = await api('GET','/api/pending');
   document.getElementById('pending').innerHTML = rows.map(p =>
-    `<tr><td><code>${esc(p.code)}</code></td><td>${esc(p.name)}</td><td>${esc(shortKey(p.pubkey))}</td><td>${fmtDate(p.first_seen)}</td>`+
+    `<tr><td><code>${esc(p.code)}</code></td><td>${esc(p.name)}</td><td class="muted">${esc(shortKey(p.pubkey))}</td><td class="muted">${fmtDate(p.first_seen)}</td>`+
     `<td><button onclick="approve('${esc(p.pubkey)}')">approve</button> `+
-    `<button class="ghost" onclick="denyNode('${esc(p.pubkey)}')">deny</button></td></tr>`).join('')
-    || '<tr><td colspan=5>Nothing waiting. Devices that join with a token appear under Live nodes directly.</td></tr>';
+    `<button class="ghost danger" onclick="denyNode('${esc(p.pubkey)}')">deny</button></td></tr>`).join('')
+    || '<tr><td class="empty" colspan=5>Nothing waiting. Devices that join with a token appear under Live nodes directly.</td></tr>';
   // Hide the card entirely when nothing is pending (keeps the dashboard lean).
   document.getElementById('card-pending').style.display = rows.length ? '' : 'none';
 }
@@ -161,21 +245,36 @@ async function loadNodes(){
   const proxy = INFO.proxy_addr || '<hub-host>:18080';
   document.getElementById('nodes').innerHTML = rows.map(n => {
     const c = `curl -x http://${puser}+${n.name}:${ppass}@${proxy} https://api.ipify.org`;
-    const lat = n.latency_ms != null ? ` <span style="color:var(--mut)">${n.latency_ms}ms</span>` : '';
-    const fail = `<span class="dot ${n.fails === 0 ? 'ok' : n.fails >= 3 ? 'bad' : 'warn'}"></span>${n.fails >= 3 ? `<span style="color:#e0564b">${n.fails} / 3</span>` : `${n.fails} / 3`}${lat}`;
-    const ip = n.ip ? `<code>${esc(n.ip)}</code>` : '<span style="color:var(--mut)">pending</span>';
-    const loc = [n.city, n.country].filter(Boolean).map(esc).join(', ') || '<span style="color:var(--mut)">-</span>';
-    return `<tr><td>${esc(n.id)}</td><td>${ip}</td><td>${loc}</td><td>${fmtDate(n.since)}</td><td>${fail}</td><td>${fmtBytes(n.bytes)}</td>`+
-      `<td><button class="ghost" onclick='copyText(${esc(JSON.stringify(c))})'>copy proxy cmd</button></td></tr>`;
-  }).join('') || '<tr><td colspan=7>No devices online yet. Create a token below and run the install line on a device.</td></tr>';
+    const dotc = n.fails === 0 ? 'ok' : n.fails >= 3 ? 'bad' : 'warn';
+    const lat = n.latency_ms != null ? ` <span class="muted">${n.latency_ms}ms</span>` : '';
+    const fcol = n.fails >= 3 ? 'color:var(--bad)' : '';
+    const fail = `<span class="dot ${dotc}"></span><span style="${fcol}">${n.fails} / 3</span>${lat}`;
+    const ip = n.ip ? `<code>${esc(n.ip)}</code>` : '<span class="muted">pending</span>';
+    const loc = [n.city, n.country].filter(Boolean).map(esc).join(', ') || '<span class="muted">-</span>';
+    let succ;
+    if (!n.dials) {
+      succ = '<span class="muted">-</span>';
+    } else {
+      const pct = Math.round(n.success_rate);
+      const col = pct >= 95 ? 'var(--mut)' : 'var(--bad)';
+      const err = n.last_error ? ` title="last error: ${esc(n.last_error)}"` : '';
+      succ = `<span style="color:${col}"${err}>${pct}% <span class="muted">(${n.dials})</span></span>`;
+    }
+    const up = `<span title="${fmtDate(n.since)}">${fmtAgo(n.since)}</span>`;
+    return `<tr><td><b>${esc(n.id)}</b></td><td>${ip}</td><td>${loc}</td><td>${up}</td><td>${fail}</td><td>${succ}</td><td>${fmtBytes(n.bytes)}</td>`+
+      `<td><button class="ghost" onclick='copyVal(this, ${esc(JSON.stringify(c))})'>copy cmd</button></td></tr>`;
+  }).join('') || '<tr><td class="empty" colspan=8>No devices online yet. Create a token below and run the install line on a device.</td></tr>';
+  // Stat strip: online count + total relayed traffic.
+  document.getElementById('stat-nodes').innerHTML = rows.length + ' <small>online</small>';
+  const total = rows.reduce((a,n)=>a+(n.bytes||0),0);
+  document.getElementById('stat-traffic').textContent = fmtBytes(total);
 }
-function copyText(t){ navigator.clipboard.writeText(t); setStatus('proxy command copied'); }
 async function loadKeys(){
   const rows = await api('GET','/api/node-keys');
   document.getElementById('keys').innerHTML = rows.map(k =>
-    `<tr><td>${esc(k.name)}</td><td><code>${esc(shortKey(k.pubkey))}</code></td><td>${fmtDate(k.approved_at)}</td>`+
-    `<td><button class="ghost" onclick="revokeKey('${esc(k.pubkey)}')">revoke</button></td></tr>`).join('')
-    || '<tr><td colspan=4>none</td></tr>';
+    `<tr><td>${esc(k.name)}</td><td><code>${esc(shortKey(k.pubkey))}</code></td><td class="muted">${fmtDate(k.approved_at)}</td>`+
+    `<td><button class="ghost danger" onclick="revokeKey('${esc(k.pubkey)}')">revoke</button></td></tr>`).join('')
+    || '<tr><td class="empty" colspan=4>none</td></tr>';
   document.getElementById('card-keys').style.display = rows.length ? '' : 'none';
 }
 async function revokeKey(pk){ await api('DELETE','/api/node-keys/'+encodeURIComponent(pk)); loadKeys(); }
@@ -185,15 +284,15 @@ async function loadTokens(){
     // With a join code, offer a copy button per OS; otherwise the manual command.
     let copy;
     if (t.join_code) {
-      copy = `<button class="ghost" onclick='copyText(${esc(JSON.stringify(joinInstallCmd(t.join_code)))})'>copy (Linux/mac)</button> `+
-             `<button class="ghost" onclick='copyText(${esc(JSON.stringify(winInstallCmd(t.join_code)))})'>copy (Windows)</button> `;
+      copy = `<button class="ghost" onclick='copyVal(this, ${esc(JSON.stringify(joinInstallCmd(t.join_code)))})'>copy (Linux/mac)</button> `+
+             `<button class="ghost" onclick='copyVal(this, ${esc(JSON.stringify(winInstallCmd(t.join_code)))})'>copy (Windows)</button> `;
     } else {
-      copy = `<button class="ghost" onclick='copyText(${esc(JSON.stringify(installCmd(t.token)))})'>copy install</button> `;
+      copy = `<button class="ghost" onclick='copyVal(this, ${esc(JSON.stringify(installCmd(t.token)))})'>copy install</button> `;
     }
-    return `<tr><td>${esc(t.name)}</td><td><code>${esc(t.token)}</code></td><td>${fmtDate(t.created)}</td>`+
-    `<td>${copy}<button class="ghost" onclick="delToken('${esc(t.token)}')">delete</button></td></tr>`;
+    return `<tr><td>${esc(t.name)}</td><td><code>${esc(t.token)}</code></td><td class="muted">${fmtDate(t.created)}</td>`+
+    `<td>${copy}<button class="ghost danger" onclick="delToken('${esc(t.token)}')">delete</button></td></tr>`;
   }).join('')
-    || '<tr><td colspan=4>No tokens yet. Create one to let a device join automatically.</td></tr>';
+    || '<tr><td class="empty" colspan=4>No tokens yet. Create one to let a device join automatically.</td></tr>';
 }
 async function addToken(){
   const name = document.getElementById('tname').value.trim() || 'node';
@@ -205,8 +304,9 @@ async function delToken(t){ await api('DELETE','/api/tokens/'+encodeURIComponent
 async function loadUsers(){
   const rows = await api('GET','/api/users');
   document.getElementById('users').innerHTML = rows.map(u =>
-    `<tr><td>${esc(u.username)}</td><td>${fmtBytes(u.bytes)}</td><td><button class="ghost" onclick="delUser('${esc(u.username)}')">delete</button></td></tr>`).join('')
-    || '<tr><td colspan=3>No proxy users yet. Add one so apps can authenticate to the proxy.</td></tr>';
+    `<tr><td><b>${esc(u.username)}</b></td><td>${fmtBytes(u.bytes)}</td><td><button class="ghost danger" onclick="delUser('${esc(u.username)}')">delete</button></td></tr>`).join('')
+    || '<tr><td class="empty" colspan=3>No proxy users yet. Add one so apps can authenticate to the proxy.</td></tr>';
+  document.getElementById('stat-users').textContent = rows.length;
 }
 async function addUser(){
   const username = document.getElementById('uname').value.trim();
