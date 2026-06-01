@@ -142,6 +142,29 @@ On Windows: `install.ps1 -Uninstall`. Revoke the device's key in the dashboard t
 if you want the hub to forget it. No prebuilt binary for your arch? Build it:
 `cargo install --git https://github.com/doedja/warren warren`.
 
+### On a phone (Android, via Termux)
+
+A spare Android phone can be a node. Install [Termux](https://termux.dev) from
+F-Droid (not the Play Store version, which is outdated), then:
+
+```bash
+pkg install curl
+curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh   # drops the binary in ~/.local/bin
+~/.local/bin/warren node run --join warren1...                                    # paste your join code
+```
+
+The arm64 static binary runs directly under Termux. Two things to know:
+
+- **Keep it alive.** Android stops background apps to save battery. Run
+  `termux-wake-lock`, exempt Termux from battery optimization in Android
+  settings, and install Termux:Boot (F-Droid) with a `~/.termux/boot/` script
+  that runs the command above so the node restarts after a reboot.
+- A phone that sleeps with the screen off may still drop; a device kept awake and
+  on power is the most reliable. The node reconnects on its own when it can.
+
+`warren node install` (the boot service) does not apply here, since Termux has no
+systemd; run the node directly as shown.
+
 ## Running the hub on the public internet
 
 **TLS is on by default.** The hub generates a self-signed cert (persisted next to
