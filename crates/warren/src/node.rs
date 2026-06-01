@@ -153,6 +153,7 @@ async fn dial_conn(addr: &str, connector: &Option<TlsConnector>) -> Result<Conn>
     let tcp = TcpStream::connect(addr)
         .await
         .with_context(|| format!("connect {addr}"))?;
+    let _ = tcp.set_nodelay(true); // proxied splice: no Nagle stalls
     match connector {
         Some(c) => {
             // "warren" is a 'static str, so this ServerName is 'static. The
@@ -299,7 +300,10 @@ async fn handle_dial(
 ) {
     // Dial the target from this node: this is the residential egress.
     let mut target = match TcpStream::connect((host.as_str(), port)).await {
-        Ok(t) => t,
+        Ok(t) => {
+            let _ = t.set_nodelay(true); // proxied splice: no Nagle stalls
+            t
+        }
         Err(e) => {
             let _ = ntx.send(NodeToHub::DialFailed {
                 conn_id,

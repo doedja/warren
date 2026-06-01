@@ -442,6 +442,7 @@ pub async fn run_with_listeners(
         loop {
             match node_listener.accept().await {
                 Ok((stream, peer)) => {
+                    let _ = stream.set_nodelay(true); // proxied splice: no Nagle stalls
                     let h = h1.clone();
                     tokio::spawn(async move {
                         if let Err(e) = handle_node_conn(stream, h).await {
@@ -459,6 +460,7 @@ pub async fn run_with_listeners(
         loop {
             match proxy_listener.accept().await {
                 Ok((stream, peer)) => {
+                    let _ = stream.set_nodelay(true); // proxied splice: no Nagle stalls
                     let h = h2.clone();
                     tokio::spawn(async move {
                         if let Err(e) = handle_client(stream, h).await {
