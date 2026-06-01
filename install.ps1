@@ -39,9 +39,11 @@ if ($arch -ne 'AMD64') {
   Write-Error "warren: only x86_64 Windows binary is published (got $arch). Build from source: cargo install --git https://github.com/$repo warren"
   return
 }
-$url = "https://github.com/$repo/releases/latest/download/warren-windows-x86_64.zip"
-
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+# Assets are version-stamped (warren-<tag>-windows-x86_64.zip); resolve the tag.
+$tag = (Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest" -UseBasicParsing).tag_name
+if (-not $tag) { Write-Error 'warren: could not resolve the latest release tag.'; return }
+$url = "https://github.com/$repo/releases/download/$tag/warren-$tag-windows-x86_64.zip"
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 
 # If a node is already running, stop it first so its binary can be replaced

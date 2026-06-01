@@ -49,5 +49,6 @@ jobs:
         with:
           bin: warren
           target: ${{ matrix.target }}
-          archive: warren-${{ matrix.name }}
+          # $tag is the release tag (e.g. v0.1.9): warren-v0.1.9-linux-x86_64.tar.gz
+          archive: warren-$tag-${{ matrix.name }}
           token: ${{ secrets.GITHUB_TOKEN }}

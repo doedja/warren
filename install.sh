@@ -48,7 +48,15 @@ case "$os" in
   *) fallback ;;
 esac
 
-url="https://github.com/$REPO/releases/latest/download/warren-$asset.tar.gz"
+# Release assets are version-stamped (warren-<tag>-<os>-<arch>.tar.gz), so resolve
+# the latest tag first instead of using the /latest/download/ shortcut.
+fetch() { if command -v curl >/dev/null 2>&1; then curl -fsSL "$1"; else wget -qO- "$1"; fi; }
+tag="$(fetch "https://api.github.com/repos/$REPO/releases/latest" | grep -m1 '"tag_name"' | cut -d'"' -f4)"
+if [ -z "$tag" ]; then
+  echo "warren: could not resolve the latest release tag." >&2
+  exit 1
+fi
+url="https://github.com/$REPO/releases/download/$tag/warren-$tag-$asset.tar.gz"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 

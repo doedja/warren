@@ -8,6 +8,7 @@
 //! With `--tls` the node link is TLS; the hub cert is pinned by
 //! `--hub-fingerprint` (or accepted blindly with `--insecure`, dev only).
 
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -230,6 +231,30 @@ async fn connect_once(
 
     let hub_addr = r.hub.clone();
     let connector = connector.clone();
+
+    // Pool of pre-dialed (TLS-done) data connections kept warm so a Dial skips
+    // the connect+handshake on the node->hub leg. A refiller keeps ~3 ready; a
+    // Dial pops one (or dials fresh on miss/stale). Node-side only: the hub just
+    // waits for the DataHello frame on each connection as before.
+    let pool: Arc<StdMutex<Vec<Conn>>> = Arc::new(StdMutex::new(Vec::new()));
+    let fill_pool = pool.clone();
+    let fill_addr = hub_addr.clone();
+    let fill_conn = connector.clone();
+    let filler = tokio::spawn(async move {
+        const TARGET: usize = 3;
+        loop {
+            let n = fill_pool.lock().unwrap().len();
+            if n < TARGET {
+                match dial_conn(&fill_addr, &fill_conn).await {
+                    Ok(c) => fill_pool.lock().unwrap().push(c),
+                    Err(_) => tokio::time::sleep(Duration::from_secs(2)).await,
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    });
+
     let res: Result<()> = async {
         loop {
             let msg: HubToNode = read_msg(&mut rd).await?;
@@ -246,8 +271,9 @@ async fn connect_once(
                     let addr = hub_addr.clone();
                     let conn_tor = connector.clone();
                     let ntx2 = ntx.clone();
+                    let pool2 = pool.clone();
                     tokio::spawn(async move {
-                        handle_dial(addr, conn_tor, conn_id, nonce, host, port, ntx2).await;
+                        handle_dial(addr, conn_tor, pool2, conn_id, nonce, host, port, ntx2).await;
                     });
                 }
             }
@@ -257,6 +283,7 @@ async fn connect_once(
 
     writer.abort();
     reporter.abort();
+    filler.abort();
     res
 }
 
@@ -293,9 +320,11 @@ async fn fetch_public_info() -> Option<(String, Option<String>, Option<String>, 
     Some((ip, country, city, latency_ms))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_dial(
     hub_addr: String,
     connector: Option<TlsConnector>,
+    pool: Arc<StdMutex<Vec<Conn>>>,
     conn_id: u64,
     nonce: u64,
     host: String,
@@ -317,23 +346,43 @@ async fn handle_dial(
         }
     };
 
-    // Open a fresh data connection back to the hub, tagged with conn_id.
-    let mut data = match dial_conn(&hub_addr, &connector).await {
-        Ok(d) => d,
-        Err(e) => {
+    // Data connection back to the hub, tagged with conn_id: a warm pooled one if
+    // available, else dial fresh. Pop is sync (no await while locked).
+    let pooled = pool.lock().unwrap().pop();
+    let dh = Greeting::Data(DataHello { conn_id, nonce });
+    let mut data = match pooled {
+        Some(c) => c,
+        None => match dial_conn(&hub_addr, &connector).await {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = ntx.send(NodeToHub::DialFailed {
+                    conn_id,
+                    reason: format!("data dial: {e}"),
+                });
+                return;
+            }
+        },
+    };
+    // A pooled connection may have gone stale (hub restart, idle close); if the
+    // DataHello write fails, dial a fresh one and retry once.
+    if write_msg(&mut data, &dh).await.is_err() {
+        data = match dial_conn(&hub_addr, &connector).await {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = ntx.send(NodeToHub::DialFailed {
+                    conn_id,
+                    reason: format!("data dial: {e}"),
+                });
+                return;
+            }
+        };
+        if let Err(e) = write_msg(&mut data, &dh).await {
             let _ = ntx.send(NodeToHub::DialFailed {
                 conn_id,
-                reason: format!("data dial: {e}"),
+                reason: format!("data hello: {e}"),
             });
             return;
         }
-    };
-    if let Err(e) = write_msg(&mut data, &Greeting::Data(DataHello { conn_id, nonce })).await {
-        let _ = ntx.send(NodeToHub::DialFailed {
-            conn_id,
-            reason: format!("data hello: {e}"),
-        });
-        return;
     }
 
     let _ = copy_bidirectional(&mut data, &mut target).await;
