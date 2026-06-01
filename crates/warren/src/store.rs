@@ -105,6 +105,11 @@ impl Store {
                 "proxy username may not contain '-session-' (it is reserved for sticky sessions)"
             );
         }
+        if username.contains("-region-") {
+            anyhow::bail!(
+                "proxy username may not contain '-region-' (it is reserved for region selection)"
+            );
+        }
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO proxy_users (username, password) VALUES (?1, ?2)",

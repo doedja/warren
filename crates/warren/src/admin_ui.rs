@@ -62,7 +62,7 @@ pub const DASHBOARD: &str = r###"<!doctype html>
       <input id="upass" type="password" placeholder="password">
       <button onclick="addUser()">Add user</button>
     </div>
-    <table><thead><tr><th>Username</th><th></th></tr></thead><tbody id="users"></tbody></table>
+    <table><thead><tr><th>Username</th><th>Traffic</th><th></th></tr></thead><tbody id="users"></tbody></table>
   </section>
   <section class="card">
     <h2>Enrollment tokens</h2>
@@ -76,7 +76,7 @@ pub const DASHBOARD: &str = r###"<!doctype html>
   <section class="card">
     <h2>Live nodes</h2>
     <p class="desc">Devices connected right now and ready to carry requests. Up since is when each connected. Fails counts recent dial errors; the hub deprioritizes a device once it reaches 3. Copy a device's command to send traffic out only through that one device.</p>
-    <table><thead><tr><th>Node</th><th>Exit IP</th><th>Location</th><th>Up since</th><th>Fails</th><th>Use just this device</th></tr></thead><tbody id="nodes"></tbody></table>
+    <table><thead><tr><th>Node</th><th>Exit IP</th><th>Location</th><th>Up since</th><th>Health</th><th>Traffic</th><th>Use just this device</th></tr></thead><tbody id="nodes"></tbody></table>
   </section>
   <section class="card" id="card-pending">
     <h2>Pending approval</h2>
@@ -108,6 +108,7 @@ async function api(method, path, body){
 // device-supplied node name cannot break out of an inline onclick handler.
 function esc(s){ return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function fmtDate(s){ return s ? new Date(s*1000).toLocaleString() : ''; }
+function fmtBytes(n){ n = n||0; if (n < 1024) return n + ' B'; const u=['KB','MB','GB','TB']; let i=-1; do { n/=1024; i++; } while (n >= 1024 && i < u.length-1); return n.toFixed(1) + ' ' + u[i]; }
 function shortKey(pk){ return pk && pk.length > 16 ? pk.slice(0,16)+'...' : (pk||''); }
 function copyEl(btn){
   const c = btn.parentElement.querySelector('code').textContent;
@@ -164,9 +165,9 @@ async function loadNodes(){
     const fail = `<span class="dot ${n.fails === 0 ? 'ok' : n.fails >= 3 ? 'bad' : 'warn'}"></span>${n.fails >= 3 ? `<span style="color:#e0564b">${n.fails} / 3</span>` : `${n.fails} / 3`}${lat}`;
     const ip = n.ip ? `<code>${esc(n.ip)}</code>` : '<span style="color:var(--mut)">pending</span>';
     const loc = [n.city, n.country].filter(Boolean).map(esc).join(', ') || '<span style="color:var(--mut)">-</span>';
-    return `<tr><td>${esc(n.id)}</td><td>${ip}</td><td>${loc}</td><td>${fmtDate(n.since)}</td><td>${fail}</td>`+
+    return `<tr><td>${esc(n.id)}</td><td>${ip}</td><td>${loc}</td><td>${fmtDate(n.since)}</td><td>${fail}</td><td>${fmtBytes(n.bytes)}</td>`+
       `<td><button class="ghost" onclick='copyText(${esc(JSON.stringify(c))})'>copy proxy cmd</button></td></tr>`;
-  }).join('') || '<tr><td colspan=6>No devices online yet. Create a token below and run the install line on a device.</td></tr>';
+  }).join('') || '<tr><td colspan=7>No devices online yet. Create a token below and run the install line on a device.</td></tr>';
 }
 function copyText(t){ navigator.clipboard.writeText(t); setStatus('proxy command copied'); }
 async function loadKeys(){
@@ -204,8 +205,8 @@ async function delToken(t){ await api('DELETE','/api/tokens/'+encodeURIComponent
 async function loadUsers(){
   const rows = await api('GET','/api/users');
   document.getElementById('users').innerHTML = rows.map(u =>
-    `<tr><td>${esc(u)}</td><td><button class="ghost" onclick="delUser('${esc(u)}')">delete</button></td></tr>`).join('')
-    || '<tr><td colspan=2>No proxy users yet. Add one so apps can authenticate to the proxy.</td></tr>';
+    `<tr><td>${esc(u.username)}</td><td>${fmtBytes(u.bytes)}</td><td><button class="ghost" onclick="delUser('${esc(u.username)}')">delete</button></td></tr>`).join('')
+    || '<tr><td colspan=3>No proxy users yet. Add one so apps can authenticate to the proxy.</td></tr>';
 }
 async function addUser(){
   const username = document.getElementById('uname').value.trim();

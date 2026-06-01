@@ -161,6 +161,9 @@ struct Hub {
     /// Sticky sessions: session key -> (node name, last use). A `user-session-K`
     /// proxy username keeps requests on the same device while it stays healthy.
     sessions: Mutex<HashMap<String, (String, Instant)>>,
+    /// Cumulative bytes relayed per node id and per proxy user (in-memory).
+    node_bytes: Mutex<HashMap<String, u64>>,
+    user_bytes: Mutex<HashMap<String, u64>>,
 }
 
 impl Hub {
@@ -215,11 +218,69 @@ impl Hub {
         }
         map.insert(key.to_string(), (name.to_string(), Instant::now()));
     }
+
+    /// Add relayed bytes to the per-node and per-user counters.
+    async fn add_bytes(&self, node_id: &str, user: &str, n: u64) {
+        if n == 0 {
+            return;
+        }
+        *self
+            .node_bytes
+            .lock()
+            .await
+            .entry(node_id.to_string())
+            .or_insert(0) += n;
+        if !user.is_empty() {
+            *self
+                .user_bytes
+                .lock()
+                .await
+                .entry(user.to_string())
+                .or_insert(0) += n;
+        }
+    }
+    /// Snapshot of nodes whose reported geo country matches `country`
+    /// (case-insensitive). Same tuple shape as [`snapshot`].
+    #[allow(clippy::type_complexity)]
+    async fn snapshot_region(
+        &self,
+        country: &str,
+    ) -> Vec<(
+        NodeId,
+        String,
+        mpsc::UnboundedSender<HubToNode>,
+        Arc<AtomicU32>,
+        Arc<StdMutex<HashMap<String, u32>>>,
+    )> {
+        self.nodes
+            .lock()
+            .await
+            .iter()
+            .filter(|n| {
+                n.info
+                    .lock()
+                    .unwrap()
+                    .country
+                    .as_deref()
+                    .is_some_and(|c| c.eq_ignore_ascii_case(country))
+            })
+            .map(|n| {
+                (
+                    n.id.clone(),
+                    n.name.clone(),
+                    n.tx.clone(),
+                    n.fails.clone(),
+                    n.host_fails.clone(),
+                )
+            })
+            .collect()
+    }
     async fn add_node(&self, e: NodeEntry) {
         self.nodes.lock().await.push(e);
     }
     async fn remove_node(&self, id: &NodeId) {
         self.nodes.lock().await.retain(|n| &n.id != id);
+        self.node_bytes.lock().await.remove(&id.0);
     }
     async fn insert_pending(&self, id: u64, nonce: u64, tx: oneshot::Sender<Conn>) {
         self.pending.lock().await.insert(id, (nonce, tx));
@@ -228,6 +289,7 @@ impl Hub {
         self.pending.lock().await.remove(&id)
     }
     async fn list_node_info(&self) -> Vec<NodeInfo> {
+        let bytes = self.node_bytes.lock().await.clone();
         self.nodes
             .lock()
             .await
@@ -243,6 +305,7 @@ impl Hub {
                     country: r.country,
                     city: r.city,
                     latency_ms: r.latency_ms,
+                    bytes: bytes.get(&n.id.0).copied().unwrap_or(0),
                 }
             })
             .collect()
@@ -416,6 +479,8 @@ pub async fn run_with_listeners(
         rr: AtomicUsize::new(0),
         conn_seq: AtomicU64::new(1),
         sessions: Mutex::new(HashMap::new()),
+        node_bytes: Mutex::new(HashMap::new()),
+        user_bytes: Mutex::new(HashMap::new()),
     });
 
     tracing::info!(
@@ -661,14 +726,23 @@ enum Route {
     Device(String),
     /// `user-session-KEY`: stick to one device for this session key.
     Session(String),
+    /// `user-region-COUNTRY`: route through a device whose reported geo country
+    /// matches (case-insensitive). No fallback to other regions if none match.
+    Region(String),
 }
 
-/// Parse `(base_user, route)` from a proxy username. `-session-` is checked first
-/// (and rejected at user creation, so it cannot collide), then `+`.
+/// Parse `(base_user, route)` from a proxy username. `-session-` and `-region-`
+/// are checked first (both rejected at user creation, so they cannot collide),
+/// then `+`.
 fn parse_route(user: &str) -> (&str, Route) {
     if let Some((base, key)) = user.split_once("-session-") {
         if !key.is_empty() {
             return (base, Route::Session(key.to_string()));
+        }
+    }
+    if let Some((base, region)) = user.split_once("-region-") {
+        if !region.is_empty() {
+            return (base, Route::Region(region.to_string()));
         }
     }
     match user.split_once('+') {
@@ -699,9 +773,12 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
     // it back once the target is known. The password is checked against the base.
     let route_cell: Arc<StdMutex<Route>> = Arc::new(StdMutex::new(Route::Pool));
     let route_cap = route_cell.clone();
+    let user_cell: Arc<StdMutex<String>> = Arc::new(StdMutex::new(String::new()));
+    let user_cap = user_cell.clone();
     let verify = move |u: &str, p: &str| {
         let (base, route) = parse_route(u);
         *route_cap.lock().unwrap() = route;
+        *user_cap.lock().unwrap() = base.to_string();
         store.check_user(base, p).unwrap_or(false)
     };
 
@@ -752,11 +829,13 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
     };
 
     let route = std::mem::take(&mut *route_cell.lock().unwrap());
+    let base_user = std::mem::take(&mut *user_cell.lock().unwrap());
     // Resolve candidate nodes. Device/sticky pin to one device; pool and
     // fresh-session use the whole pool. session_key is Some when we should record
     // which device served, so the next request in that session sticks to it.
     let (nodes, session_key) = match route {
         Route::Device(name) => (hub.snapshot(Some(&name)).await, None),
+        Route::Region(country) => (hub.snapshot_region(&country).await, None),
         Route::Session(key) => match hub.session_node(&key).await {
             Some(name) => {
                 let pinned = hub.snapshot(Some(&name)).await;
@@ -826,7 +905,9 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
                     Mode::Socks5 => socks5::write_reply(&mut client, socks5::REP_SUCCESS).await?,
                     Mode::Http(head) => data.write_all(head).await?,
                 }
-                let _ = copy_bidirectional(&mut client, &mut data).await;
+                if let Ok((a, b)) = copy_bidirectional(&mut client, &mut data).await {
+                    hub.add_bytes(&node_id.0, &base_user, a + b).await;
+                }
                 return Ok(());
             }
             _ => {
@@ -892,6 +973,7 @@ struct NodeInfo {
     country: Option<String>,
     city: Option<String>,
     latency_ms: Option<u32>,
+    bytes: u64,
 }
 
 #[derive(Serialize)]
@@ -1079,14 +1161,32 @@ async fn api_delete_token(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Serialize)]
+struct UserInfo {
+    username: String,
+    bytes: u64,
+}
+
 async fn api_list_users(
     State(ctx): State<AdminCtx>,
     headers: HeaderMap,
-) -> Result<Json<Vec<String>>, StatusCode> {
+) -> Result<Json<Vec<UserInfo>>, StatusCode> {
     if !authed(&headers, &ctx.token) {
         return Err(StatusCode::UNAUTHORIZED);
     }
-    Ok(Json(ctx.hub.store.list_users().map_err(ise)?))
+    let bytes = ctx.hub.user_bytes.lock().await.clone();
+    Ok(Json(
+        ctx.hub
+            .store
+            .list_users()
+            .map_err(ise)?
+            .into_iter()
+            .map(|username| {
+                let b = bytes.get(&username).copied().unwrap_or(0);
+                UserInfo { username, bytes: b }
+            })
+            .collect(),
+    ))
 }
 
 async fn api_create_user(
@@ -1240,6 +1340,11 @@ mod tests {
         assert_eq!(
             parse_route("me-session-k+x"),
             ("me", Route::Session("k+x".into()))
+        );
+        // region tag
+        assert_eq!(
+            parse_route("me-region-Indonesia"),
+            ("me", Route::Region("Indonesia".into()))
         );
     }
 }
