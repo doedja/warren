@@ -258,9 +258,13 @@
     <p class="sub" style="margin:6px 0 0;font-size:18px">It prints a proxy login, an enroll token, the TLS fingerprint, and a join code. It listens on <code>:7000</code> for devices and <code>:8000</code> for the proxy.</p>
 
     <p class="sub" style="margin:18px 0 4px"><span class="stepnum">02</span>on each device you own: paste the join code</p>
+    <p class="sub" style="margin:0 0 4px;font-size:18px;color:var(--mut)">Linux / macOS:</p>
     <div class="code"><button class="copy" onclick="cp(this)">COPY</button>
 <pre>curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh -s -- --join warren1.aGVsbG8...</pre></div>
-    <p class="sub" style="margin:6px 0 0;font-size:18px">The code carries the address, token, TLS, and fingerprint, so there are no flags to fill in. Copy it from the hub's output or the dashboard.</p>
+    <p class="sub" style="margin:8px 0 4px;font-size:18px;color:var(--mut)">Windows (elevated PowerShell):</p>
+    <div class="code"><button class="copy" onclick="cp(this)">COPY</button>
+<pre>&amp; ([scriptblock]::Create((irm https://raw.githubusercontent.com/doedja/warren/main/install.ps1))) -Join warren1.aGVsbG8...</pre></div>
+    <p class="sub" style="margin:6px 0 0;font-size:18px">The code carries the address, token, TLS, and fingerprint, so there are no flags to fill in. The dashboard hands you the right line per OS.</p>
 
     <p class="sub" style="margin:20px 0 4px">That is the setup. Now point any app at the proxy with the printed login:</p>
     <div class="code"><button class="copy" onclick="cp(this)">COPY</button>
@@ -269,7 +273,7 @@
     <div class="code"><button class="copy" onclick="cp(this)">COPY</button>
 <pre>curl -x http://warren+phone:PASSWORD@SERVER:8000 https://api.ipify.org</pre></div>
 
-    <p class="sub" style="margin-top:20px">On Windows, run <code>install.ps1 -Join ...</code>. For a localhost-only hub, add <code>--no-tls</code>. Full docs and prebuilt binaries on <a href="https://github.com/doedja/warren" style="color:var(--amber)">GitHub</a>.</p>
+    <p class="sub" style="margin-top:20px">For a localhost-only hub, add <code>--no-tls</code>. A spare Android phone works too, via Termux. Full docs and prebuilt binaries on <a href="https://github.com/doedja/warren" style="color:var(--amber)">GitHub</a>.</p>
   </section>
 </div>
 

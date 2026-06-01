@@ -117,8 +117,9 @@ function installCmd(token){
   const node = INFO.node_addr || '<hub-host>:7000';
   return `curl -fsSL ${installUrl()} | sh -s -- --hub ${node} --token ${token}${tlsFlags()}`;
 }
-// One-paste install using a join code (carries host + token + TLS + fingerprint).
+// One-paste installs using a join code (carries host + token + TLS + fingerprint).
 function joinInstallCmd(code){ return `curl -fsSL ${installUrl()} | sh -s -- --join ${code}`; }
+function winInstallCmd(code){ const ps = installUrl().replace('install.sh','install.ps1'); return `& ([scriptblock]::Create((irm ${ps}))) -Join ${code}`; }
 async function loadInfo(){
   const i = await api('GET','/api/info'); INFO = i;
   const node = i.node_addr || '<hub-host>:7000';
@@ -168,11 +169,16 @@ async function revokeKey(pk){ await api('DELETE','/api/node-keys/'+encodeURIComp
 async function loadTokens(){
   const rows = await api('GET','/api/tokens');
   document.getElementById('tokens').innerHTML = rows.map(t => {
-    // One-paste join code if the hub knows its public address; else the manual command.
-    const cmd = t.join_code ? joinInstallCmd(t.join_code) : installCmd(t.token);
+    // With a join code, offer a copy button per OS; otherwise the manual command.
+    let copy;
+    if (t.join_code) {
+      copy = `<button class="ghost" onclick='copyText(${esc(JSON.stringify(joinInstallCmd(t.join_code)))})'>copy (Linux/mac)</button> `+
+             `<button class="ghost" onclick='copyText(${esc(JSON.stringify(winInstallCmd(t.join_code)))})'>copy (Windows)</button> `;
+    } else {
+      copy = `<button class="ghost" onclick='copyText(${esc(JSON.stringify(installCmd(t.token)))})'>copy install</button> `;
+    }
     return `<tr><td>${esc(t.name)}</td><td><code>${esc(t.token)}</code></td><td>${fmtDate(t.created)}</td>`+
-    `<td><button class="ghost" onclick='copyText(${esc(JSON.stringify(cmd))})'>copy install</button> `+
-    `<button class="ghost" onclick="delToken('${esc(t.token)}')">delete</button></td></tr>`;
+    `<td>${copy}<button class="ghost" onclick="delToken('${esc(t.token)}')">delete</button></td></tr>`;
   }).join('')
     || '<tr><td colspan=4>No tokens yet. Create one to let a device join automatically.</td></tr>';
 }

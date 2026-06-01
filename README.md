@@ -47,10 +47,19 @@ This runs in the foreground for a quick try. For an always-on server, run it as 
 container ([compose example](examples/docker-compose.yml)) or behind a service.
 
 **2. On each device you own, join the pool.** Paste the join code (it carries the
-address, token, TLS, and fingerprint, so there are no flags to fill in):
+address, token, TLS, and fingerprint, so there are no flags to fill in). The
+dashboard's token list gives you the right line per OS.
+
+Linux / macOS:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh -s -- --join warren1.aGVsbG8...
+```
+
+Windows (elevated PowerShell):
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/doedja/warren/main/install.ps1))) -Join warren1.aGVsbG8...
 ```
 
 That is the setup. No VPN to mesh, no proxy to configure on each device, no
@@ -164,6 +173,21 @@ The arm64 static binary runs directly under Termux. Two things to know:
 
 `warren node install` (the boot service) does not apply here, since Termux has no
 systemd; run the node directly as shown.
+
+### Managing the node
+
+The installer registers a boot service, so the node **starts on reboot** and
+restarts if it crashes (systemd `Restart=always`, launchd `KeepAlive`). It also
+reconnects to the hub on its own if the link drops. To control it by hand:
+
+| OS | start / restart | status / logs |
+|----|-----------------|---------------|
+| Linux | `systemctl restart warren-node` | `journalctl -u warren-node -f` |
+| macOS | `launchctl kickstart -k gui/$(id -u)/com.warren.node` | `log show --predicate 'process == "warren"'` |
+| Windows | `schtasks /Run /TN warren-node` (runs at startup; not auto-restarted on crash) | Task Scheduler |
+| Termux | re-run `warren node run --join <code>` | terminal output |
+
+Or just run it in the foreground anywhere: `warren node run --join <code>`.
 
 ## Running the hub on the public internet
 
