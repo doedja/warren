@@ -125,15 +125,16 @@ async function loadInfo(){
   const node = i.node_addr || '<hub-host>:7000';
   const proxy = i.proxy_addr || '<hub-host>:18080';
   const puser = i.proxy_user || 'USER';
+  const ppass = i.proxy_pass || '<PASSWORD>';
   let html = '';
   if (!i.proxy_user) html += `<p class="desc" style="color:var(--acc)">No proxy user yet. Add one under Proxy users below first, or the proxy commands will not authenticate.</p>`;
   html += kv('Node link', node) + kv('Proxy', proxy);
   if (i.fingerprint) html += kv('Fingerprint (hub ID)', i.fingerprint);
   html += `<p class="desc">To add a device, use the <b>copy install</b> button on a token under Enrollment tokens below: it is one paste, no flags to fill in. The manual form is:</p>`;
   html += cmd('Add a node (manual)', `warren node run --hub ${node} --token <ENROLL_TOKEN>${tlsFlags()}`);
-  html += cmd('Use the pool (HTTPS / CONNECT, auto-picks a device)', `curl -x http://${puser}:<PASSWORD>@${proxy} https://api.ipify.org`);
-  html += cmd('Use the pool (SOCKS5)', `curl -x socks5h://${puser}:<PASSWORD>@${proxy} https://api.ipify.org`);
-  html += cmd('Use ONE device (put its name after +, see Live nodes)', `curl -x http://${puser}+DEVICE:<PASSWORD>@${proxy} https://api.ipify.org`);
+  html += cmd('Use the pool (HTTPS / CONNECT, auto-picks a device)', `curl -x http://${puser}:${ppass}@${proxy} https://api.ipify.org`);
+  html += cmd('Use the pool (SOCKS5)', `curl -x socks5h://${puser}:${ppass}@${proxy} https://api.ipify.org`);
+  html += cmd('Use ONE device (put its name after +, see Live nodes)', `curl -x http://${puser}+DEVICE:${ppass}@${proxy} https://api.ipify.org`);
   document.getElementById('connect').innerHTML = html;
 }
 async function loadPending(){
@@ -149,9 +150,10 @@ async function denyNode(pk){ await api('DELETE','/api/pending/'+encodeURICompone
 async function loadNodes(){
   const rows = await api('GET','/api/nodes');
   const puser = INFO.proxy_user || 'USER';
+  const ppass = INFO.proxy_pass || '<PASSWORD>';
   const proxy = INFO.proxy_addr || '<hub-host>:18080';
   document.getElementById('nodes').innerHTML = rows.map(n => {
-    const c = `curl -x http://${puser}+${n.name}:<PASSWORD>@${proxy} https://api.ipify.org`;
+    const c = `curl -x http://${puser}+${n.name}:${ppass}@${proxy} https://api.ipify.org`;
     const fail = n.fails >= 3 ? `<span style="color:#e0564b">${n.fails} / 3</span>` : `${n.fails} / 3`;
     return `<tr><td>${esc(n.id)}</td><td>${fmtDate(n.since)}</td><td>${fail}</td>`+
       `<td><button class="ghost" onclick='copyText(${esc(JSON.stringify(c))})'>copy proxy cmd</button></td></tr>`;

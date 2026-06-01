@@ -884,6 +884,10 @@ struct InfoJson {
     fingerprint: Option<String>,
     tls: bool,
     proxy_user: Option<String>,
+    /// Password of the displayed proxy user, so the dashboard's copy commands are
+    /// runnable as-is. The dashboard is admin-gated, so this is no more exposed
+    /// than the enroll/admin tokens already shown.
+    proxy_pass: Option<String>,
     install_url: String,
 }
 
@@ -894,18 +898,17 @@ async fn api_info(
     if !authed(&headers, &ctx.token) {
         return Err(StatusCode::UNAUTHORIZED);
     }
-    let proxy_user = ctx
-        .hub
-        .store
-        .list_users()
-        .ok()
-        .and_then(|u| u.into_iter().next());
+    let (proxy_user, proxy_pass) = match ctx.hub.store.first_user().ok().flatten() {
+        Some((u, p)) => (Some(u), Some(p)),
+        None => (None, None),
+    };
     Ok(Json(InfoJson {
         node_addr: ctx.hub.public_node_addr.clone(),
         proxy_addr: ctx.hub.public_proxy_addr.clone(),
         fingerprint: ctx.hub.fingerprint.clone(),
         tls: ctx.hub.tls.is_some(),
         proxy_user,
+        proxy_pass,
         install_url: "https://raw.githubusercontent.com/doedja/warren/main/install.sh".to_string(),
     }))
 }

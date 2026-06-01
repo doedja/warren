@@ -11,3 +11,5 @@ out/
 out-ci/
 out-wire/
 out-proxy/
+
+.handoff/

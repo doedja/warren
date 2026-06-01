@@ -118,6 +118,22 @@ impl Store {
         Ok(result)
     }
 
+    /// First proxy user as (username, password). Used to prefill the dashboard's
+    /// copy commands (the dashboard is admin-gated, so the password is no more
+    /// exposed than the other secrets already shown there).
+    pub fn first_user(&self) -> Result<Option<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        match conn.query_row(
+            "SELECT username, password FROM proxy_users LIMIT 1",
+            [],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        ) {
+            Ok(t) => Ok(Some(t)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     pub fn delete_user(&self, username: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let removed = conn.execute(
