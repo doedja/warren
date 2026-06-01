@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use axum::extract::{Path, State};
@@ -44,6 +45,11 @@ const UNHEALTHY_AT: u32 = 3;
 
 /// Cap on distinct hosts tracked per node before low-count entries are dropped.
 const HOST_FAIL_CAP: usize = 256;
+
+/// How long a sticky session keeps mapping to the same node after its last use.
+const SESSION_TTL: Duration = Duration::from_secs(600);
+/// Cap on tracked sessions before expired ones are swept.
+const SESSION_CAP: usize = 10_000;
 
 #[derive(Args, Debug)]
 pub struct HubArgs {
@@ -114,6 +120,16 @@ struct NodeEntry {
     /// still "fresh" on a given host (transport-level reachability). App-level
     /// blocks like 429/403 are inside the TLS tunnel and not observable here.
     host_fails: Arc<StdMutex<HashMap<String, u32>>>,
+    /// Public egress IP + geo, self-reported by the node (best-effort, may be
+    /// empty until the first report arrives).
+    info: Arc<StdMutex<NodeReport>>,
+}
+
+#[derive(Default, Clone)]
+struct NodeReport {
+    ip: Option<String>,
+    country: Option<String>,
+    city: Option<String>,
 }
 
 /// Runtime config independent of the CLI, so tests can drive the hub with
@@ -141,15 +157,19 @@ struct Hub {
     pending: Mutex<HashMap<u64, (u64, oneshot::Sender<Conn>)>>,
     rr: AtomicUsize,
     conn_seq: AtomicU64,
+    /// Sticky sessions: session key -> (node name, last use). A `user-session-K`
+    /// proxy username keeps requests on the same device while it stays healthy.
+    sessions: Mutex<HashMap<String, (String, Instant)>>,
 }
 
 impl Hub {
     fn next_conn_id(&self) -> u64 {
         self.conn_seq.fetch_add(1, Ordering::Relaxed)
     }
-    /// Snapshot of connected nodes. When `sel` is `Some(name)`, only nodes with
-    /// that exact device name are returned, so a client can route through one
-    /// specific device (and gets nothing, not a fallback, if it is offline).
+    /// Snapshot of connected nodes (id, name, tx, fails, host_fails). When `sel`
+    /// is `Some(name)`, only nodes with that exact device name are returned, so a
+    /// client can route through one specific device (and gets nothing, not a
+    /// fallback, if it is offline).
     // `map_or(true, ...)` keeps the MSRV at 1.74; `Option::is_none_or` is 1.82+.
     #[allow(clippy::type_complexity, clippy::unnecessary_map_or)]
     async fn snapshot(
@@ -157,6 +177,7 @@ impl Hub {
         sel: Option<&str>,
     ) -> Vec<(
         NodeId,
+        String,
         mpsc::UnboundedSender<HubToNode>,
         Arc<AtomicU32>,
         Arc<StdMutex<HashMap<String, u32>>>,
@@ -169,12 +190,29 @@ impl Hub {
             .map(|n| {
                 (
                     n.id.clone(),
+                    n.name.clone(),
                     n.tx.clone(),
                     n.fails.clone(),
                     n.host_fails.clone(),
                 )
             })
             .collect()
+    }
+
+    /// Look up the sticky node name for a session key if it is still within TTL.
+    async fn session_node(&self, key: &str) -> Option<String> {
+        let map = self.sessions.lock().await;
+        map.get(key)
+            .and_then(|(name, seen)| (seen.elapsed() < SESSION_TTL).then(|| name.clone()))
+    }
+
+    /// Record (or refresh) the node a session is stuck to.
+    async fn set_session(&self, key: &str, name: &str) {
+        let mut map = self.sessions.lock().await;
+        if map.len() > SESSION_CAP {
+            map.retain(|_, (_, seen)| seen.elapsed() < SESSION_TTL);
+        }
+        map.insert(key.to_string(), (name.to_string(), Instant::now()));
     }
     async fn add_node(&self, e: NodeEntry) {
         self.nodes.lock().await.push(e);
@@ -193,11 +231,17 @@ impl Hub {
             .lock()
             .await
             .iter()
-            .map(|n| NodeInfo {
-                id: n.id.0.clone(),
-                name: n.name.clone(),
-                fails: n.fails.load(Ordering::Relaxed),
-                since: n.since,
+            .map(|n| {
+                let r = n.info.lock().unwrap().clone();
+                NodeInfo {
+                    id: n.id.0.clone(),
+                    name: n.name.clone(),
+                    fails: n.fails.load(Ordering::Relaxed),
+                    since: n.since,
+                    ip: r.ip,
+                    country: r.country,
+                    city: r.city,
+                }
             })
             .collect()
     }
@@ -369,6 +413,7 @@ pub async fn run_with_listeners(
         pending: Mutex::new(HashMap::new()),
         rr: AtomicUsize::new(0),
         conn_seq: AtomicU64::new(1),
+        sessions: Mutex::new(HashMap::new()),
     });
 
     tracing::info!(
@@ -515,6 +560,7 @@ async fn handle_control(hello: Hello, mut conn: Conn, hub: Arc<Hub>) -> Result<(
     tracing::info!(node = %node_id.0, "node enrolled");
 
     let (tx, mut rx) = mpsc::unbounded_channel::<HubToNode>();
+    let info = Arc::new(StdMutex::new(NodeReport::default()));
     hub.add_node(NodeEntry {
         id: node_id.clone(),
         name: hello.node_name.clone(),
@@ -522,6 +568,7 @@ async fn handle_control(hello: Hello, mut conn: Conn, hub: Arc<Hub>) -> Result<(
         tx: tx.clone(),
         fails: Arc::new(AtomicU32::new(0)),
         host_fails: Arc::new(StdMutex::new(HashMap::new())),
+        info: info.clone(),
     })
     .await;
 
@@ -555,6 +602,17 @@ async fn handle_control(hello: Hello, mut conn: Conn, hub: Arc<Hub>) -> Result<(
                     tracing::debug!(node = %node_id.0, conn_id, %reason, "node reported dial failed");
                     let _ = hub.take_pending(conn_id).await;
                 }
+                NodeToHub::Info {
+                    public_ip,
+                    country,
+                    city,
+                } => {
+                    *info.lock().unwrap() = NodeReport {
+                        ip: public_ip,
+                        country,
+                        city,
+                    };
+                }
             }
         }
     }
@@ -587,13 +645,29 @@ fn host_fail_count(m: &StdMutex<HashMap<String, u32>>, host: &str) -> u32 {
     m.lock().unwrap().get(host).copied().unwrap_or(0)
 }
 
-/// Split a proxy username into its base user and an optional device selector.
-/// `user+phone` -> ("user", Some("phone")); `user` -> ("user", None). A trailing
-/// or empty selector (`user+`) is treated as no selector.
-fn split_selector(user: &str) -> (&str, Option<String>) {
+/// How the client wants its request routed, parsed from the proxy username.
+#[derive(Debug, PartialEq, Clone, Default)]
+enum Route {
+    /// `user`: any healthy device (round-robin + failover).
+    #[default]
+    Pool,
+    /// `user+name`: pin one named device (no fallback if offline).
+    Device(String),
+    /// `user-session-KEY`: stick to one device for this session key.
+    Session(String),
+}
+
+/// Parse `(base_user, route)` from a proxy username. `-session-` is checked first
+/// (and rejected at user creation, so it cannot collide), then `+`.
+fn parse_route(user: &str) -> (&str, Route) {
+    if let Some((base, key)) = user.split_once("-session-") {
+        if !key.is_empty() {
+            return (base, Route::Session(key.to_string()));
+        }
+    }
     match user.split_once('+') {
-        Some((base, sel)) if !sel.is_empty() => (base, Some(sel.to_string())),
-        _ => (user, None),
+        Some((base, name)) if !name.is_empty() => (base, Route::Device(name.to_string())),
+        _ => (user, Route::Pool),
     }
 }
 
@@ -614,15 +688,14 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
 
     let need_auth = hub.store.auth_required().unwrap_or(false);
     let store = hub.store.clone();
-    // A proxy username of `user+device` routes through one specific device;
-    // `user` alone uses the whole pool. Auth runs inside the SOCKS5/HTTP paths,
-    // so capture any device selector there and read it back once the target is
-    // known. The password is checked against the base username only.
-    let selector: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
-    let sel_cap = selector.clone();
+    // The proxy username encodes how to route (user / user+device / user-session-K).
+    // Auth runs inside the SOCKS5/HTTP paths, so capture the route there and read
+    // it back once the target is known. The password is checked against the base.
+    let route_cell: Arc<StdMutex<Route>> = Arc::new(StdMutex::new(Route::Pool));
+    let route_cap = route_cell.clone();
     let verify = move |u: &str, p: &str| {
-        let (base, sel) = split_selector(u);
-        *sel_cap.lock().unwrap() = sel;
+        let (base, route) = parse_route(u);
+        *route_cap.lock().unwrap() = route;
         store.check_user(base, p).unwrap_or(false)
     };
 
@@ -672,12 +745,28 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
         }
     };
 
-    let selector = selector.lock().unwrap().take();
-    let nodes = hub.snapshot(selector.as_deref()).await;
+    let route = std::mem::take(&mut *route_cell.lock().unwrap());
+    // Resolve candidate nodes. Device/sticky pin to one device; pool and
+    // fresh-session use the whole pool. session_key is Some when we should record
+    // which device served, so the next request in that session sticks to it.
+    let (nodes, session_key) = match route {
+        Route::Device(name) => (hub.snapshot(Some(&name)).await, None),
+        Route::Session(key) => match hub.session_node(&key).await {
+            Some(name) => {
+                let pinned = hub.snapshot(Some(&name)).await;
+                if pinned.is_empty() {
+                    (hub.snapshot(None).await, Some(key)) // stuck node gone: re-pick
+                } else {
+                    (pinned, Some(key))
+                }
+            }
+            None => (hub.snapshot(None).await, Some(key)),
+        },
+        Route::Pool => (hub.snapshot(None).await, None),
+    };
     if nodes.is_empty() {
-        // Either no devices are connected, or a specific device was named
-        // (user+device) and it is not online. Reject rather than silently
-        // leaving from a different device than the client asked for.
+        // No devices connected, or a pinned device (user+name) is offline. Reject
+        // rather than silently leaving from a different device than asked.
         reject(&mut client, &mode).await?;
         return Ok(());
     }
@@ -692,13 +781,13 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
     // last, global fails as the final tie-break. Stable sort keeps round-robin
     // order within a tier.
     order.sort_by_key(|&i| {
-        let hf = host_fail_count(&nodes[i].3, &host);
-        let global = nodes[i].2.load(Ordering::Relaxed);
+        let hf = host_fail_count(&nodes[i].4, &host);
+        let global = nodes[i].3.load(Ordering::Relaxed);
         (hf >= UNHEALTHY_AT, hf, global)
     });
 
     for idx in order {
-        let (node_id, node_tx, fails, host_fails) = &nodes[idx];
+        let (node_id, node_name, node_tx, fails, host_fails) = &nodes[idx];
         let conn_id = hub.next_conn_id();
         let nonce = rand::random::<u64>();
         let (otx, orx) = oneshot::channel::<Conn>();
@@ -722,6 +811,10 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
             Ok(Ok(mut data)) => {
                 fails.store(0, Ordering::Relaxed);
                 host_fails.lock().unwrap().remove(&host);
+                // This device served the request: stick the session to it.
+                if let Some(key) = &session_key {
+                    hub.set_session(key, node_name).await;
+                }
                 match &mode {
                     Mode::Connect => proxy::write_established(&mut client).await?,
                     Mode::Socks5 => socks5::write_reply(&mut client, socks5::REP_SUCCESS).await?,
@@ -789,6 +882,9 @@ struct NodeInfo {
     name: String,
     fails: u32,
     since: i64,
+    ip: Option<String>,
+    country: Option<String>,
+    city: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1115,15 +1211,28 @@ async fn api_delete_node_key(
 
 #[cfg(test)]
 mod tests {
-    use super::split_selector;
+    use super::{parse_route, Route};
 
     #[test]
-    fn selector_parsing() {
-        assert_eq!(split_selector("me"), ("me", None));
-        assert_eq!(split_selector("me+phone"), ("me", Some("phone".into())));
-        // empty selector is ignored (no device pinned)
-        assert_eq!(split_selector("me+"), ("me+", None));
+    fn route_parsing() {
+        assert_eq!(parse_route("me"), ("me", Route::Pool));
+        assert_eq!(
+            parse_route("me+phone"),
+            ("me", Route::Device("phone".into()))
+        );
+        // empty selector is ignored (whole pool)
+        assert_eq!(parse_route("me+"), ("me+", Route::Pool));
         // only the first + splits; later ones are part of the device name
-        assert_eq!(split_selector("me+a+b"), ("me", Some("a+b".into())));
+        assert_eq!(parse_route("me+a+b"), ("me", Route::Device("a+b".into())));
+        // sticky session
+        assert_eq!(
+            parse_route("me-session-ab12"),
+            ("me", Route::Session("ab12".into()))
+        );
+        // -session- takes priority over +
+        assert_eq!(
+            parse_route("me-session-k+x"),
+            ("me", Route::Session("k+x".into()))
+        );
     }
 }

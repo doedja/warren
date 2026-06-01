@@ -76,8 +76,21 @@ pub enum HubToNode {
 /// Messages from node to hub on the control connection after the handshake.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NodeToHub {
-    Pong { nonce: u64 },
-    DialFailed { conn_id: u64, reason: String },
+    Pong {
+        nonce: u64,
+    },
+    DialFailed {
+        conn_id: u64,
+        reason: String,
+    },
+    /// Node self-reports its public egress IP + geo (best-effort, periodic).
+    /// Added at the END so older nodes (which never send it) stay wire-compatible
+    /// with a newer hub; no PROTOCOL_VERSION bump needed.
+    Info {
+        public_ip: Option<String>,
+        country: Option<String>,
+        city: Option<String>,
+    },
 }
 
 /// First frame sent by the node on a data connection to identify which

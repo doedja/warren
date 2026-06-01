@@ -77,6 +77,16 @@ name to send traffic out one device, like picking a single exit node:
 curl -x http://warren+phone:PASSWORD@SERVER:8000 https://api.ipify.org
 ```
 
+Or use a **sticky session**: `user-session-KEY` keeps a sequence of requests on
+the same device while it stays healthy (for multi-step flows that need a stable
+IP). Any key works; reuse it across requests:
+
+```bash
+curl -x http://warren-session-ab12:PASSWORD@SERVER:8000 https://api.ipify.org
+```
+
+The dashboard's Live nodes shows each device's current **exit IP and location**.
+
 ## Why one binary
 
 The usual way to build this from your own devices is a stack: a mesh VPN
@@ -117,10 +127,12 @@ approval, your proxy users, and enrollment tokens, each labeled with what it doe
 ## What you get
 
 - One proxy endpoint for a pool of your own devices, with automatic failover.
-- **Pick the pool or one device.** `user:pass` auto-picks a healthy device;
-  `user+name:pass` sends traffic out one named device, like an exit node.
+- **Pick the pool, one device, or a sticky session.** `user:pass` auto-picks a
+  healthy device; `user+name:pass` pins one named device; `user-session-K:pass`
+  keeps a session on one device while it stays healthy.
 - **HTTP CONNECT, SOCKS5, and plain HTTP**, all on the same port, with auth.
-- A **live web dashboard** to add devices, approve them, and copy install commands.
+- A **live web dashboard** to add devices, approve them, copy install commands,
+  and see each device's current exit IP and location.
 - **Encrypted device link** (TLS on by default; the device pins the hub's key).
 - **No inbound** on devices; runs on Linux, macOS, Windows, and tiny ARM boxes.
 - One static binary. No runtime, no database server (state is a local file).

@@ -91,12 +91,18 @@ impl Store {
     }
 
     pub fn add_user(&self, username: &str, password: &str) -> Result<()> {
-        // `+` is reserved: clients put a device name after it (user+device) to
-        // route through one device, so a username containing `+` would be
-        // ambiguous at proxy-auth time. Reject it where the name is created.
+        // `+` and `-session-` are reserved in proxy usernames: clients put a
+        // device name after `+` (user+device) or a session key after `-session-`
+        // (user-session-KEY) to control routing, so a username containing either
+        // would be ambiguous at proxy-auth time. Reject at creation.
         if username.contains('+') {
             anyhow::bail!(
                 "proxy username may not contain '+' (it is reserved for device selection)"
+            );
+        }
+        if username.contains("-session-") {
+            anyhow::bail!(
+                "proxy username may not contain '-session-' (it is reserved for sticky sessions)"
             );
         }
         let conn = self.conn.lock().unwrap();

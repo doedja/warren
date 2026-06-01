@@ -210,6 +210,22 @@ async fn connect_once(
         }
     });
 
+    // Self-report public egress IP + geo to the hub, best-effort, on connect and
+    // every 5 minutes. Old hubs ignore an unknown message; this hub shows it.
+    let report_tx = ntx.clone();
+    let reporter = tokio::spawn(async move {
+        loop {
+            if let Some((ip, country, city)) = fetch_public_info().await {
+                let _ = report_tx.send(NodeToHub::Info {
+                    public_ip: Some(ip),
+                    country,
+                    city,
+                });
+            }
+            tokio::time::sleep(Duration::from_secs(300)).await;
+        }
+    });
+
     let hub_addr = r.hub.clone();
     let connector = connector.clone();
     let res: Result<()> = async {
@@ -238,7 +254,38 @@ async fn connect_once(
     .await;
 
     writer.abort();
+    reporter.abort();
     res
+}
+
+/// Best-effort lookup of this node's public egress IP + geo via ip-api.com
+/// (plain HTTP, no key, no extra dependency). Returns None on any failure.
+async fn fetch_public_info() -> Option<(String, Option<String>, Option<String>)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let connect = TcpStream::connect("ip-api.com:80");
+    let mut s = tokio::time::timeout(Duration::from_secs(8), connect)
+        .await
+        .ok()?
+        .ok()?;
+    let req = "GET /line/?fields=query,country,city HTTP/1.1\r\nHost: ip-api.com\r\nConnection: close\r\nUser-Agent: warren\r\n\r\n";
+    s.write_all(req.as_bytes()).await.ok()?;
+    let mut buf = Vec::new();
+    tokio::time::timeout(Duration::from_secs(8), s.read_to_end(&mut buf))
+        .await
+        .ok()?
+        .ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    let body = text.split("\r\n\r\n").nth(1)?;
+    let mut lines = body.lines().map(str::trim).filter(|l| !l.is_empty());
+    let ip = lines.next()?.to_string();
+    // /line returns "fail" as the first line on error; reject anything that is
+    // not IP-shaped.
+    if !ip.contains('.') && !ip.contains(':') {
+        return None;
+    }
+    let country = lines.next().map(str::to_string);
+    let city = lines.next().map(str::to_string);
+    Some((ip, country, city))
 }
 
 async fn handle_dial(

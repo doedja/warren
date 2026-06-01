@@ -15,7 +15,7 @@ pub const DASHBOARD: &str = r###"<!doctype html>
   h2 { font-size:13px; color:var(--mut); margin:0 0 4px; text-transform:uppercase; letter-spacing:.05em; }
   .desc { color:var(--mut); font-size:12px; margin:0 0 12px; line-height:1.45; max-width:62ch; }
   .hint { color:var(--acc); cursor:help; border-bottom:1px dotted var(--acc); }
-  main { padding:20px; display:grid; gap:18px; max-width:920px; }
+  main { padding:20px; display:grid; gap:18px; max-width:920px; margin:0 auto; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:16px; }
   input { background:#0b0d10; border:1px solid var(--line); color:var(--fg); padding:6px 8px; border-radius:5px; font:inherit; }
   button { background:var(--acc); border:0; color:#06121f; padding:6px 12px; border-radius:5px; font:inherit; cursor:pointer; }
@@ -72,7 +72,7 @@ pub const DASHBOARD: &str = r###"<!doctype html>
   <section class="card">
     <h2>Live nodes</h2>
     <p class="desc">Devices connected right now and ready to carry requests. Up since is when each connected. Fails counts recent dial errors; the hub deprioritizes a device once it reaches 3. Copy a device's command to send traffic out only through that one device.</p>
-    <table><thead><tr><th>Node</th><th>Up since</th><th>Fails</th><th>Use just this device</th></tr></thead><tbody id="nodes"></tbody></table>
+    <table><thead><tr><th>Node</th><th>Exit IP</th><th>Location</th><th>Up since</th><th>Fails</th><th>Use just this device</th></tr></thead><tbody id="nodes"></tbody></table>
   </section>
   <section class="card">
     <h2>Pending approval</h2>
@@ -155,9 +155,11 @@ async function loadNodes(){
   document.getElementById('nodes').innerHTML = rows.map(n => {
     const c = `curl -x http://${puser}+${n.name}:${ppass}@${proxy} https://api.ipify.org`;
     const fail = n.fails >= 3 ? `<span style="color:#e0564b">${n.fails} / 3</span>` : `${n.fails} / 3`;
-    return `<tr><td>${esc(n.id)}</td><td>${fmtDate(n.since)}</td><td>${fail}</td>`+
+    const ip = n.ip ? `<code>${esc(n.ip)}</code>` : '<span style="color:var(--mut)">pending</span>';
+    const loc = [n.city, n.country].filter(Boolean).map(esc).join(', ') || '<span style="color:var(--mut)">-</span>';
+    return `<tr><td>${esc(n.id)}</td><td>${ip}</td><td>${loc}</td><td>${fmtDate(n.since)}</td><td>${fail}</td>`+
       `<td><button class="ghost" onclick='copyText(${esc(JSON.stringify(c))})'>copy proxy cmd</button></td></tr>`;
-  }).join('') || '<tr><td colspan=4>No devices online yet. Create a token below and run the install line on a device.</td></tr>';
+  }).join('') || '<tr><td colspan=6>No devices online yet. Create a token below and run the install line on a device.</td></tr>';
 }
 function copyText(t){ navigator.clipboard.writeText(t); setStatus('proxy command copied'); }
 async function loadKeys(){
