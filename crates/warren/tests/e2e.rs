@@ -57,7 +57,8 @@ async fn end_to_end_proxy_through_node() {
     // 3. One node agent dialing the hub.
     tokio::spawn(async move {
         let _ = run_agent(RunArgs {
-            hub: node_addr.to_string(),
+            join: None,
+            hub: Some(node_addr.to_string()),
             token: Some("secret".into()),
             key_file: Some(format!(
                 "{}/warren-e2e-proxy.key",
@@ -157,7 +158,8 @@ async fn rejects_bad_auth_and_allows_good() {
     });
     tokio::spawn(async move {
         let _ = run_agent(RunArgs {
-            hub: node_addr.to_string(),
+            join: None,
+            hub: Some(node_addr.to_string()),
             token: Some("secret".into()),
             key_file: Some(format!(
                 "{}/warren-e2e-auth.key",
@@ -231,7 +233,8 @@ async fn routes_to_named_device_and_rejects_unknown() {
     });
     tokio::spawn(async move {
         let _ = run_agent(RunArgs {
-            hub: node_addr.to_string(),
+            join: None,
+            hub: Some(node_addr.to_string()),
             token: Some("secret".into()),
             key_file: Some(format!(
                 "{}/warren-e2e-named.key",

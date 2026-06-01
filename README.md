@@ -24,36 +24,48 @@ and the node.
 
 ## Set it up: two steps
 
-**1. On a server, install warren and start the hub.** It mints and prints a join
-token, so there is no secret to invent.
+**1. On a server, install warren and start the hub.** No secrets to invent: it
+generates a proxy login and an enrollment token, turns on TLS, and prints a
+one-paste **join code** for your devices (give it the address devices reach it on
+so the code is complete).
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh && warren hub --proxy-user me --proxy-pass YOURPASSWORD
+curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh && warren hub --public-node-addr SERVER:7000
+```
+
+It prints something like:
+
+```
+warren hub is up.
+  proxy login:   warren / 7f3a9d2e1b8c...
+  enroll token:  k7f3a9d2e1b8...
+  fingerprint:   c8145bad9e7f...
+  join a device: warren node run --join warren1.aGVsbG8...
 ```
 
 This runs in the foreground for a quick try. For an always-on server, run it as a
 container ([compose example](examples/docker-compose.yml)) or behind a service.
 
-**2. On each device you own, join the pool.** `JOINKEY` is the token the hub
-printed (or copy the whole line from the dashboard, address and token filled in).
+**2. On each device you own, join the pool.** Paste the join code (it carries the
+address, token, TLS, and fingerprint, so there are no flags to fill in):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh -s -- --hub SERVER:7000 --token JOINKEY
+curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh -s -- --join warren1.aGVsbG8...
 ```
 
 That is the setup. No VPN to mesh, no proxy to configure on each device, no
 rotator to bolt on. Add more devices and the hub spreads requests across them and
-skips any that drop. Now point any app at the proxy:
+skips any that drop. Now point any app at the proxy with the printed login:
 
 ```bash
-curl -x http://me:YOURPASSWORD@SERVER:8000 https://api.ipify.org
+curl -x http://warren:PASSWORD@SERVER:8000 https://api.ipify.org
 ```
 
 A plain username uses the whole pool and fails over automatically. Add a device
 name to send traffic out one device, like picking a single exit node:
 
 ```bash
-curl -x http://me+phone:YOURPASSWORD@SERVER:8000 https://api.ipify.org
+curl -x http://warren+phone:PASSWORD@SERVER:8000 https://api.ipify.org
 ```
 
 ## Why one binary
@@ -100,7 +112,7 @@ approval, your proxy users, and enrollment tokens, each labeled with what it doe
   `user+name:pass` sends traffic out one named device, like an exit node.
 - **HTTP CONNECT, SOCKS5, and plain HTTP**, all on the same port, with auth.
 - A **live web dashboard** to add devices, approve them, and copy install commands.
-- **Encrypted device link** (opt-in TLS; the device pins the hub's key).
+- **Encrypted device link** (TLS on by default; the device pins the hub's key).
 - **No inbound** on devices; runs on Linux, macOS, Windows, and tiny ARM boxes.
 - One static binary. No runtime, no database server (state is a local file).
 
@@ -116,7 +128,7 @@ arguments to just drop in the binary.
 
 ```powershell
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/doedja/warren/main/install.ps1))) `
-    -Hub SERVER:7000 -Token SECRET
+    -Join warren1.aGVsbG8...
 ```
 
 **Clean uninstall** (stops the service, deletes the node key, removes the binary):
@@ -132,19 +144,16 @@ if you want the hub to forget it. No prebuilt binary for your arch? Build it:
 
 ## Running the hub on the public internet
 
-**Do I need TLS?** On a private hub (localhost, a LAN, a tailnet), no. If anyone
-on the internet can reach the hub, yes: turn on TLS so each device can confirm it
-is talking to *your* real hub, not an impostor.
-
-- Start the hub with `--tls`. It prints a fingerprint on first run; use
-  `--tls-cert-dir` to keep that fingerprint stable across restarts.
-- Join devices with `--tls --hub-fingerprint FP`. The dashboard's Connect card
-  already includes this, so you still just copy and paste.
+**TLS is on by default.** The hub generates a self-signed cert (persisted next to
+the db, so the fingerprint stays stable across restarts) and devices pin its
+fingerprint, so a device can confirm it reached *your* real hub. The join code
+carries the fingerprint, so you never type it. Only drop TLS with `--no-tls` for a
+hub reached only over localhost or a tailnet.
 
 A device makes an ed25519 key on first run and proves it owns that key when it
-connects. With `--token` the hub trusts the device right away; without a token it
-appears as **pending** and you approve it in the dashboard. You can revoke any
-device's key later, and nothing secret travels over the wire.
+connects. With a token (in the join code) the hub trusts the device right away;
+without one it appears as **pending** and you approve it in the dashboard. You can
+revoke any device's key later, and nothing secret travels over the wire.
 
 ### As a container
 
@@ -188,29 +197,36 @@ One binary, three subcommands. Run any with `--help` for the full list.
 
 | flag | default | what it does |
 |------|---------|--------------|
+| flag | default | what it does |
+|------|---------|--------------|
 | `--listen` | `0.0.0.0:7000` | address devices dial in on (control + data) |
 | `--proxy-listen` | `0.0.0.0:8000` | address apps send proxy traffic to |
-| `--enroll-token` | auto-minted | join secret for devices; if omitted, one is generated and printed on first run |
-| `--proxy-user` / `--proxy-pass` | none | seed a proxy login (clients auth with these) |
+| `--public-node-addr` | none | the address devices reach the hub on; set it so the printed/dashboard join code is complete |
+| `--enroll-token` | auto | join secret; if omitted and none exists, one is generated and printed |
+| `--proxy-user` / `--proxy-pass` | auto | a proxy login; if omitted and none exists, one is generated and printed |
 | `--admin-listen` / `--admin-token` | off | serve the dashboard; log in with any username + the token |
-| `--tls` | off | encrypt the device link; prints a fingerprint devices pin |
-| `--tls-cert-dir` | none | keep the TLS cert across restarts (so the fingerprint is stable) |
+| `--no-tls` | off | turn TLS OFF (plaintext); only for localhost or a tailnet |
+| `--tls-cert-dir` | next to `--db` | where the TLS cert lives (so the fingerprint is stable) |
 | `--db` | `warren.db` | SQLite file (tokens + proxy users + device keys) |
-| `--public-node-addr` / `--public-proxy-addr` | none | addresses shown in the dashboard's commands |
+| `--public-proxy-addr` | none | proxy address shown in the dashboard's commands |
 
 Most of these also read an env var (`WARREN_ENROLL_TOKEN`, `WARREN_PROXY_USER`,
 `WARREN_PROXY_PASS`, `WARREN_ADMIN_LISTEN`, `WARREN_ADMIN_TOKEN`, `WARREN_DB`,
 `WARREN_TLS_CERT_DIR`, `WARREN_PUBLIC_NODE_ADDR`, `WARREN_PUBLIC_PROXY_ADDR`),
 which is how the container image is configured. `--listen`, `--proxy-listen`, and
-`--tls` are flags only.
+`--no-tls` are flags only.
 
-**`warren node run --hub HOST:7000`** runs the agent on a device.
+**`warren node run --join <code>`** runs the agent on a device. The join code (from
+the hub's startup output or the dashboard) fills in everything below; or pass the
+flags yourself.
 
 | flag | what it does |
 |------|--------------|
+| `--join` | one-paste join code; fills in hub address, token, TLS, and fingerprint |
+| `--hub HOST:7000` | the hub address, if you are not using `--join` |
 | `--token` | join automatically (Mode B); omit to wait for dashboard approval (Mode A) |
 | `--name` | the device's name in the pool (defaults to its hostname); this is the name used in `user+name` |
-| `--tls` `--hub-fingerprint FP` | use TLS and pin the hub (required if the hub uses `--tls`) |
+| `--tls` `--hub-fingerprint FP` | use TLS and pin the hub (carried by `--join`) |
 | `--insecure` | with `--tls`, skip fingerprint pinning. Dev only; do not use against a real hub |
 | `--key-file` | where the device keeps its identity key (default `~/.warren/node.key`) |
 

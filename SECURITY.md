@@ -19,11 +19,12 @@ You can expect an acknowledgement within a few days.
 warren is built for devices and accounts you control. Useful things to know when
 judging severity:
 
-- **The node link.** Without `--tls` the hub-to-node link is plaintext, by
-  design, for a hub reached only over localhost or a private network (a tailnet,
-  a LAN, a WireGuard mesh). On a public hub, run with `--tls`: the device pins
-  the hub's certificate fingerprint, and each data connection carries a random
-  per-dial nonce so a guessed connection id cannot hijack a tunnel.
+- **The node link.** TLS is on by default: the device pins the hub's certificate
+  fingerprint (carried in the join code), and each data connection carries a
+  random per-dial nonce so a guessed connection id cannot hijack a tunnel.
+  `--no-tls` drops to plaintext, by design, for a hub reached only over localhost
+  or a private network (a tailnet, a LAN, a WireGuard mesh); do not use it on a
+  public hub.
 - **Enrollment.** A device proves possession of its ed25519 key with a signed,
   time-bounded challenge. An enrollment token auto-approves a new key; without a
   token the device waits for approval in the dashboard. Treat the token as a

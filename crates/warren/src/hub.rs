@@ -6,9 +6,9 @@
 //!   - Data: a fresh socket tagged with a conn_id, handed to the waiting
 //!     client handler to splice.
 //!
-//! With `--tls` the node link is wrapped in TLS (self-signed cert, fingerprint
-//! printed at startup). The client-facing proxy auto-detects HTTP CONNECT,
-//! SOCKS5, and plain-HTTP (absolute-URI) on one port.
+//! The node link is TLS by default (self-signed cert, fingerprint printed at
+//! startup; `--no-tls` drops to plaintext for localhost). The client-facing
+//! proxy auto-detects HTTP CONNECT, SOCKS5, and plain-HTTP on one port.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -65,9 +65,12 @@ pub struct HubArgs {
     /// Optional Basic-auth password required of proxy clients.
     #[arg(long, env = "WARREN_PROXY_PASS")]
     pub proxy_pass: Option<String>,
-    /// Enable TLS on the node link (self-signed cert; fingerprint printed).
-    #[arg(long, default_value_t = false)]
+    /// Deprecated: TLS is on by default now. Accepted for compatibility, no effect.
+    #[arg(long, default_value_t = false, hide = true)]
     pub tls: bool,
+    /// Turn OFF TLS on the node link (plaintext). Use only on localhost or a tailnet.
+    #[arg(long, default_value_t = false)]
+    pub no_tls: bool,
     /// Persist the TLS cert under this dir so the fingerprint survives restarts.
     /// Without it, a fresh cert is generated each boot.
     #[arg(long, env = "WARREN_TLS_CERT_DIR")]
@@ -223,6 +226,56 @@ fn gen_token() -> String {
         .collect()
 }
 
+/// Directory that holds the db, used as the default TLS cert location so the
+/// fingerprint persists next to the rest of the hub's state.
+fn db_parent_dir(db: &str) -> String {
+    std::path::Path::new(db)
+        .parent()
+        .map(|p| {
+            if p.as_os_str().is_empty() {
+                ".".to_string()
+            } else {
+                p.to_string_lossy().into_owned()
+            }
+        })
+        .unwrap_or_else(|| ".".to_string())
+}
+
+/// Print the secrets and a ready-to-paste join command once at startup, so a
+/// fresh hub is usable without digging through flags or the dashboard.
+fn print_startup(
+    store: &Store,
+    tls_on: bool,
+    fingerprint: Option<&str>,
+    public_node_addr: Option<&str>,
+    login: Option<(String, String)>,
+) -> Result<()> {
+    let token = store.list_tokens()?.into_iter().next().map(|(t, _, _)| t);
+    println!("\n  warren hub is up.");
+    if let Some((u, p)) = &login {
+        println!("  proxy login:   {u} / {p}");
+    }
+    if let Some(t) = &token {
+        println!("  enroll token:  {t}");
+    }
+    if tls_on {
+        if let Some(fp) = fingerprint {
+            println!("  fingerprint:   {fp}");
+        }
+    }
+    match (public_node_addr, &token) {
+        (Some(addr), Some(t)) => {
+            let code = crate::joincode::encode(addr, tls_on, fingerprint, Some(t));
+            println!("  join a device: warren node run --join {code}");
+        }
+        _ => println!(
+            "  (set --public-node-addr to print a one-paste join code, or copy it from the dashboard)"
+        ),
+    }
+    println!();
+    Ok(())
+}
+
 pub async fn run(args: HubArgs) -> Result<()> {
     let node_listener = TcpListener::bind(&args.listen)
         .await
@@ -231,17 +284,20 @@ pub async fn run(args: HubArgs) -> Result<()> {
         .await
         .with_context(|| format!("bind proxy listener {}", args.proxy_listen))?;
 
-    let (tls, fingerprint) = if args.tls {
-        let (acceptor, fp) = match &args.tls_cert_dir {
-            Some(dir) => tls::server_acceptor_from_dir(dir)?,
-            None => tls::server_acceptor()?,
-        };
-        println!("warren hub TLS fingerprint: {fp}");
-        tracing::info!(fingerprint = %fp,
-            "TLS enabled on node link; join nodes with --tls --hub-fingerprint <fingerprint>");
+    // TLS is on by default; --no-tls drops to plaintext for localhost/tailnet.
+    // The cert is persisted (next to the db unless --tls-cert-dir is given) so
+    // the fingerprint stays stable across restarts and pinned nodes keep working.
+    let tls_on = !args.no_tls;
+    let (tls, fingerprint) = if tls_on {
+        let cert_dir = args
+            .tls_cert_dir
+            .clone()
+            .unwrap_or_else(|| db_parent_dir(&args.db));
+        let (acceptor, fp) = tls::server_acceptor_from_dir(&cert_dir)?;
+        tracing::info!(fingerprint = %fp, cert_dir = %cert_dir, "TLS on (node link)");
         (Some(acceptor), Some(fp))
     } else {
-        tracing::warn!("node link is PLAINTEXT (no --tls); use only on localhost or a tailnet");
+        tracing::warn!("node link is PLAINTEXT (--no-tls); use only on localhost or a tailnet");
         (None, None)
     };
 
@@ -250,15 +306,28 @@ pub async fn run(args: HubArgs) -> Result<()> {
         store.add_token(tok, "cli")?;
     } else if store.list_tokens()?.is_empty() {
         // No token supplied and none stored yet: mint one so a fresh hub is
-        // usable without inventing a secret. Printed once here and shown in the
-        // dashboard under Enrollment tokens. Rotate with `warren enroll`.
-        let tok = gen_token();
-        store.add_token(&tok, "auto")?;
-        println!("warren enroll token (use on your devices with --token): {tok}");
+        // usable without inventing a secret. Rotate with `warren enroll`.
+        store.add_token(&gen_token(), "auto")?;
     }
-    if let (Some(u), Some(p)) = (&args.proxy_user, &args.proxy_pass) {
-        store.add_user(u, p)?;
+    // Seed a proxy login. If none is given and none exists yet, generate one so
+    // a fresh hub is immediately usable; the operator can change it later.
+    let mut printed_login: Option<(String, String)> = None;
+    match (&args.proxy_user, &args.proxy_pass) {
+        (Some(u), Some(p)) => store.add_user(u, p)?,
+        _ if !store.auth_required().unwrap_or(false) => {
+            let (u, p) = ("warren".to_string(), gen_token());
+            store.add_user(&u, &p)?;
+            printed_login = Some((u, p));
+        }
+        _ => {}
     }
+    print_startup(
+        &store,
+        tls_on,
+        fingerprint.as_deref(),
+        args.public_node_addr.as_deref(),
+        printed_login,
+    )?;
 
     let admin = match (args.admin_listen, args.admin_token) {
         (Some(l), Some(t)) => Some((l, t)),
@@ -727,6 +796,9 @@ struct TokenInfo {
     token: String,
     name: String,
     created: i64,
+    /// One-paste join code for this token, or null if the hub does not know its
+    /// public address yet (set --public-node-addr).
+    join_code: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -856,12 +928,21 @@ async fn api_list_tokens(
         return Err(StatusCode::UNAUTHORIZED);
     }
     let rows = ctx.hub.store.list_tokens().map_err(ise)?;
+    let node_addr = ctx.hub.public_node_addr.clone();
+    let tls = ctx.hub.tls.is_some();
+    let fp = ctx.hub.fingerprint.clone();
     Ok(Json(
         rows.into_iter()
-            .map(|(token, name, created)| TokenInfo {
-                token,
-                name,
-                created,
+            .map(|(token, name, created)| {
+                let join_code = node_addr
+                    .as_deref()
+                    .map(|addr| crate::joincode::encode(addr, tls, fp.as_deref(), Some(&token)));
+                TokenInfo {
+                    token,
+                    name,
+                    created,
+                    join_code,
+                }
             })
             .collect(),
     ))

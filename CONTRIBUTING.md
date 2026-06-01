@@ -22,10 +22,10 @@ hub, a node, and a target on ephemeral ports and drives real proxy traffic
 through them. Add a test there for any behavior change to the routing, auth, or
 data path.
 
-To run it by hand: start a hub with `cargo run -- hub --proxy-user me
---proxy-pass pw` (it prints a join token), join a node with `cargo run -- node
-run --hub 127.0.0.1:7000 --token <printed>`, then
-`curl -x http://me:pw@127.0.0.1:8000 https://api.ipify.org`.
+To run it by hand on localhost (plaintext, no fingerprint to deal with): start a
+hub with `cargo run -- hub --no-tls` (it prints a proxy login and an enroll
+token), join a node with `cargo run -- node run --hub 127.0.0.1:7000 --token
+<printed>`, then `curl -x http://<printed-login>@127.0.0.1:8000 https://api.ipify.org`.
 
 ## Pull requests
 

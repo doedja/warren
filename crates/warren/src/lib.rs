@@ -7,6 +7,7 @@ pub mod admin_ui;
 pub mod conn;
 pub mod hub;
 pub mod identity;
+pub mod joincode;
 pub mod node;
 pub mod proxy;
 pub mod socks5;

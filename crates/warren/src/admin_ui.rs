@@ -112,10 +112,13 @@ function copyEl(btn){
 function kv(k,v){ return `<div class="kv"><b>${k}</b><code>${esc(v)}</code></div>`; }
 function cmd(label, c){ return `<div class="cmd"><div class="cmdlabel">${label}</div><div class="cmdrow"><code>${esc(c)}</code><button class="ghost" onclick="copyEl(this)">copy</button></div></div>`; }
 function tlsFlags(){ return (INFO.tls && INFO.fingerprint) ? ` --tls --hub-fingerprint ${INFO.fingerprint}` : ''; }
+function installUrl(){ return INFO.install_url||'https://raw.githubusercontent.com/doedja/warren/main/install.sh'; }
 function installCmd(token){
   const node = INFO.node_addr || '<hub-host>:7000';
-  return `curl -fsSL ${INFO.install_url||'https://raw.githubusercontent.com/doedja/warren/main/install.sh'} | sh -s -- --hub ${node} --token ${token}${tlsFlags()}`;
+  return `curl -fsSL ${installUrl()} | sh -s -- --hub ${node} --token ${token}${tlsFlags()}`;
 }
+// One-paste install using a join code (carries host + token + TLS + fingerprint).
+function joinInstallCmd(code){ return `curl -fsSL ${installUrl()} | sh -s -- --join ${code}`; }
 async function loadInfo(){
   const i = await api('GET','/api/info'); INFO = i;
   const node = i.node_addr || '<hub-host>:7000';
@@ -125,8 +128,8 @@ async function loadInfo(){
   if (!i.proxy_user) html += `<p class="desc" style="color:var(--acc)">No proxy user yet. Add one under Proxy users below first, or the proxy commands will not authenticate.</p>`;
   html += kv('Node link', node) + kv('Proxy', proxy);
   if (i.fingerprint) html += kv('Fingerprint (hub ID)', i.fingerprint);
-  html += cmd('Add a node (installer, fill in a token from below)', installCmd('<ENROLL_TOKEN>'));
-  html += cmd('Add a node (existing binary)', `warren node run --hub ${node} --token <ENROLL_TOKEN>${tlsFlags()}`);
+  html += `<p class="desc">To add a device, use the <b>copy install</b> button on a token under Enrollment tokens below: it is one paste, no flags to fill in. The manual form is:</p>`;
+  html += cmd('Add a node (manual)', `warren node run --hub ${node} --token <ENROLL_TOKEN>${tlsFlags()}`);
   html += cmd('Use the pool (HTTPS / CONNECT, auto-picks a device)', `curl -x http://${puser}:<PASSWORD>@${proxy} https://api.ipify.org`);
   html += cmd('Use the pool (SOCKS5)', `curl -x socks5h://${puser}:<PASSWORD>@${proxy} https://api.ipify.org`);
   html += cmd('Use ONE device (put its name after +, see Live nodes)', `curl -x http://${puser}+DEVICE:<PASSWORD>@${proxy} https://api.ipify.org`);
@@ -164,13 +167,15 @@ async function loadKeys(){
 async function revokeKey(pk){ await api('DELETE','/api/node-keys/'+encodeURIComponent(pk)); loadKeys(); }
 async function loadTokens(){
   const rows = await api('GET','/api/tokens');
-  document.getElementById('tokens').innerHTML = rows.map(t =>
-    `<tr><td>${esc(t.name)}</td><td><code>${esc(t.token)}</code></td><td>${fmtDate(t.created)}</td>`+
-    `<td><button class="ghost" onclick='copyInstall(${esc(JSON.stringify(t.token))})'>copy install</button> `+
-    `<button class="ghost" onclick="delToken('${esc(t.token)}')">delete</button></td></tr>`).join('')
+  document.getElementById('tokens').innerHTML = rows.map(t => {
+    // One-paste join code if the hub knows its public address; else the manual command.
+    const cmd = t.join_code ? joinInstallCmd(t.join_code) : installCmd(t.token);
+    return `<tr><td>${esc(t.name)}</td><td><code>${esc(t.token)}</code></td><td>${fmtDate(t.created)}</td>`+
+    `<td><button class="ghost" onclick='copyText(${esc(JSON.stringify(cmd))})'>copy install</button> `+
+    `<button class="ghost" onclick="delToken('${esc(t.token)}')">delete</button></td></tr>`;
+  }).join('')
     || '<tr><td colspan=4>No tokens yet. Create one to let a device join automatically.</td></tr>';
 }
-function copyInstall(token){ navigator.clipboard.writeText(installCmd(token)); setStatus('install command copied for token'); }
 async function addToken(){
   const name = document.getElementById('tname').value.trim() || 'node';
   const res = await api('POST','/api/tokens',{name});

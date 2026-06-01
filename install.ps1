@@ -5,14 +5,15 @@ service is registered as SYSTEM).
   # install the binary only:
   irm https://raw.githubusercontent.com/doedja/warren/main/install.ps1 | iex
 
-  # install + register as a startup service:
+  # install + register as a startup service (join code from the hub/dashboard):
   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/doedja/warren/main/install.ps1))) `
-      -Hub HOST:7000 -Token TOKEN -Tls -HubFingerprint FP
+      -Join warren1.aGVsbG8...
 
   # uninstall:
   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/doedja/warren/main/install.ps1))) -Uninstall
 #>
 param(
+  [string]$Join,
   [string]$Hub,
   [string]$Token,
   [string]$HubFingerprint,
@@ -52,7 +53,11 @@ if (-not $found) { Write-Error 'warren: warren.exe not found in archive.'; retur
 if ($found.FullName -ne $exe) { Copy-Item $found.FullName $exe -Force }
 Write-Host "warren: installed at $exe"
 
-if ($Hub) {
+if ($Join) {
+  $a = @('node', 'install', '--join', $Join)
+  if ($Name) { $a += @('--name', $Name) }
+  & $exe @a
+} elseif ($Hub) {
   $a = @('node', 'install', '--hub', $Hub)
   if ($Token) { $a += @('--token', $Token) }
   if ($Tls) { $a += '--tls' }
@@ -61,6 +66,6 @@ if ($Hub) {
   if ($Name) { $a += @('--name', $Name) }
   & $exe @a
 } else {
-  Write-Host "Next: `"$exe`" node run --hub HOST:7000 --token TOKEN [-Tls -HubFingerprint FP]"
+  Write-Host "Next: `"$exe`" node run --join <code>   (or --hub HOST:7000 --token TOKEN)"
   Write-Host "(or add $dir to PATH)"
 }

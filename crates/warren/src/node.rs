@@ -45,9 +45,13 @@ pub enum NodeAction {
 
 #[derive(Args, Debug)]
 pub struct RunArgs {
-    /// Hub node-facing address, host:port (e.g. 127.0.0.1:7000).
+    /// One-paste join code from the hub/dashboard. Fills in --hub, --token,
+    /// --tls, and --hub-fingerprint, so you do not pass them separately.
     #[arg(long)]
-    pub hub: String,
+    pub join: Option<String>,
+    /// Hub node-facing address, host:port (e.g. 127.0.0.1:7000). Not needed with --join.
+    #[arg(long)]
+    pub hub: Option<String>,
     /// Enrollment token (Mode B). Omit to request admin approval (Mode A).
     #[arg(long)]
     pub token: Option<String>,
@@ -76,17 +80,51 @@ pub async fn run(args: NodeArgs) -> Result<()> {
     }
 }
 
+/// The connection settings after merging --join (if any) with the flags.
+struct Resolved {
+    hub: String,
+    token: Option<String>,
+    tls: bool,
+    fingerprint: Option<String>,
+    insecure: bool,
+}
+
+/// A --join code provides hub/token/tls/fingerprint in one string; otherwise
+/// fall back to the individual flags. Either --join or --hub is required.
+fn resolve(args: &RunArgs) -> Result<Resolved> {
+    if let Some(code) = &args.join {
+        let j = crate::joincode::decode(code)?;
+        Ok(Resolved {
+            hub: j.hub,
+            token: j.token.or_else(|| args.token.clone()),
+            tls: j.tls,
+            fingerprint: j.fingerprint.or_else(|| args.hub_fingerprint.clone()),
+            insecure: args.insecure,
+        })
+    } else {
+        let hub = args
+            .hub
+            .clone()
+            .ok_or_else(|| anyhow!("need --join <code> or --hub <host:port>"))?;
+        Ok(Resolved {
+            hub,
+            token: args.token.clone(),
+            tls: args.tls,
+            fingerprint: args.hub_fingerprint.clone(),
+            insecure: args.insecure,
+        })
+    }
+}
+
 pub async fn run_agent(args: RunArgs) -> Result<()> {
+    let r = resolve(&args)?;
     let name = if args.name.is_empty() {
         hostname()
     } else {
         args.name.clone()
     };
-    let connector = if args.tls {
-        Some(tls::client_connector(
-            args.hub_fingerprint.clone(),
-            args.insecure,
-        )?)
+    let connector = if r.tls {
+        Some(tls::client_connector(r.fingerprint.clone(), r.insecure)?)
     } else {
         None
     };
@@ -95,7 +133,7 @@ pub async fn run_agent(args: RunArgs) -> Result<()> {
         Identity::load_or_create(&key_path).with_context(|| format!("node key {key_path}"))?;
     tracing::info!(code = %crate::identity::short_code(&identity.pubkey()), key = %key_path, "node identity ready");
     loop {
-        match connect_once(&args, &name, &connector, &identity).await {
+        match connect_once(&r, &name, &connector, &identity).await {
             Ok(()) => tracing::warn!("control connection closed; reconnecting in 3s"),
             Err(e) => tracing::warn!(error = %e, "control connection error; reconnecting in 3s"),
         }
@@ -127,12 +165,12 @@ async fn dial_conn(addr: &str, connector: &Option<TlsConnector>) -> Result<Conn>
 }
 
 async fn connect_once(
-    args: &RunArgs,
+    r: &Resolved,
     name: &str,
     connector: &Option<TlsConnector>,
     identity: &Identity,
 ) -> Result<()> {
-    let mut conn = dial_conn(&args.hub, connector).await?;
+    let mut conn = dial_conn(&r.hub, connector).await?;
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -141,7 +179,7 @@ async fn connect_once(
     let hello = Hello {
         protocol_version: PROTOCOL_VERSION,
         pubkey: identity.pubkey(),
-        token: args.token.clone(),
+        token: r.token.clone(),
         timestamp,
         signature: identity.sign_auth(timestamp),
         node_name: name.to_string(),
@@ -153,7 +191,7 @@ async fn connect_once(
     let reply: HelloReply = read_msg(&mut conn).await?;
     match reply {
         HelloReply::Welcome { node_id } => {
-            tracing::info!(node = %node_id.0, hub = %args.hub, "enrolled")
+            tracing::info!(node = %node_id.0, hub = %r.hub, "enrolled")
         }
         HelloReply::Pending { code } => {
             anyhow::bail!("pending admin approval (code {code}); approve it in the hub dashboard")
@@ -172,7 +210,7 @@ async fn connect_once(
         }
     });
 
-    let hub_addr = args.hub.clone();
+    let hub_addr = r.hub.clone();
     let connector = connector.clone();
     let res: Result<()> = async {
         loop {
@@ -249,18 +287,31 @@ async fn handle_dial(
 const SYSTEMD_UNIT: &str = "/etc/systemd/system/warren-node.service";
 const LAUNCHD_LABEL: &str = "com.warren.node";
 
-/// Build the argv for `warren node run ...` from the install args.
+/// Build the argv for `warren node run ...` from the install args. A join code
+/// is passed through verbatim (it already encodes hub/token/tls/fingerprint);
+/// otherwise the individual flags are emitted.
 fn node_run_argv(exe: &str, a: &RunArgs) -> Vec<String> {
-    let mut v = vec![
-        exe.to_string(),
-        "node".into(),
-        "run".into(),
-        "--hub".into(),
-        a.hub.clone(),
-    ];
-    if let Some(token) = &a.token {
-        v.push("--token".into());
-        v.push(token.clone());
+    let mut v = vec![exe.to_string(), "node".into(), "run".into()];
+    if let Some(code) = &a.join {
+        v.push("--join".into());
+        v.push(code.clone());
+    } else if let Some(hub) = &a.hub {
+        v.push("--hub".into());
+        v.push(hub.clone());
+        if let Some(token) = &a.token {
+            v.push("--token".into());
+            v.push(token.clone());
+        }
+        if a.tls {
+            v.push("--tls".into());
+            if let Some(fp) = &a.hub_fingerprint {
+                v.push("--hub-fingerprint".into());
+                v.push(fp.clone());
+            }
+            if a.insecure {
+                v.push("--insecure".into());
+            }
+        }
     }
     if let Some(kf) = &a.key_file {
         v.push("--key-file".into());
@@ -269,16 +320,6 @@ fn node_run_argv(exe: &str, a: &RunArgs) -> Vec<String> {
     if !a.name.is_empty() {
         v.push("--name".into());
         v.push(a.name.clone());
-    }
-    if a.tls {
-        v.push("--tls".into());
-        if let Some(fp) = &a.hub_fingerprint {
-            v.push("--hub-fingerprint".into());
-            v.push(fp.clone());
-        }
-        if a.insecure {
-            v.push("--insecure".into());
-        }
     }
     v
 }
