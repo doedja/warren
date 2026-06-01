@@ -130,6 +130,7 @@ struct NodeReport {
     ip: Option<String>,
     country: Option<String>,
     city: Option<String>,
+    latency_ms: Option<u32>,
 }
 
 /// Runtime config independent of the CLI, so tests can drive the hub with
@@ -241,6 +242,7 @@ impl Hub {
                     ip: r.ip,
                     country: r.country,
                     city: r.city,
+                    latency_ms: r.latency_ms,
                 }
             })
             .collect()
@@ -609,11 +611,13 @@ async fn handle_control(hello: Hello, mut conn: Conn, hub: Arc<Hub>) -> Result<(
                     country,
                     city,
                 } => {
-                    *info.lock().unwrap() = NodeReport {
-                        ip: public_ip,
-                        country,
-                        city,
-                    };
+                    let mut r = info.lock().unwrap();
+                    r.ip = public_ip;
+                    r.country = country;
+                    r.city = city;
+                }
+                NodeToHub::Latency { ms } => {
+                    info.lock().unwrap().latency_ms = Some(ms);
                 }
             }
         }
@@ -887,6 +891,7 @@ struct NodeInfo {
     ip: Option<String>,
     country: Option<String>,
     city: Option<String>,
+    latency_ms: Option<u32>,
 }
 
 #[derive(Serialize)]

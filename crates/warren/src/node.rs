@@ -216,12 +216,13 @@ async fn connect_once(
     let report_tx = ntx.clone();
     let reporter = tokio::spawn(async move {
         loop {
-            if let Some((ip, country, city)) = fetch_public_info().await {
+            if let Some((ip, country, city, ms)) = fetch_public_info().await {
                 let _ = report_tx.send(NodeToHub::Info {
                     public_ip: Some(ip),
                     country,
                     city,
                 });
+                let _ = report_tx.send(NodeToHub::Latency { ms });
             }
             tokio::time::sleep(Duration::from_secs(300)).await;
         }
@@ -260,9 +261,11 @@ async fn connect_once(
 }
 
 /// Best-effort lookup of this node's public egress IP + geo via ip-api.com
-/// (plain HTTP, no key, no extra dependency). Returns None on any failure.
-async fn fetch_public_info() -> Option<(String, Option<String>, Option<String>)> {
+/// (plain HTTP, no key, no extra dependency). Also times the round trip as a
+/// rough latency signal. Returns (ip, country, city, latency_ms) or None.
+async fn fetch_public_info() -> Option<(String, Option<String>, Option<String>, u32)> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let start = std::time::Instant::now();
     let connect = TcpStream::connect("ip-api.com:80");
     let mut s = tokio::time::timeout(Duration::from_secs(8), connect)
         .await
@@ -275,6 +278,7 @@ async fn fetch_public_info() -> Option<(String, Option<String>, Option<String>)>
         .await
         .ok()?
         .ok()?;
+    let latency_ms = start.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
     let text = String::from_utf8_lossy(&buf);
     let body = text.split("\r\n\r\n").nth(1)?;
     let mut lines = body.lines().map(str::trim).filter(|l| !l.is_empty());
@@ -286,7 +290,7 @@ async fn fetch_public_info() -> Option<(String, Option<String>, Option<String>)>
     }
     let country = lines.next().map(str::to_string);
     let city = lines.next().map(str::to_string);
-    Some((ip, country, city))
+    Some((ip, country, city, latency_ms))
 }
 
 async fn handle_dial(

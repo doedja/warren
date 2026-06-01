@@ -91,6 +91,13 @@ pub enum NodeToHub {
         country: Option<String>,
         city: Option<String>,
     },
+    /// Round-trip latency (ms) of the node's own internet check: a rough
+    /// health/perf signal. A SEPARATE variant (not a field on Info) so it stays
+    /// additive: v0.1.6 nodes already send the 3-field Info, and appending a
+    /// field there would break decoding. Old nodes never send this; no bump.
+    Latency {
+        ms: u32,
+    },
 }
 
 /// First frame sent by the node on a data connection to identify which

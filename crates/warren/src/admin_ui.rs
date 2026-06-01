@@ -15,6 +15,10 @@ pub const DASHBOARD: &str = r###"<!doctype html>
   h2 { font-size:13px; color:var(--mut); margin:0 0 4px; text-transform:uppercase; letter-spacing:.05em; }
   .desc { color:var(--mut); font-size:12px; margin:0 0 12px; line-height:1.45; max-width:62ch; }
   .hint { color:var(--acc); cursor:help; border-bottom:1px dotted var(--acc); }
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; vertical-align:middle; }
+  .dot.ok { background:#46c46e; }
+  .dot.warn { background:#e0a23a; }
+  .dot.bad { background:#e0564b; }
   main { padding:20px; display:grid; gap:18px; max-width:920px; margin:0 auto; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:16px; }
   input { background:#0b0d10; border:1px solid var(--line); color:var(--fg); padding:6px 8px; border-radius:5px; font:inherit; }
@@ -74,12 +78,12 @@ pub const DASHBOARD: &str = r###"<!doctype html>
     <p class="desc">Devices connected right now and ready to carry requests. Up since is when each connected. Fails counts recent dial errors; the hub deprioritizes a device once it reaches 3. Copy a device's command to send traffic out only through that one device.</p>
     <table><thead><tr><th>Node</th><th>Exit IP</th><th>Location</th><th>Up since</th><th>Fails</th><th>Use just this device</th></tr></thead><tbody id="nodes"></tbody></table>
   </section>
-  <section class="card">
+  <section class="card" id="card-pending">
     <h2>Pending approval</h2>
     <p class="desc">Devices that connected without an enrollment token. Approve one to let it serve traffic, or deny it. Match the short code against the device to be sure it is yours.</p>
     <table><thead><tr><th>Code</th><th>Name</th><th>Key</th><th>First seen</th><th></th></tr></thead><tbody id="pending"></tbody></table>
   </section>
-  <section class="card">
+  <section class="card" id="card-keys">
     <h2>Approved keys</h2>
     <p class="desc">Device identities the hub trusts (each device made its own key on first run). Revoke one to kick that device out of the pool for good.</p>
     <table><thead><tr><th>Name</th><th>Key</th><th>Approved</th><th></th></tr></thead><tbody id="keys"></tbody></table>
@@ -144,6 +148,8 @@ async function loadPending(){
     `<td><button onclick="approve('${esc(p.pubkey)}')">approve</button> `+
     `<button class="ghost" onclick="denyNode('${esc(p.pubkey)}')">deny</button></td></tr>`).join('')
     || '<tr><td colspan=5>Nothing waiting. Devices that join with a token appear under Live nodes directly.</td></tr>';
+  // Hide the card entirely when nothing is pending (keeps the dashboard lean).
+  document.getElementById('card-pending').style.display = rows.length ? '' : 'none';
 }
 async function approve(pk){ await api('POST','/api/pending/'+encodeURIComponent(pk)+'/approve'); loadPending(); loadKeys(); }
 async function denyNode(pk){ await api('DELETE','/api/pending/'+encodeURIComponent(pk)); loadPending(); }
@@ -154,7 +160,8 @@ async function loadNodes(){
   const proxy = INFO.proxy_addr || '<hub-host>:18080';
   document.getElementById('nodes').innerHTML = rows.map(n => {
     const c = `curl -x http://${puser}+${n.name}:${ppass}@${proxy} https://api.ipify.org`;
-    const fail = n.fails >= 3 ? `<span style="color:#e0564b">${n.fails} / 3</span>` : `${n.fails} / 3`;
+    const lat = n.latency_ms != null ? ` <span style="color:var(--mut)">${n.latency_ms}ms</span>` : '';
+    const fail = `<span class="dot ${n.fails === 0 ? 'ok' : n.fails >= 3 ? 'bad' : 'warn'}"></span>${n.fails >= 3 ? `<span style="color:#e0564b">${n.fails} / 3</span>` : `${n.fails} / 3`}${lat}`;
     const ip = n.ip ? `<code>${esc(n.ip)}</code>` : '<span style="color:var(--mut)">pending</span>';
     const loc = [n.city, n.country].filter(Boolean).map(esc).join(', ') || '<span style="color:var(--mut)">-</span>';
     return `<tr><td>${esc(n.id)}</td><td>${ip}</td><td>${loc}</td><td>${fmtDate(n.since)}</td><td>${fail}</td>`+
@@ -168,6 +175,7 @@ async function loadKeys(){
     `<tr><td>${esc(k.name)}</td><td><code>${esc(shortKey(k.pubkey))}</code></td><td>${fmtDate(k.approved_at)}</td>`+
     `<td><button class="ghost" onclick="revokeKey('${esc(k.pubkey)}')">revoke</button></td></tr>`).join('')
     || '<tr><td colspan=4>none</td></tr>';
+  document.getElementById('card-keys').style.display = rows.length ? '' : 'none';
 }
 async function revokeKey(pk){ await api('DELETE','/api/node-keys/'+encodeURIComponent(pk)); loadKeys(); }
 async function loadTokens(){
