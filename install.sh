@@ -76,6 +76,16 @@ if [ "$(id -u)" != "0" ] && command -v sudo >/dev/null 2>&1; then
   sudo="sudo"
 fi
 
+# If a node service is already running, stop it first so its binary can be
+# replaced (a running executable cannot be overwritten: ETXTBSY on Linux). It
+# is restarted below by `node install`.
+if command -v systemctl >/dev/null 2>&1; then
+  $sudo systemctl stop warren-node >/dev/null 2>&1 || true
+fi
+if command -v launchctl >/dev/null 2>&1; then
+  launchctl unload "$HOME/Library/LaunchAgents/com.warren.node.plist" >/dev/null 2>&1 || true
+fi
+
 # Install to /usr/local/bin when root or it is writable; otherwise to
 # ~/.local/bin (no sudo prompt for a plain binary install).
 if [ "$(id -u)" = "0" ] || [ -w /usr/local/bin ]; then

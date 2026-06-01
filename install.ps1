@@ -43,6 +43,14 @@ $url = "https://github.com/$repo/releases/latest/download/warren-windows-x86_64.
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
+
+# If a node is already running, stop it first so its binary can be replaced
+# (otherwise Expand-Archive hits "Access denied" on the locked warren.exe and
+# the old binary keeps running). It is restarted below by `node install`.
+schtasks /End /TN warren-node 2>$null | Out-Null
+Get-Process warren -ErrorAction SilentlyContinue | Stop-Process -Force
+Start-Sleep -Milliseconds 500
+
 $zip = Join-Path $env:TEMP 'warren.zip'
 Write-Host "warren: downloading $url"
 Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
