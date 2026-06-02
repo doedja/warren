@@ -58,6 +58,23 @@ Start-Sleep -Milliseconds 500
 $zip = Join-Path $env:TEMP 'warren.zip'
 Write-Host "warren: downloading $url"
 Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+# Verify against the sha256 published next to the asset before extracting or
+# running anything. Fail closed; set $env:WARREN_SKIP_VERIFY=1 to bypass.
+if ($env:WARREN_SKIP_VERIFY -ne '1') {
+  try {
+    $sumline = (Invoke-WebRequest -Uri "$url.sha256" -UseBasicParsing).Content
+  } catch {
+    Remove-Item $zip -ErrorAction SilentlyContinue
+    Write-Error 'warren: could not fetch checksum. Set $env:WARREN_SKIP_VERIFY=1 to bypass (not recommended).'; return
+  }
+  $expected = (($sumline -split '\s+')[0]).Trim().ToLower()
+  $actual = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash.ToLower()
+  if ($expected -ne $actual) {
+    Remove-Item $zip -ErrorAction SilentlyContinue
+    Write-Error "warren: checksum mismatch (expected $expected, got $actual). Aborting."; return
+  }
+  Write-Host 'warren: checksum verified (sha256).'
+}
 Expand-Archive -Path $zip -DestinationPath $dir -Force
 Remove-Item $zip -ErrorAction SilentlyContinue
 $found = Get-ChildItem -Path $dir -Recurse -Filter warren.exe | Select-Object -First 1

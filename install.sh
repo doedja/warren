@@ -109,6 +109,34 @@ else
   exit 1
 fi
 
+# Verify the download against the sha256 published next to it before extracting
+# or running anything. Auto-update re-runs this script, so self-updates are
+# covered too. Fail closed; WARREN_SKIP_VERIFY=1 bypasses (not recommended).
+if [ "${WARREN_SKIP_VERIFY:-0}" != "1" ]; then
+  expected="$(fetch "$url.sha256" 2>/dev/null | awk '{print $1}' | head -n1)"
+  if [ -z "$expected" ]; then
+    echo "warren: could not fetch checksum ($url.sha256)." >&2
+    echo "        set WARREN_SKIP_VERIFY=1 to bypass (not recommended)." >&2
+    exit 1
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual="$(sha256sum "$tmp/warren.tar.gz" | awk '{print $1}')"
+  elif command -v shasum >/dev/null 2>&1; then
+    actual="$(shasum -a 256 "$tmp/warren.tar.gz" | awk '{print $1}')"
+  elif command -v openssl >/dev/null 2>&1; then
+    actual="$(openssl dgst -sha256 "$tmp/warren.tar.gz" | awk '{print $NF}')"
+  else
+    echo "warren: no sha256 tool (sha256sum/shasum/openssl) to verify the download." >&2
+    echo "        set WARREN_SKIP_VERIFY=1 to bypass (not recommended)." >&2
+    exit 1
+  fi
+  if [ "$expected" != "$actual" ]; then
+    echo "warren: checksum mismatch (expected $expected, got $actual). Aborting." >&2
+    exit 1
+  fi
+  echo "warren: checksum verified (sha256)." >&2
+fi
+
 tar -xzf "$tmp/warren.tar.gz" -C "$tmp"
 bin="$(find "$tmp" -type f -name warren | head -n 1)"
 if [ -z "$bin" ]; then

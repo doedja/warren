@@ -55,4 +55,7 @@ jobs:
           target: ${{ matrix.target }}
           # $tag is the release tag (e.g. v0.1.9): warren-v0.1.9-linux-x86_64.tar.gz
           archive: warren-$tag-${{ matrix.name }}
+          # Publish a sha256 next to each archive so install.sh can verify the
+          # download before extracting/running it (uploads warren-$tag-NAME.tar.gz.sha256).
+          checksum: sha256
           token: ${{ secrets.GITHUB_TOKEN }}

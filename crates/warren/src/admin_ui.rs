@@ -61,7 +61,7 @@ pub const DASHBOARD: &str = r###"<!doctype html>
   .live::before { content:""; width:6px; height:6px; border-radius:50%; background:currentColor; box-shadow:0 0 7px -1px currentColor; }
   #status { color:var(--mut); font-size:11px; }
   /* Layout */
-  main { padding:20px 22px 40px; display:grid; gap:16px; max-width:960px; margin:0 auto; }
+  main { padding:20px 22px 40px; display:grid; gap:16px; max-width:1200px; margin:0 auto; }
   .card { background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); padding:16px 18px; }
   /* Stat strip */
   .stats { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; }

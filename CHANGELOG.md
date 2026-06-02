@@ -7,6 +7,25 @@ workflow publishes each version's section here as its GitHub release notes.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-06-02
+
+### Added
+- Release assets now ship a `sha256` checksum next to each archive, and both
+  installers (`install.sh`, `install.ps1`) verify the download against it before
+  extracting or running anything. Fails closed; `WARREN_SKIP_VERIFY=1` bypasses.
+  Because auto-update re-runs the installer, self-updates are verified too.
+
+### Changed
+- Dashboard is wider (max 1200px) so the Live nodes table fits all columns
+  (including the new Version) without crowding on a normal desktop.
+
+### Fixed
+- Node auto-update is now actually reachable: `--auto-update` passed to the
+  installer is baked into the boot service (it was previously dropped), and a
+  self-update re-runs with the flag so it stays on across an upgrade. Still
+  opt-in and off by default. Append `--auto-update` to the install line to
+  enable it (Unix only).
+
 ## [0.4.1] - 2026-06-02
 
 ### Added
@@ -77,7 +96,8 @@ workflow publishes each version's section here as its GitHub release notes.
 - Dashboard refresh: a stat strip, setup stepper, version badge, and unified copy
   buttons.
 
-[Unreleased]: https://github.com/doedja/warren/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/doedja/warren/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/doedja/warren/releases/tag/v0.4.2
 [0.4.1]: https://github.com/doedja/warren/releases/tag/v0.4.1
 [0.4.0]: https://github.com/doedja/warren/releases/tag/v0.4.0
 [0.3.0]: https://github.com/doedja/warren/releases/tag/v0.3.0

@@ -288,6 +288,9 @@ fn maybe_self_update(remote: &str, auto_update: bool, r: &Resolved) {
     if r.insecure {
         cmd.push_str(" --insecure");
     }
+    // Keep auto-update on after the update: the re-run reinstalls the service, so
+    // without this the upgraded node would come back with auto-update off.
+    cmd.push_str(" --auto-update");
     tracing::warn!("auto-updating: re-running installer (service will restart)");
     let _ = std::process::Command::new("sh").arg("-c").arg(&cmd).spawn();
 }
@@ -724,6 +727,11 @@ fn node_run_argv(exe: &str, a: &RunArgs) -> Vec<String> {
         v.push("--name".into());
         v.push(a.name.clone());
     }
+    // Opt-in auto-update: bake it into the service command so it persists across
+    // restarts (and across a self-update, which re-runs the installer).
+    if a.auto_update {
+        v.push("--auto-update".into());
+    }
     v
 }
 
@@ -905,7 +913,7 @@ fn current_platform() -> Platform {
 
 #[cfg(test)]
 mod tests {
-    use super::{backoff_sleep, drain_in_flight, version_gt, DRAIN_BUDGET};
+    use super::{backoff_sleep, drain_in_flight, node_run_argv, version_gt, RunArgs, DRAIN_BUDGET};
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -946,6 +954,30 @@ mod tests {
         assert!(waited >= DRAIN_BUDGET);
         // It still exits (does not hang forever); cap the upper bound generously.
         assert!(waited < DRAIN_BUDGET + Duration::from_secs(1));
+    }
+
+    fn run_args(auto_update: bool) -> RunArgs {
+        RunArgs {
+            join: None,
+            hub: Some("127.0.0.1:7000".into()),
+            token: Some("tok".into()),
+            key_file: None,
+            name: String::new(),
+            tls: false,
+            hub_fingerprint: None,
+            insecure: false,
+            auto_update,
+        }
+    }
+
+    // The service command must carry --auto-update only when it was requested, so
+    // the opt-in survives restarts and self-updates (and stays off by default).
+    #[test]
+    fn argv_forwards_auto_update() {
+        let on = node_run_argv("/usr/local/bin/warren", &run_args(true));
+        assert!(on.iter().any(|a| a == "--auto-update"));
+        let off = node_run_argv("/usr/local/bin/warren", &run_args(false));
+        assert!(!off.iter().any(|a| a == "--auto-update"));
     }
 
     #[test]

@@ -184,6 +184,10 @@ page. The `install.sh` line above downloads the right one and registers a boot
 service (systemd, launchd, or a Windows scheduled task). Run it with no extra
 arguments to just drop in the binary.
 
+Both installers verify the download against the `sha256` published with each
+release before extracting or running it, and abort on a mismatch (set
+`WARREN_SKIP_VERIFY=1` to bypass, not recommended).
+
 **Windows** (elevated PowerShell):
 
 ```powershell
@@ -242,6 +246,21 @@ reconnects to the hub on its own if the link drops. To control it by hand:
 | Termux | re-run `warren node run --join <code>` | terminal output |
 
 Or just run it in the foreground anywhere: `warren node run --join <code>`.
+
+**Auto-update (opt-in, off by default).** Append `--auto-update` to the install
+line and the node will re-run the installer to upgrade itself when the hub
+reports a newer version (Unix only; on Windows the running exe is locked):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh -s -- --join <code> --auto-update
+```
+
+It is off by default on purpose: a silent binary swap across a fleet means the
+hub (and this repo) effectively gets to run code on every node, and a bad
+release would propagate everywhere at once with no canary. Version tolerance
+means a node that is a version behind keeps serving, so leaving it off and
+reinstalling by hand is the safe default. Turn it on per node once you trust the
+release flow.
 
 ## Running the hub on the public internet
 
