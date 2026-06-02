@@ -89,8 +89,8 @@ pub struct RunArgs {
     #[arg(long, default_value_t = false)]
     pub insecure: bool,
     /// Auto-update: when the hub reports a newer version, re-run the installer to
-    /// upgrade this node. Off by default (a notice is logged instead). Unix only;
-    /// on Windows the running exe is locked, so reinstall manually.
+    /// upgrade this node. Off by default (a notice is logged instead). On Windows
+    /// a detached helper swaps the locked exe after this process exits.
     #[arg(long, default_value_t = false)]
     pub auto_update: bool,
 }
@@ -255,8 +255,9 @@ fn version_gt(remote: &str, local: &str) -> bool {
     parse(remote) > parse(local)
 }
 
-/// On a newer hub version, log it and (with --auto-update, unix only) re-run the
-/// installer detached: it stops this service, swaps the binary, and restarts it.
+/// On a newer hub version, log it and (with --auto-update) re-run the installer
+/// detached: it stops this service, swaps the binary, and restarts it. On unix
+/// the re-run is in-place; on Windows a helper waits for this exe to exit first.
 /// Default is notice-only, because a silent binary swap across a fleet is
 /// dangerous; enable per node once confirmed. Version tolerance means an
 /// unupdated node keeps serving meanwhile.
@@ -271,7 +272,53 @@ fn maybe_self_update(remote: &str, auto_update: bool, r: &Resolved) {
         return;
     }
     if cfg!(windows) {
-        tracing::warn!("auto-update unsupported on Windows (locked exe); reinstall manually");
+        // The running .exe is locked, so it cannot overwrite itself in place.
+        // Instead spawn a detached PowerShell helper that waits for THIS process
+        // to exit, then re-runs install.ps1 (which stops the task, swaps the exe,
+        // reinstalls the service, and restarts it). We exit right after spawning
+        // so the binary unlocks. -AutoUpdate persists the setting across the swap.
+        let ps_url = "https://raw.githubusercontent.com/doedja/warren/main/install.ps1";
+        let mut inv = format!(
+            "& ([scriptblock]::Create((irm {} -UseBasicParsing))) -Hub {}",
+            ps_single_quote(ps_url),
+            ps_single_quote(&r.hub)
+        );
+        if let Some(t) = &r.token {
+            inv.push_str(&format!(" -Token {}", ps_single_quote(t)));
+        }
+        if r.tls {
+            inv.push_str(" -Tls");
+            if let Some(fp) = &r.fingerprint {
+                inv.push_str(&format!(" -HubFingerprint {}", ps_single_quote(fp)));
+            }
+        }
+        if r.insecure {
+            inv.push_str(" -Insecure");
+        }
+        inv.push_str(" -AutoUpdate");
+        let script = format!(
+            "Wait-Process -Id {} -Timeout 300 -ErrorAction SilentlyContinue; {}",
+            std::process::id(),
+            inv
+        );
+        tracing::warn!("auto-updating: a helper will swap the binary after this node exits");
+        if std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                &script,
+            ])
+            .spawn()
+            .is_ok()
+        {
+            // Release the locked exe so the helper can overwrite it. The helper
+            // restarts the service (install.ps1 ends with schtasks /Run).
+            std::process::exit(0);
+        }
+        tracing::warn!("auto-update: failed to spawn the Windows updater; reinstall manually");
         return;
     }
     let url = "https://raw.githubusercontent.com/doedja/warren/main/install.sh";

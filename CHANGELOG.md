@@ -7,6 +7,29 @@ workflow publishes each version's section here as its GitHub release notes.
 
 ## [Unreleased]
 
+## [0.4.6] - 2026-06-03
+
+### Fixed
+- A node that reconnected over a half-open link (the old TCP connection never
+  sent a FIN, common on Windows) was silently dropped from the routable set even
+  though its new connection was alive. The hub keyed a node only by its stable id
+  and removed every entry with that id, so when the dead-peer timer reaped the
+  stale duplicate connection (~75s after the node had already reconnected) it
+  evicted the live reconnected entry too. The node stayed "ghost-connected" (TCP
+  up, replying to pings) but invisible on the dashboard and carrying no traffic
+  until a restart. Each connection now carries a unique sequence: a reconnect
+  displaces the old entry on enroll, and the stale reap removes only its own
+  connection, never the live one. Hub-only fix, no protocol change.
+
+### Added
+- Windows nodes support opt-in `--auto-update`. The running `.exe` is locked, so
+  a detached PowerShell helper waits for the node process to exit, then re-runs
+  `install.ps1` to swap the binary and restart the service. Off by default, like
+  the unix path; `install.ps1` gained an `-AutoUpdate` switch and the dashboard
+  auto-update toggle now applies to the Windows install command too.
+- CI gained an MSRV (Rust 1.74) build job and a `cargo audit` job, so the
+  declared minimum toolchain and dependency advisories are both enforced.
+
 ## [0.4.5] - 2026-06-02
 
 ### Fixed
@@ -158,7 +181,8 @@ workflow publishes each version's section here as its GitHub release notes.
 - Dashboard refresh: a stat strip, setup stepper, version badge, and unified copy
   buttons.
 
-[Unreleased]: https://github.com/doedja/warren/compare/v0.4.5...HEAD
+[Unreleased]: https://github.com/doedja/warren/compare/v0.4.6...HEAD
+[0.4.6]: https://github.com/doedja/warren/releases/tag/v0.4.6
 [0.4.5]: https://github.com/doedja/warren/releases/tag/v0.4.5
 [0.4.4]: https://github.com/doedja/warren/releases/tag/v0.4.4
 [0.4.3]: https://github.com/doedja/warren/releases/tag/v0.4.3

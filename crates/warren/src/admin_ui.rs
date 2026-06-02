@@ -158,7 +158,7 @@ pub const DASHBOARD: &str = r###"<!doctype html>
       <input id="tname" placeholder="node name">
       <button onclick="addToken()">Create token</button>
     </div>
-    <label class="au"><input type="checkbox" id="autoupd"> add <code>--auto-update</code> to copied Linux/macOS commands <span class="muted">(opt-in self-update; not supported on Windows)</span></label>
+    <label class="au"><input type="checkbox" id="autoupd"> add auto-update to copied install commands <span class="muted">(opt-in self-update; Linux/macOS in-place, Windows swaps via a helper)</span></label>
     <table><thead><tr><th>Name</th><th>Token</th><th>Created</th><th></th></tr></thead><tbody id="tokens"></tbody></table>
   </section>
 
@@ -227,16 +227,17 @@ function kv(k,v){ return `<div class="kv"><b>${k}</b><code>${esc(v)}</code></div
 function cmd(label, c){ return `<div class="cmd"><div class="cmdlabel">${label}</div><div class="cmdrow"><code>${esc(c)}</code><button class="ghost" onclick="copyEl(this)">copy</button></div></div>`; }
 function tlsFlags(){ return (INFO.tls && INFO.fingerprint) ? ` --tls --hub-fingerprint ${INFO.fingerprint}` : ''; }
 function installUrl(){ return INFO.install_url||'https://raw.githubusercontent.com/doedja/warren/main/install.sh'; }
-// '--auto-update' if the operator ticked the box; unix-only, so it rides only on
-// the Linux/macOS (sh) commands, never the Windows one.
+// Self-update flag if the operator ticked the box. The sh installers take
+// '--auto-update'; install.ps1 takes the '-AutoUpdate' switch (winInstallCmd).
 function autoUpd(){ const c = document.getElementById('autoupd'); return (c && c.checked) ? ' --auto-update' : ''; }
+function winAutoUpd(){ const c = document.getElementById('autoupd'); return (c && c.checked) ? ' -AutoUpdate' : ''; }
 function installCmd(token){
   const node = INFO.node_addr || '<hub-host>:7000';
   return `curl -fsSL ${installUrl()} | sh -s -- --hub ${node} --token ${token}${tlsFlags()}${autoUpd()}`;
 }
 // One-paste installs using a join code (carries host + token + TLS + fingerprint).
 function joinInstallCmd(code){ return `curl -fsSL ${installUrl()} | sh -s -- --join ${code}${autoUpd()}`; }
-function winInstallCmd(code){ const ps = installUrl().replace('install.sh','install.ps1'); return `& ([scriptblock]::Create((irm ${ps}))) -Join ${code}`; }
+function winInstallCmd(code){ const ps = installUrl().replace('install.sh','install.ps1'); return `& ([scriptblock]::Create((irm ${ps}))) -Join ${code}${winAutoUpd()}`; }
 async function loadInfo(){
   const i = await api('GET','/api/info'); INFO = i;
   const node = i.node_addr || '<hub-host>:7000';

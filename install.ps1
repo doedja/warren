@@ -20,6 +20,7 @@ param(
   [string]$Name,
   [switch]$Tls,
   [switch]$Insecure,
+  [switch]$AutoUpdate,
   [switch]$Uninstall
 )
 $ErrorActionPreference = 'Stop'
@@ -103,6 +104,7 @@ if ($Join -or $Hub) {
 if ($Join) {
   $a = @('node', 'install', '--join', $Join)
   if ($Name) { $a += @('--name', $Name) }
+  if ($AutoUpdate) { $a += '--auto-update' }
   & $exe @a
 } elseif ($Hub) {
   $a = @('node', 'install', '--hub', $Hub)
@@ -111,6 +113,7 @@ if ($Join) {
   if ($HubFingerprint) { $a += @('--hub-fingerprint', $HubFingerprint) }
   if ($Insecure) { $a += '--insecure' }
   if ($Name) { $a += @('--name', $Name) }
+  if ($AutoUpdate) { $a += '--auto-update' }
   & $exe @a
 } else {
   Write-Host "Next: `"$exe`" node run --join <code>   (or --hub HOST:7000 --token TOKEN)"

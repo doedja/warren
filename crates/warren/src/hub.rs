@@ -154,6 +154,11 @@ struct NodeEntry {
     /// client target every node in a group with `user-group-NAME`. None for nodes
     /// that joined without a token (admin-approved) or with an unnamed token.
     group: Option<String>,
+    /// Unique per-connection sequence (not the stable node id). A reconnecting
+    /// node keeps the same id but gets a fresh conn_seq, so the dead-peer reap of
+    /// a stale half-open connection removes only its own entry, never the live
+    /// reconnected one that shares the id.
+    conn_seq: u64,
 }
 
 #[derive(Default, Clone)]
@@ -383,12 +388,21 @@ impl Hub {
             .collect()
     }
     async fn add_node(&self, e: NodeEntry) {
-        self.nodes.lock().await.push(e);
+        let mut nodes = self.nodes.lock().await;
+        displace_and_push(&mut nodes, e);
     }
-    async fn remove_node(&self, id: &NodeId) {
-        self.nodes.lock().await.retain(|n| &n.id != id);
-        self.node_bytes.lock().await.remove(&id.0);
-        self.node_stats.lock().await.remove(&id.0);
+    async fn remove_node(&self, id: &NodeId, conn_seq: u64) {
+        // Only purge the per-id byte/stat counters once the node is fully gone.
+        // A stale half-open connection timing out must not wipe the live
+        // reconnected connection's counters (they share the id).
+        let id_still_present = {
+            let mut nodes = self.nodes.lock().await;
+            remove_conn(&mut nodes, id, conn_seq)
+        };
+        if !id_still_present {
+            self.node_bytes.lock().await.remove(&id.0);
+            self.node_stats.lock().await.remove(&id.0);
+        }
     }
     async fn insert_pending(&self, id: u64, nonce: u64, tx: oneshot::Sender<MuxStream>) {
         self.pending.lock().await.insert(id, (nonce, tx));
@@ -791,6 +805,9 @@ async fn handle_node_conn(stream: TcpStream, peer_ip: IpAddr, hub: Arc<Hub>) -> 
         .token
         .as_deref()
         .and_then(|t| hub.store.token_name(t).ok().flatten());
+    // Unique per-connection sequence so a reconnect (same id) and the dead-peer
+    // reap of its stale predecessor cannot evict each other.
+    let conn_seq = hub.next_conn_id();
     hub.add_node(NodeEntry {
         id: node_id.clone(),
         name: hello.node_name.clone(),
@@ -803,6 +820,7 @@ async fn handle_node_conn(stream: TcpStream, peer_ip: IpAddr, hub: Arc<Hub>) -> 
         agent_version: hello.agent_version.clone(),
         info: info.clone(),
         group,
+        conn_seq,
     })
     .await;
     tracing::info!(node = %node_id.0, ip = %peer_ip, ver = hello.protocol_version, "node enrolled");
@@ -904,7 +922,7 @@ async fn handle_node_conn(stream: TcpStream, peer_ip: IpAddr, hub: Arc<Hub>) -> 
         r = &mut ctrl_loop => r.unwrap_or("control task ended"),
     };
 
-    hub.remove_node(&node_id).await;
+    hub.remove_node(&node_id, conn_seq).await;
     pinger.abort();
     writer.abort();
     ctrl_loop.abort();
@@ -1952,9 +1970,104 @@ async fn api_delete_node_key(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Add `e` to the node list, displacing any existing entry for the same node id.
+/// A node holds exactly one live link; when it reconnects (same id, fresh
+/// conn_seq) the new connection supersedes the old, so a half-open duplicate
+/// never lingers in the routable set waiting to be reaped alongside the live one.
+fn displace_and_push(nodes: &mut Vec<NodeEntry>, e: NodeEntry) {
+    nodes.retain(|n| n.id != e.id);
+    nodes.push(e);
+}
+
+/// Remove the entry matching exactly this (id, conn_seq). Returns true if another
+/// entry for the same id is still present, so the caller keeps that node's per-id
+/// counters. Matching on conn_seq (not id alone) is what stops a stale connection
+/// reap from evicting a live reconnected connection that shares the id.
+fn remove_conn(nodes: &mut Vec<NodeEntry>, id: &NodeId, conn_seq: u64) -> bool {
+    nodes.retain(|n| !(n.id == *id && n.conn_seq == conn_seq));
+    nodes.iter().any(|n| n.id == *id)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_route, success_pct, Route};
+    use super::{
+        displace_and_push, parse_route, remove_conn, success_pct, NodeEntry, NodeId, NodeReport,
+        Route,
+    };
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicU32;
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::mpsc;
+
+    fn entry(id: &str, conn_seq: u64) -> NodeEntry {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        NodeEntry {
+            id: NodeId(id.to_string()),
+            name: "n".into(),
+            since: 0,
+            tx,
+            fails: Arc::new(AtomicU32::new(0)),
+            host_fails: Arc::new(Mutex::new(HashMap::new())),
+            in_flight: Arc::new(AtomicU32::new(0)),
+            protocol_version: 6,
+            agent_version: "0.4.6".into(),
+            info: Arc::new(Mutex::new(NodeReport::default())),
+            group: None,
+            conn_seq,
+        }
+    }
+
+    #[test]
+    fn add_displaces_stale_same_id() {
+        // A node reconnecting (same id, new conn_seq) must not leave a stale
+        // duplicate behind: the newest connection replaces the old entry.
+        let mut nodes = Vec::new();
+        displace_and_push(&mut nodes, entry("yuki", 1));
+        displace_and_push(&mut nodes, entry("yuki", 2));
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].conn_seq, 2);
+    }
+
+    #[test]
+    fn add_keeps_distinct_ids() {
+        let mut nodes = Vec::new();
+        displace_and_push(&mut nodes, entry("yuki", 1));
+        displace_and_push(&mut nodes, entry("kukky", 1));
+        assert_eq!(nodes.len(), 2);
+    }
+
+    #[test]
+    fn reap_stale_keeps_live_reconnect() {
+        // The core bug: two connections briefly overlap for one id. Reaping the
+        // stale one (seq 1) must leave the live one (seq 2) routable, and report
+        // that the id is still present so its byte/stat counters survive.
+        let mut nodes = vec![entry("yuki", 1), entry("yuki", 2)];
+        let id_still_present = remove_conn(&mut nodes, &NodeId("yuki".into()), 1);
+        assert!(id_still_present);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].conn_seq, 2);
+    }
+
+    #[test]
+    fn reap_after_displace_is_noop_for_live() {
+        // Real flow: seq 2 already displaced seq 1 on enroll. When seq 1's dead
+        // socket finally times out and reaps itself, it must touch nothing.
+        let mut nodes = vec![entry("yuki", 2)];
+        let id_still_present = remove_conn(&mut nodes, &NodeId("yuki".into()), 1);
+        assert!(id_still_present);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].conn_seq, 2);
+    }
+
+    #[test]
+    fn reap_last_connection_reports_gone() {
+        // When the only connection for an id is removed, the id is fully gone so
+        // the caller knows to purge its per-id byte/stat counters.
+        let mut nodes = vec![entry("yuki", 1)];
+        let id_still_present = remove_conn(&mut nodes, &NodeId("yuki".into()), 1);
+        assert!(!id_still_present);
+        assert!(nodes.is_empty());
+    }
 
     #[test]
     fn success_pct_no_dials_is_none() {

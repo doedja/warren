@@ -47,3 +47,33 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Build
         run: cargo build --verbose
+
+  # Enforce the declared MSRV (rust-version in Cargo.toml). A build with the
+  # exact pinned toolchain fails the job if a dependency or new syntax pushes the
+  # real minimum above 1.74, so the claim cannot silently rot.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Rust 1.74
+        uses: dtolnay/rust-toolchain@1.74
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+      - name: Build on MSRV
+        run: cargo build --verbose
+
+  # Fail on dependencies with a known RUSTSEC advisory.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: Audit
+        run: cargo audit
