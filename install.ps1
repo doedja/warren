@@ -63,12 +63,18 @@ Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
 # Verify against the sha256 published next to the asset before extracting or
 # running anything. Fail closed; set $env:WARREN_SKIP_VERIFY=1 to bypass.
 if ($env:WARREN_SKIP_VERIFY -ne '1') {
+  # Download to a file and read as text. Invoke-WebRequest's .Content is a byte
+  # array for octet-stream responses (GitHub serves the asset that way), which
+  # would stringify the bytes instead of giving us the hash line.
+  $sumfile = Join-Path $env:TEMP 'warren.sha256'
   try {
-    $sumline = (Invoke-WebRequest -Uri $sumUrl -UseBasicParsing).Content
+    Invoke-WebRequest -Uri $sumUrl -OutFile $sumfile -UseBasicParsing
   } catch {
     Remove-Item $zip -ErrorAction SilentlyContinue
     Write-Error 'warren: could not fetch checksum. Set $env:WARREN_SKIP_VERIFY=1 to bypass (not recommended).'; return
   }
+  $sumline = Get-Content $sumfile -Raw
+  Remove-Item $sumfile -ErrorAction SilentlyContinue
   $expected = (($sumline -split '\s+')[0]).Trim().ToLower()
   $actual = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash.ToLower()
   if ($expected -ne $actual) {

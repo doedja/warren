@@ -3,7 +3,7 @@
 **Turn devices you already own into your own private residential proxy pool.**
 
 [![CI](https://github.com/doedja/warren/actions/workflows/ci.yml/badge.svg)](https://github.com/doedja/warren/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/doedja/warren?sort=semver)](https://github.com/doedja/warren/releases/latest)
+[![Release](https://img.shields.io/github/v/release/doedja/warren?sort=semver&display_name=tag)](https://github.com/doedja/warren/releases/latest)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](#license)
 ![Platforms](https://img.shields.io/badge/platforms-linux%20%7C%20macos%20%7C%20windows-informational)
 
