@@ -100,6 +100,9 @@ pub const DASHBOARD: &str = r###"<!doctype html>
   .cmdrow { display:flex; gap:8px; align-items:flex-start; background:var(--panel2); border:1px solid var(--line); border-radius:var(--radius-sm); padding:9px 11px; }
   .cmdrow code { flex:1; white-space:pre-wrap; }
   .cmdrow button { flex:0 0 auto; }
+  .au { display:flex; align-items:center; gap:7px; font-size:12px; color:var(--mut); margin:4px 0 12px; cursor:pointer; flex-wrap:wrap; }
+  .au input { accent-color:var(--acc); cursor:pointer; }
+  .au code { color:var(--fg); }
   /* Setup stepper */
   .steps { display:flex; flex-wrap:wrap; gap:10px 18px; color:var(--mut); font-size:12px; margin:2px 0 2px; }
   .steps span { display:inline-flex; align-items:center; gap:7px; }
@@ -155,6 +158,7 @@ pub const DASHBOARD: &str = r###"<!doctype html>
       <input id="tname" placeholder="node name">
       <button onclick="addToken()">Create token</button>
     </div>
+    <label class="au"><input type="checkbox" id="autoupd"> add <code>--auto-update</code> to copied Linux/macOS commands <span class="muted">(opt-in self-update; not supported on Windows)</span></label>
     <table><thead><tr><th>Name</th><th>Token</th><th>Created</th><th></th></tr></thead><tbody id="tokens"></tbody></table>
   </section>
 
@@ -223,12 +227,15 @@ function kv(k,v){ return `<div class="kv"><b>${k}</b><code>${esc(v)}</code></div
 function cmd(label, c){ return `<div class="cmd"><div class="cmdlabel">${label}</div><div class="cmdrow"><code>${esc(c)}</code><button class="ghost" onclick="copyEl(this)">copy</button></div></div>`; }
 function tlsFlags(){ return (INFO.tls && INFO.fingerprint) ? ` --tls --hub-fingerprint ${INFO.fingerprint}` : ''; }
 function installUrl(){ return INFO.install_url||'https://raw.githubusercontent.com/doedja/warren/main/install.sh'; }
+// '--auto-update' if the operator ticked the box; unix-only, so it rides only on
+// the Linux/macOS (sh) commands, never the Windows one.
+function autoUpd(){ const c = document.getElementById('autoupd'); return (c && c.checked) ? ' --auto-update' : ''; }
 function installCmd(token){
   const node = INFO.node_addr || '<hub-host>:7000';
-  return `curl -fsSL ${installUrl()} | sh -s -- --hub ${node} --token ${token}${tlsFlags()}`;
+  return `curl -fsSL ${installUrl()} | sh -s -- --hub ${node} --token ${token}${tlsFlags()}${autoUpd()}`;
 }
 // One-paste installs using a join code (carries host + token + TLS + fingerprint).
-function joinInstallCmd(code){ return `curl -fsSL ${installUrl()} | sh -s -- --join ${code}`; }
+function joinInstallCmd(code){ return `curl -fsSL ${installUrl()} | sh -s -- --join ${code}${autoUpd()}`; }
 function winInstallCmd(code){ const ps = installUrl().replace('install.sh','install.ps1'); return `& ([scriptblock]::Create((irm ${ps}))) -Join ${code}`; }
 async function loadInfo(){
   const i = await api('GET','/api/info'); INFO = i;
@@ -332,11 +339,13 @@ async function loadTokens(){
   document.getElementById('tokens').innerHTML = rows.map(t => {
     // With a join code, offer a copy button per OS; otherwise the manual command.
     let copy;
+    // Build the command at click time (inside the *InstallCmd fns) so the
+    // --auto-update checkbox is read live, not baked in at render.
     if (t.join_code) {
-      copy = `<button class="ghost" onclick='copyVal(this, ${esc(JSON.stringify(joinInstallCmd(t.join_code)))})'>copy (Linux/mac)</button> `+
-             `<button class="ghost" onclick='copyVal(this, ${esc(JSON.stringify(winInstallCmd(t.join_code)))})'>copy (Windows)</button> `;
+      copy = `<button class="ghost" onclick='copyVal(this, joinInstallCmd(${esc(JSON.stringify(t.join_code))}))'>copy (Linux/mac)</button> `+
+             `<button class="ghost" onclick='copyVal(this, winInstallCmd(${esc(JSON.stringify(t.join_code))}))'>copy (Windows)</button> `;
     } else {
-      copy = `<button class="ghost" onclick='copyVal(this, ${esc(JSON.stringify(installCmd(t.token)))})'>copy install</button> `;
+      copy = `<button class="ghost" onclick='copyVal(this, installCmd(${esc(JSON.stringify(t.token))}))'>copy install</button> `;
     }
     return `<tr><td>${esc(t.name)}</td><td><code>${esc(t.token)}</code></td><td class="muted">${fmtDate(t.created)}</td>`+
     `<td>${copy}<button class="ghost danger" onclick="delToken('${esc(t.token)}')">delete</button></td></tr>`;
