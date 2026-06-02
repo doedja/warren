@@ -96,6 +96,30 @@ curl -x http://warren-region-Indonesia:PASSWORD@SERVER:8000 https://api.ipify.or
 The dashboard's Live nodes shows each device's **exit IP, location, health, and
 success rate**.
 
+### Route a whole device through the pool (tun2socks)
+
+The examples above are per-app. To send a **whole machine or phone** out through
+the pool (including UDP, QUIC, and WebRTC), point a tun2socks tool at warren's
+SOCKS5 endpoint, which does UDP ASSOCIATE. With
+[hev-socks5-tunnel](https://github.com/heiher/hev-socks5-tunnel):
+
+```yaml
+# config.yaml
+tunnel:
+  name: tun0
+  mtu: 8500
+socks5:
+  address: SERVER
+  port: 8000
+  username: warren
+  password: PASSWORD
+  udp: udp        # carry UDP over the SOCKS5 UDP associate
+```
+
+Then bring up the tun device and route traffic into it (OS-specific). Now every
+connection from that device leaves through one of your nodes on its home IP, not
+just what you point at the proxy. (`examples/tun2socks.md` has the full walk-through.)
+
 ## Why one binary
 
 The usual way to build this from your own devices is a stack: a mesh VPN
@@ -133,6 +157,11 @@ for new devices, address and token (and, if you use TLS, the fingerprint) alread
 filled in. Copy, paste on the device, done. It also lists devices waiting for
 approval, your proxy users, and enrollment tokens, each labeled with what it does.
 
+The admin server also exposes **Prometheus metrics** at `/metrics` (HTTP Basic,
+any username + the admin token as the password, so Prometheus `basic_auth`):
+nodes online, bytes per node and per user, dial counts, and active UDP
+associations, for scraping into Grafana or alerting.
+
 ## What you get
 
 - One proxy endpoint for a pool of your own devices, with automatic failover.
@@ -165,7 +194,9 @@ arguments to just drop in the binary.
 **Clean uninstall** (stops the service, deletes the node key, removes the binary):
 
 ```bash
-warren node uninstall                                                    # if warren is on PATH
+# if warren is on PATH:
+warren node uninstall
+# otherwise:
 curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh -s -- --uninstall
 ```
 
@@ -176,25 +207,26 @@ if you want the hub to forget it. No prebuilt binary for your arch? Build it:
 ### On a phone (Android, via Termux)
 
 A spare Android phone can be a node. Install [Termux](https://termux.dev) from
-F-Droid (not the Play Store version, which is outdated), then:
+F-Droid (not the Play Store version, which is outdated), then run the installer
+with your join code:
 
 ```bash
 pkg install curl
-curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh   # drops the binary in ~/.local/bin
-~/.local/bin/warren node run --join warren1...                                    # paste your join code
+curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh -s -- --join warren1.YOUR_JOIN_CODE
 ```
 
-The arm64 static binary runs directly under Termux. Two things to know:
+The installer drops the arm64 binary, **starts the node, takes a CPU wake lock,
+writes a boot-restart script, and opens the battery-optimization screen** for you.
+Two one-time taps finish it (Android requires these by hand, no script can do them):
 
-- **Keep it alive.** Android stops background apps to save battery. Run
-  `termux-wake-lock`, exempt Termux from battery optimization in Android
-  settings, and install Termux:Boot (F-Droid) with a `~/.termux/boot/` script
-  that runs the command above so the node restarts after a reboot.
-- A phone that sleeps with the screen off may still drop; a device kept awake and
-  on power is the most reliable. The node reconnects on its own when it can.
+- Install **Termux:Boot** and **Termux:API** from F-Droid and open each once. They
+  enable the boot-restart and the wake lock the installer set up.
+- Accept the **battery-optimization exemption** dialog the installer opened.
 
-`warren node install` (the boot service) does not apply here, since Termux has no
-systemd; run the node directly as shown.
+After that the node survives sleep and reboot with no further steps. Logs are in
+`~/warren-node.log`; a phone kept on power is steadiest, and the node reconnects on
+its own when the link drops. (Termux has no systemd, so `warren node install`
+does not apply; this path replaces it.)
 
 ### Managing the node
 
@@ -299,6 +331,7 @@ flags yourself.
 | `--tls` `--hub-fingerprint FP` | use TLS and pin the hub (carried by `--join`) |
 | `--insecure` | with `--tls`, skip fingerprint pinning. Dev only; do not use against a real hub |
 | `--key-file` | where the device keeps its identity key (default `~/.warren/node.key`) |
+| `--auto-update` | when the hub reports a newer version, re-run the installer to upgrade this node (Unix only; off by default, a notice is logged instead) |
 
 **`warren node install ...`** takes the same flags as `node run` and registers a
 boot service (systemd / launchd / Windows task) so the device rejoins on reboot.
@@ -312,8 +345,10 @@ token in the dashboard.
 ## Build from source
 
 ```bash
-cargo build --release   # needs rustup, stable >= 1.74; binary at target/release/warren
-cargo test              # unit + end-to-end tests
+# needs rustup, stable >= 1.74; binary lands at target/release/warren
+cargo build --release
+# unit + end-to-end tests
+cargo test
 ```
 
 ## License

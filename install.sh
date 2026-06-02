@@ -22,11 +22,50 @@ fi
 os="$(uname -s)"
 arch="$(uname -m)"
 
+# Termux (Android) has no systemd/launchd, so it gets its own setup path below:
+# a Termux:Boot script + wake lock + battery-exemption prompt instead of a service.
+termux=0
+case "${PREFIX:-}" in *com.termux*) termux=1 ;; esac
+
 fallback() {
   echo "warren: no prebuilt binary for $os/$arch." >&2
   echo "On Windows, use install.ps1. Otherwise build from source:" >&2
   echo "  cargo install --git https://github.com/$REPO warren" >&2
   exit 1
+}
+
+# Android/Termux node setup: automate the wake-lock + boot-restart + battery
+# prompt that otherwise have to be done by hand. $dest is the installed binary.
+setup_termux() {
+  # CPU wake lock so Doze does not suspend the node (needs the termux-api pkg +
+  # the Termux:API app). Best-effort; harmless if unavailable.
+  pkg install -y termux-api >/dev/null 2>&1 || true
+  termux-wake-lock >/dev/null 2>&1 || true
+
+  # Boot script: re-acquire the lock and start the node on device boot. Runs only
+  # once the Termux:Boot app is installed (one F-Droid install, opened once).
+  bootdir="$HOME/.termux/boot"
+  mkdir -p "$bootdir"
+  {
+    echo "#!$PREFIX/bin/sh"
+    echo "termux-wake-lock 2>/dev/null || true"
+    printf 'exec "%s" node run' "$dest"
+    for a in "$@"; do printf ' "%s"' "$a"; done
+    echo ""
+  } >"$bootdir/start-warren.sh"
+  chmod +x "$bootdir/start-warren.sh"
+
+  # The one step Android requires a tap for: battery-optimization exemption.
+  am start -a android.settings.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS \
+    -d package:com.termux >/dev/null 2>&1 || true
+
+  echo "" >&2
+  echo "Termux node set up. Two one-time taps so it survives sleep + reboot:" >&2
+  echo "  1. Install Termux:Boot and Termux:API from F-Droid, open each once." >&2
+  echo "  2. Accept the battery-optimization dialog that just opened." >&2
+  echo "Starting the node now (logs: ~/warren-node.log)..." >&2
+  nohup "$dest" node run "$@" >"$HOME/warren-node.log" 2>&1 &
+  echo "warren: node running in the background (pid $!)." >&2
 }
 
 # asset = warren-<os>-<arch>.tar.gz (see .github/workflows/release.yml)
@@ -108,7 +147,10 @@ fi
 chmod +x "$dest"
 echo "warren: installed at $dest" >&2
 
-if [ "$#" -gt 0 ]; then
+if [ "$#" -gt 0 ] && [ "$termux" = 1 ]; then
+  # Android: no systemd/launchd; wire up wake-lock + boot-restart + start now.
+  setup_termux "$@"
+elif [ "$#" -gt 0 ]; then
   # Register a boot service with the passed args (needs root for systemd).
   echo "warren: installing node service..." >&2
   if [ "$(id -u)" = "0" ]; then

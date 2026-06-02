@@ -9,6 +9,7 @@
 //! With `--tls` the node link is TLS; the hub cert is pinned by
 //! `--hub-fingerprint` (or accepted blindly with `--insecure`, dev only).
 
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -81,6 +82,11 @@ pub struct RunArgs {
     /// Accept any hub cert (dev only).
     #[arg(long, default_value_t = false)]
     pub insecure: bool,
+    /// Auto-update: when the hub reports a newer version, re-run the installer to
+    /// upgrade this node. Off by default (a notice is logged instead). Unix only;
+    /// on Windows the running exe is locked, so reinstall manually.
+    #[arg(long, default_value_t = false)]
+    pub auto_update: bool,
 }
 
 pub async fn run(args: NodeArgs) -> Result<()> {
@@ -128,6 +134,10 @@ fn resolve(args: &RunArgs) -> Result<Resolved> {
 }
 
 pub async fn run_agent(args: RunArgs) -> Result<()> {
+    // On Termux (Android), hold a CPU wake lock so Doze does not suspend the node.
+    // Best-effort and self-contained, so a plain `node run` works even without the
+    // install script. Released on clean exit below.
+    termux_wakelock(true);
     let r = resolve(&args)?;
     let name = if args.name.is_empty() {
         hostname()
@@ -166,6 +176,7 @@ pub async fn run_agent(args: RunArgs) -> Result<()> {
             &identity,
             shutdown_rx.clone(),
             in_flight.clone(),
+            args.auto_update,
         )
         .await;
         if *shutdown_rx.borrow() {
@@ -187,7 +198,23 @@ pub async fn run_agent(args: RunArgs) -> Result<()> {
     // connect_once drains in-flight splices on shutdown (while its yamux driver
     // is still alive), so by the time we break out there is nothing left to wait
     // for here.
+    termux_wakelock(false); // release on clean exit so we do not pin the CPU.
     Ok(())
+}
+
+/// Acquire (or release) a Termux CPU wake lock so Android Doze does not suspend
+/// the node. No-op off Termux (gated on TERMUX_VERSION) and best-effort: needs
+/// the termux-api package + the Termux:API app, but failure is harmless.
+fn termux_wakelock(acquire: bool) {
+    if std::env::var_os("TERMUX_VERSION").is_none() {
+        return;
+    }
+    let cmd = if acquire {
+        "termux-wake-lock"
+    } else {
+        "termux-wake-unlock"
+    };
+    let _ = std::process::Command::new(cmd).spawn();
 }
 
 /// Wait up to DRAIN_BUDGET for in-flight dials to finish, then return so the
@@ -210,6 +237,53 @@ async fn drain_in_flight(in_flight: &AtomicU32) {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     tracing::info!("drain complete; exiting");
+}
+
+/// True if dotted version `remote` is numerically greater than `local`.
+fn version_gt(remote: &str, local: &str) -> bool {
+    let parse = |s: &str| {
+        s.split('.')
+            .map(|p| p.parse::<u64>().unwrap_or(0))
+            .collect::<Vec<u64>>()
+    };
+    parse(remote) > parse(local)
+}
+
+/// On a newer hub version, log it and (with --auto-update, unix only) re-run the
+/// installer detached: it stops this service, swaps the binary, and restarts it.
+/// Default is notice-only, because a silent binary swap across a fleet is
+/// dangerous; enable per node once confirmed. Version tolerance means an
+/// unupdated node keeps serving meanwhile.
+fn maybe_self_update(remote: &str, auto_update: bool, r: &Resolved) {
+    let local = env!("CARGO_PKG_VERSION");
+    if !version_gt(remote, local) {
+        return;
+    }
+    tracing::warn!(node = local, hub = remote, "hub is newer than this node");
+    if !auto_update {
+        tracing::warn!("auto-update off (pass --auto-update to enable); reinstall to upgrade");
+        return;
+    }
+    if cfg!(windows) {
+        tracing::warn!("auto-update unsupported on Windows (locked exe); reinstall manually");
+        return;
+    }
+    let url = "https://raw.githubusercontent.com/doedja/warren/main/install.sh";
+    let mut cmd = format!("curl -fsSL {url} | sh -s -- --hub {}", r.hub);
+    if let Some(t) = &r.token {
+        cmd.push_str(&format!(" --token {t}"));
+    }
+    if r.tls {
+        cmd.push_str(" --tls");
+        if let Some(fp) = &r.fingerprint {
+            cmd.push_str(&format!(" --hub-fingerprint {fp}"));
+        }
+    }
+    if r.insecure {
+        cmd.push_str(" --insecure");
+    }
+    tracing::warn!("auto-updating: re-running installer (service will restart)");
+    let _ = std::process::Command::new("sh").arg("-c").arg(&cmd).spawn();
 }
 
 /// Flip the shutdown watch on the first SIGTERM/SIGINT. On non-unix there is no
@@ -279,6 +353,7 @@ async fn connect_once(
     identity: &Identity,
     mut shutdown_rx: watch::Receiver<bool>,
     in_flight: Arc<AtomicU32>,
+    auto_update: bool,
 ) -> Result<()> {
     let conn = dial_conn(&r.hub, connector).await?;
     // One yamux connection carries everything. The node opens streams: the
@@ -354,7 +429,7 @@ async fn connect_once(
             }
             tokio::select! {
                 _ = shutdown_rx.changed() => break 'read Ok(()),
-                r = tokio::time::timeout(mux::LINK_READ_TIMEOUT, read_msg(&mut rd)) => match r {
+                read = tokio::time::timeout(mux::LINK_READ_TIMEOUT, read_msg(&mut rd)) => match read {
                     Ok(Ok(msg)) => match msg {
                         HubToNode::Ping { nonce } => {
                             let _ = ntx.send(NodeToHub::Pong { nonce });
@@ -383,6 +458,9 @@ async fn connect_once(
                                 let _g = guard;
                                 handle_udp(opener, conn_id, nonce, ntx2).await;
                             });
+                        }
+                        HubToNode::HubVersion { version } => {
+                            maybe_self_update(&version, auto_update, r);
                         }
                     },
                     Ok(Err(e)) => break 'read Err(e.into()),
@@ -516,7 +594,10 @@ async fn handle_udp(
         });
         return;
     }
-    let udp = match UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).await {
+    // Egress sockets: IPv4 always, IPv6 best-effort. Targets are routed to the
+    // socket matching their resolved address family, so v6-only destinations
+    // (QUIC/DNS over IPv6) work too, not just v4.
+    let udp4 = match UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).await {
         Ok(u) => Arc::new(u),
         Err(e) => {
             let _ = ntx.send(NodeToHub::DialFailed {
@@ -526,30 +607,69 @@ async fn handle_udp(
             return;
         }
     };
+    let udp6 = UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, 0))
+        .await
+        .ok()
+        .map(Arc::new);
 
     let (mut srd, mut swr) = split(stream);
 
-    // Egress replies -> hub, tagged with the responder's address.
-    let udp_rx = udp.clone();
-    let reader = tokio::spawn(async move {
-        let mut buf = vec![0u8; 65535];
-        while let Ok((n, src)) = udp_rx.recv_from(&mut buf).await {
-            let dg = UdpDatagram {
-                host: src.ip().to_string(),
-                port: src.port(),
-                data: buf[..n].to_vec(),
-            };
+    // Both egress sockets funnel replies through one channel to a single writer,
+    // so the stream's write half is never touched from two tasks at once.
+    let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<UdpDatagram>();
+    let writer = tokio::spawn(async move {
+        while let Some(dg) = reply_rx.recv().await {
             if write_msg(&mut swr, &dg).await.is_err() {
                 break;
             }
         }
     });
+    let r4 = spawn_udp_recv(udp4.clone(), reply_tx.clone());
+    let r6 = udp6.clone().map(|s| spawn_udp_recv(s, reply_tx.clone()));
+    drop(reply_tx); // writer ends once both recv tasks (the only senders) stop.
 
-    // Client datagrams from the hub -> the target, from this node's egress.
+    // Client datagrams from the hub -> the target, out the family-matched socket.
     while let Ok(dg) = read_msg::<_, UdpDatagram>(&mut srd).await {
-        let _ = udp.send_to(&dg.data, (dg.host.as_str(), dg.port)).await;
+        if let Ok(mut addrs) = tokio::net::lookup_host((dg.host.as_str(), dg.port)).await {
+            match addrs.next() {
+                Some(a @ SocketAddr::V4(_)) => {
+                    let _ = udp4.send_to(&dg.data, a).await;
+                }
+                Some(a @ SocketAddr::V6(_)) => {
+                    if let Some(s6) = &udp6 {
+                        let _ = s6.send_to(&dg.data, a).await;
+                    }
+                }
+                None => {}
+            }
+        }
     }
-    reader.abort();
+    r4.abort();
+    if let Some(r6) = r6 {
+        r6.abort();
+    }
+    writer.abort();
+}
+
+/// Spawn a task that reads datagrams off `sock` and forwards each to `tx` tagged
+/// with the responder's address (the node->hub reply direction of a UDP relay).
+fn spawn_udp_recv(
+    sock: Arc<UdpSocket>,
+    tx: mpsc::UnboundedSender<UdpDatagram>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+        while let Ok((n, src)) = sock.recv_from(&mut buf).await {
+            let dg = UdpDatagram {
+                host: src.ip().to_string(),
+                port: src.port(),
+                data: buf[..n].to_vec(),
+            };
+            if tx.send(dg).is_err() {
+                break;
+            }
+        }
+    })
 }
 
 const SYSTEMD_UNIT: &str = "/etc/systemd/system/warren-node.service";
@@ -770,7 +890,7 @@ fn current_platform() -> Platform {
 
 #[cfg(test)]
 mod tests {
-    use super::{backoff_sleep, drain_in_flight, DRAIN_BUDGET};
+    use super::{backoff_sleep, drain_in_flight, version_gt, DRAIN_BUDGET};
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -811,6 +931,15 @@ mod tests {
         assert!(waited >= DRAIN_BUDGET);
         // It still exits (does not hang forever); cap the upper bound generously.
         assert!(waited < DRAIN_BUDGET + Duration::from_secs(1));
+    }
+
+    #[test]
+    fn version_compare() {
+        assert!(version_gt("0.4.0", "0.3.0"));
+        assert!(version_gt("0.3.1", "0.3.0"));
+        assert!(version_gt("1.0.0", "0.9.9"));
+        assert!(!version_gt("0.3.0", "0.3.0"));
+        assert!(!version_gt("0.2.0", "0.3.0"));
     }
 
     #[test]

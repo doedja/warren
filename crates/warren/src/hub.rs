@@ -61,6 +61,11 @@ const SESSION_CAP: usize = 10_000;
 /// Bound on enrollment (control stream open + Hello) so a peer that finishes TLS
 /// then stalls cannot pin a connection + driver task indefinitely.
 const ENROLL_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Minimum node protocol for UDP relay (UdpOpen landed in v5).
+const UDP_MIN_VERSION: u16 = 5;
+/// Minimum node protocol that understands the HubVersion self-update hint (v6).
+const HUB_VERSION_MIN: u16 = 6;
 /// Bound on a data stream sending its DataHello before we give up on it, so a
 /// stream opened but never identified cannot leak a task + open stream.
 const DATA_HELLO_TIMEOUT: Duration = Duration::from_secs(15);
@@ -136,6 +141,9 @@ struct NodeEntry {
     host_fails: Arc<StdMutex<HashMap<String, u32>>>,
     /// Number of in-flight dials currently being handled by this node.
     in_flight: Arc<AtomicU32>,
+    /// The node's reported protocol version. Routing gates version-specific
+    /// features (e.g. UDP relay needs >= 5) so older nodes still serve TCP.
+    protocol_version: u16,
     /// Public egress IP + geo, self-reported by the node (best-effort, may be
     /// empty until the first report arrives).
     info: Arc<StdMutex<NodeReport>>,
@@ -171,10 +179,44 @@ struct UdpAssoc {
     /// (UDP is lossy) instead of growing hub memory without limit.
     to_node: mpsc::Sender<UdpDatagram>,
     client_src: Arc<StdMutex<Option<SocketAddr>>>,
+    /// Activity timestamp (idle close) + per-second rate counter.
+    meter: Arc<StdMutex<AssocMeter>>,
 }
 
 /// Per-association queue depth from the demux to a node's relay stream.
 const UDP_QUEUE_DEPTH: usize = 1024;
+/// Close a UDP association after this long with no client datagrams (frees the
+/// node stream + tasks for clients that vanish without closing their TCP conn).
+const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Per-association cap on client->target datagrams per second (amplification /
+/// reflection guard). Excess datagrams are dropped (UDP is lossy).
+const UDP_MAX_PPS: u32 = 2000;
+
+/// Per-association activity + rate state, behind one lock.
+struct AssocMeter {
+    last_seen: Instant,
+    window_start: Instant,
+    count: u32,
+}
+impl AssocMeter {
+    fn new(now: Instant) -> Self {
+        AssocMeter {
+            last_seen: now,
+            window_start: now,
+            count: 0,
+        }
+    }
+    /// Record a datagram at `now`; returns false if it exceeds the per-second cap.
+    fn allow(&mut self, now: Instant) -> bool {
+        self.last_seen = now;
+        if now.duration_since(self.window_start) >= Duration::from_secs(1) {
+            self.window_start = now;
+            self.count = 0;
+        }
+        self.count += 1;
+        self.count <= UDP_MAX_PPS
+    }
+}
 
 struct Hub {
     store: Arc<Store>,
@@ -208,6 +250,30 @@ struct Hub {
 /// `Hub` field readable (clippy::type_complexity).
 type NodeStats = HashMap<String, (u32, u32, Option<String>)>;
 
+/// A routing snapshot of one node: id, name, control tx, fails, per-host fails,
+/// in-flight, protocol version. Cloned out so routing decisions touch no locks.
+type NodeSnap = (
+    NodeId,
+    String,
+    mpsc::UnboundedSender<HubToNode>,
+    Arc<AtomicU32>,
+    Arc<StdMutex<HashMap<String, u32>>>,
+    Arc<AtomicU32>,
+    u16,
+);
+
+fn node_snap(n: &NodeEntry) -> NodeSnap {
+    (
+        n.id.clone(),
+        n.name.clone(),
+        n.tx.clone(),
+        n.fails.clone(),
+        n.host_fails.clone(),
+        n.in_flight.clone(),
+        n.protocol_version,
+    )
+}
+
 impl Hub {
     fn next_conn_id(&self) -> u64 {
         self.conn_seq.fetch_add(1, Ordering::Relaxed)
@@ -218,32 +284,13 @@ impl Hub {
     /// fallback, if it is offline).
     // `map_or(true, ...)` keeps the MSRV at 1.74; `Option::is_none_or` is 1.82+.
     #[allow(clippy::type_complexity, clippy::unnecessary_map_or)]
-    async fn snapshot(
-        &self,
-        sel: Option<&str>,
-    ) -> Vec<(
-        NodeId,
-        String,
-        mpsc::UnboundedSender<HubToNode>,
-        Arc<AtomicU32>,
-        Arc<StdMutex<HashMap<String, u32>>>,
-        Arc<AtomicU32>,
-    )> {
+    async fn snapshot(&self, sel: Option<&str>) -> Vec<NodeSnap> {
         self.nodes
             .lock()
             .await
             .iter()
             .filter(|n| sel.map_or(true, |s| n.name == s))
-            .map(|n| {
-                (
-                    n.id.clone(),
-                    n.name.clone(),
-                    n.tx.clone(),
-                    n.fails.clone(),
-                    n.host_fails.clone(),
-                    n.in_flight.clone(),
-                )
-            })
+            .map(node_snap)
             .collect()
     }
 
@@ -296,19 +343,8 @@ impl Hub {
         }
     }
     /// Snapshot of nodes whose reported geo country matches `country`
-    /// (case-insensitive). Same tuple shape as [`snapshot`].
-    #[allow(clippy::type_complexity)]
-    async fn snapshot_region(
-        &self,
-        country: &str,
-    ) -> Vec<(
-        NodeId,
-        String,
-        mpsc::UnboundedSender<HubToNode>,
-        Arc<AtomicU32>,
-        Arc<StdMutex<HashMap<String, u32>>>,
-        Arc<AtomicU32>,
-    )> {
+    /// (case-insensitive). Same shape as [`snapshot`].
+    async fn snapshot_region(&self, country: &str) -> Vec<NodeSnap> {
         self.nodes
             .lock()
             .await
@@ -321,16 +357,7 @@ impl Hub {
                     .as_deref()
                     .is_some_and(|c| c.eq_ignore_ascii_case(country))
             })
-            .map(|n| {
-                (
-                    n.id.clone(),
-                    n.name.clone(),
-                    n.tx.clone(),
-                    n.fails.clone(),
-                    n.host_fails.clone(),
-                    n.in_flight.clone(),
-                )
-            })
+            .map(node_snap)
             .collect()
     }
     async fn add_node(&self, e: NodeEntry) {
@@ -589,9 +616,9 @@ pub async fn run_with_listeners(
                 let assoc = {
                     let m = h.udp_assoc.lock().await;
                     m.get(&src.ip())
-                        .map(|a| (a.to_node.clone(), a.client_src.clone()))
+                        .map(|a| (a.to_node.clone(), a.client_src.clone(), a.meter.clone()))
                 };
-                let Some((to_node, client_src)) = assoc else {
+                let Some((to_node, client_src, meter)) = assoc else {
                     continue;
                 };
                 // Lock the association to the first client socket we hear from and
@@ -604,6 +631,10 @@ pub async fn run_with_listeners(
                         Some(known) if known != src => continue,
                         _ => {}
                     }
+                }
+                // Mark activity (idle timer) and enforce the per-second rate cap.
+                if !meter.lock().unwrap().allow(Instant::now()) {
+                    continue;
                 }
                 if let Some((host, port, off)) = socks5::parse_udp_header(&buf[..n]) {
                     // Bounded queue: drop on overflow rather than grow hub memory.
@@ -646,7 +677,7 @@ pub async fn run_with_listeners(
                     let _ = stream.set_nodelay(true); // proxied splice: no Nagle stalls
                     let h = h1.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_node_conn(stream, h).await {
+                        if let Err(e) = handle_node_conn(stream, peer.ip(), h).await {
                             tracing::debug!(%peer, error = %e, "node conn ended");
                         }
                     });
@@ -678,7 +709,7 @@ pub async fn run_with_listeners(
     Ok(())
 }
 
-async fn handle_node_conn(stream: TcpStream, hub: Arc<Hub>) -> Result<()> {
+async fn handle_node_conn(stream: TcpStream, peer_ip: IpAddr, hub: Arc<Hub>) -> Result<()> {
     let conn = match &hub.tls {
         Some(acceptor) => Conn::ServerTls(acceptor.accept(stream).await?),
         None => Conn::Plain(stream),
@@ -723,6 +754,12 @@ async fn handle_node_conn(stream: TcpStream, hub: Arc<Hub>) -> Result<()> {
 
     let (tx, mut rx) = mpsc::unbounded_channel::<HubToNode>();
     let info = Arc::new(StdMutex::new(NodeReport::default()));
+    // The node dialed out from its residential connection, so the control-conn
+    // source IP IS its public egress IP (same NAT as proxied traffic). Set it
+    // directly: reliable and instant, no dependency on the node reaching an
+    // external IP-echo service (the old node-side ip-api self-report failed on
+    // networks that block its plaintext call). Geo is resolved hub-side below.
+    info.lock().unwrap().ip = Some(peer_ip.to_string());
     hub.add_node(NodeEntry {
         id: node_id.clone(),
         name: hello.node_name.clone(),
@@ -731,10 +768,30 @@ async fn handle_node_conn(stream: TcpStream, hub: Arc<Hub>) -> Result<()> {
         fails: Arc::new(AtomicU32::new(0)),
         host_fails: Arc::new(StdMutex::new(HashMap::new())),
         in_flight: Arc::new(AtomicU32::new(0)),
+        protocol_version: hello.protocol_version,
         info: info.clone(),
     })
     .await;
-    tracing::info!(node = %node_id.0, "node enrolled");
+    tracing::info!(node = %node_id.0, ip = %peer_ip, ver = hello.protocol_version, "node enrolled");
+
+    // Tell new-enough nodes our version so they can self-update. Gated: a node
+    // older than the version that introduced HubVersion would fail to decode it.
+    if hello.protocol_version >= HUB_VERSION_MIN {
+        let _ = tx.send(HubToNode::HubVersion {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        });
+    }
+
+    // Geo-locate the node's IP from the hub (which has reliable connectivity),
+    // rather than relying on the node to do it. Best-effort.
+    let geo_info = info.clone();
+    tokio::spawn(async move {
+        if let Some((country, city)) = geo_lookup(&peer_ip.to_string()).await {
+            let mut r = geo_info.lock().unwrap();
+            r.country = country;
+            r.city = city;
+        }
+    });
 
     let (mut rd, mut wr) = split(ctrl);
 
@@ -837,16 +894,21 @@ async fn enroll_node(
     conn: &mut MuxStream,
     hub: &Arc<Hub>,
 ) -> Result<Option<NodeId>> {
-    // 0. Refuse a node speaking a different protocol version, with a clear
-    //    reason instead of a confusing decode failure later.
-    if hello.protocol_version != warren_proto::PROTOCOL_VERSION {
+    // 0. Accept a RANGE of node versions [MIN..=CURRENT] so an additive bump does
+    //    not force every node to reinstall at once. Newer hub messages are gated
+    //    per node by the version recorded below. Only reject genuinely
+    //    incompatible nodes (older than the shared-framing floor, or from the
+    //    future), with a clear reason instead of a confusing decode failure.
+    let nv = hello.protocol_version;
+    if !(warren_proto::MIN_PROTOCOL_VERSION..=warren_proto::PROTOCOL_VERSION).contains(&nv) {
         let _ = write_msg(
             conn,
             &HelloReply::Reject {
                 reason: format!(
-                    "protocol version mismatch: hub speaks {}, node speaks {}; update the node",
+                    "protocol version unsupported: hub speaks {} (min {}), node speaks {}; update the node",
                     warren_proto::PROTOCOL_VERSION,
-                    hello.protocol_version
+                    warren_proto::MIN_PROTOCOL_VERSION,
+                    nv
                 ),
             },
         )
@@ -1109,7 +1171,7 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
     }
 
     for idx in uncapped_idx.iter().chain(capped_idx.iter()).copied() {
-        let (node_id, node_name, node_tx, fails, host_fails, in_flight) = &nodes[idx];
+        let (node_id, node_name, node_tx, fails, host_fails, in_flight, _ver) = &nodes[idx];
         let _g = mux::InFlightGuard::new(in_flight.clone());
 
         let conn_id = hub.next_conn_id();
@@ -1203,18 +1265,26 @@ async fn handle_udp_associate(
     };
 
     // Pick a node (route-aware), preferring healthy + least-loaded. UDP has no
-    // per-datagram failover; one node carries the whole association.
-    let nodes = match &route {
+    // per-datagram failover; one node carries the whole association. Only nodes
+    // new enough to speak UDP (the 7th tuple field is the protocol version) are
+    // eligible, so an older node in the pool is skipped for UDP but still serves TCP.
+    let nodes: Vec<NodeSnap> = match &route {
         Route::Device(name) => hub.snapshot(Some(name)).await,
         Route::Region(country) => hub.snapshot_region(country).await,
         _ => hub.snapshot(None).await,
     };
-    let chosen = nodes
+    let udp: Vec<&NodeSnap> = nodes.iter().filter(|n| n.6 >= UDP_MIN_VERSION).collect();
+    let chosen = udp
         .iter()
+        .copied()
         .filter(|n| n.3.load(Ordering::Relaxed) < UNHEALTHY_AT)
         .min_by_key(|n| n.5.load(Ordering::Relaxed))
-        .or_else(|| nodes.iter().min_by_key(|n| n.5.load(Ordering::Relaxed)));
-    let Some((node_id, _name, node_tx, _fails, _host_fails, in_flight)) = chosen else {
+        .or_else(|| {
+            udp.iter()
+                .copied()
+                .min_by_key(|n| n.5.load(Ordering::Relaxed))
+        });
+    let Some((node_id, _name, node_tx, _fails, _host_fails, in_flight, _ver)) = chosen else {
         socks5::write_reply(&mut client, socks5::REP_GENERAL_FAILURE).await?;
         return Ok(());
     };
@@ -1250,11 +1320,13 @@ async fn handle_udp_associate(
 
     let (to_node, mut node_rx) = mpsc::channel::<UdpDatagram>(UDP_QUEUE_DEPTH);
     let client_src = Arc::new(StdMutex::new(None::<SocketAddr>));
+    let meter = Arc::new(StdMutex::new(AssocMeter::new(Instant::now())));
     hub.udp_assoc.lock().await.insert(
         client_ip,
         UdpAssoc {
             to_node,
             client_src: client_src.clone(),
+            meter: meter.clone(),
         },
     );
 
@@ -1283,13 +1355,21 @@ async fn handle_udp_associate(
         }
     });
 
-    // The association ends when EITHER the client closes its TCP control conn OR
-    // the node relay stream dies (reader task returns), so a dead node does not
-    // leak the association + tasks until the client happens to disconnect.
+    // The association ends when ANY of: the client closes its TCP control conn,
+    // the node relay stream dies (reader returns), or it goes idle past the
+    // timeout (client vanished without closing). None of these leak the entry.
     let mut ctrl = [0u8; 1];
     tokio::select! {
         _ = async { while client.read(&mut ctrl).await.unwrap_or(0) > 0 {} } => {}
         _ = &mut reader => {}
+        _ = async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                if meter.lock().unwrap().last_seen.elapsed() > UDP_IDLE_TIMEOUT {
+                    break;
+                }
+            }
+        } => {}
     }
 
     hub.udp_assoc.lock().await.remove(&client_ip);
@@ -1313,6 +1393,33 @@ fn udp_bnd_addr(hub: &Hub, relay: &UdpSocket, client: &TcpStream) -> SocketAddr 
         .map(|a| a.ip())
         .unwrap_or(IpAddr::from([0u8, 0, 0, 0]));
     SocketAddr::new(ip, port)
+}
+
+/// Geo-locate a node IP from the hub (best-effort). Plaintext ip-api.com query;
+/// the hub has reliable connectivity even when the node does not. Returns
+/// (country, city); None on any failure.
+async fn geo_lookup(ip: &str) -> Option<(Option<String>, Option<String>)> {
+    let connect = TcpStream::connect("ip-api.com:80");
+    let mut s = timeout(Duration::from_secs(8), connect).await.ok()?.ok()?;
+    let req = format!(
+        "GET /line/{ip}?fields=status,country,city HTTP/1.1\r\nHost: ip-api.com\r\nConnection: close\r\nUser-Agent: warren\r\n\r\n"
+    );
+    s.write_all(req.as_bytes()).await.ok()?;
+    let mut buf = Vec::new();
+    timeout(Duration::from_secs(8), s.read_to_end(&mut buf))
+        .await
+        .ok()?
+        .ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    let body = text.split("\r\n\r\n").nth(1)?;
+    let mut lines = body.lines().map(str::trim).filter(|l| !l.is_empty());
+    // fields=status,country,city -> first line is "success" or "fail".
+    if lines.next()? != "success" {
+        return None;
+    }
+    let country = lines.next().map(str::to_string).filter(|s| !s.is_empty());
+    let city = lines.next().map(str::to_string).filter(|s| !s.is_empty());
+    Some((country, city))
 }
 
 pub async fn enroll(args: EnrollArgs) -> Result<()> {
@@ -1430,6 +1537,7 @@ async fn run_admin(listen: String, ctx: AdminCtx) -> Result<()> {
         .route("/api/pending/:pubkey", delete(api_deny_pending))
         .route("/api/node-keys", get(api_list_node_keys))
         .route("/api/node-keys/:pubkey", delete(api_delete_node_key))
+        .route("/metrics", get(api_metrics))
         .with_state(ctx);
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
@@ -1486,6 +1594,64 @@ async fn api_nodes(
         return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(Json(ctx.hub.list_node_info().await))
+}
+
+/// Prometheus text exposition of hub state (gated by the admin token, like the
+/// rest of the admin server). Built from counters already tracked.
+async fn api_metrics(
+    State(ctx): State<AdminCtx>,
+    headers: HeaderMap,
+) -> Result<String, StatusCode> {
+    if !authed(&headers, &ctx.token) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let h = &ctx.hub;
+    let nodes = h.list_node_info().await;
+    let user_bytes = h.user_bytes.lock().await.clone();
+    let udp_assocs = h.udp_assoc.lock().await.len();
+    // Label values here are node ids / usernames (alnum + '-' + '_'); escape the
+    // few metachars Prometheus cares about to stay well-formed regardless.
+    let esc = |s: &str| {
+        s.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', " ")
+    };
+    let mut o = String::new();
+    o.push_str("# HELP warren_nodes_online Connected nodes.\n# TYPE warren_nodes_online gauge\n");
+    o.push_str(&format!("warren_nodes_online {}\n", nodes.len()));
+    o.push_str("# HELP warren_udp_associations Active UDP associations.\n# TYPE warren_udp_associations gauge\n");
+    o.push_str(&format!("warren_udp_associations {udp_assocs}\n"));
+    o.push_str("# HELP warren_node_bytes_total Bytes relayed per node.\n# TYPE warren_node_bytes_total counter\n");
+    for n in &nodes {
+        o.push_str(&format!(
+            "warren_node_bytes_total{{node=\"{}\"}} {}\n",
+            esc(&n.id),
+            n.bytes
+        ));
+    }
+    o.push_str("# HELP warren_node_dials_total Dial attempts per node.\n# TYPE warren_node_dials_total counter\n");
+    o.push_str("# HELP warren_node_fails Consecutive dial failures per node.\n# TYPE warren_node_fails gauge\n");
+    for n in &nodes {
+        o.push_str(&format!(
+            "warren_node_dials_total{{node=\"{}\"}} {}\n",
+            esc(&n.id),
+            n.dials
+        ));
+        o.push_str(&format!(
+            "warren_node_fails{{node=\"{}\"}} {}\n",
+            esc(&n.id),
+            n.fails
+        ));
+    }
+    o.push_str("# HELP warren_user_bytes_total Bytes relayed per proxy user.\n# TYPE warren_user_bytes_total counter\n");
+    for (user, bytes) in &user_bytes {
+        o.push_str(&format!(
+            "warren_user_bytes_total{{user=\"{}\"}} {}\n",
+            esc(user),
+            bytes
+        ));
+    }
+    Ok(o)
 }
 
 async fn api_list_tokens(

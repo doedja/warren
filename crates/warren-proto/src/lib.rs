@@ -7,8 +7,15 @@ use serde::{Deserialize, Serialize};
 /// transport framing. v4: the node<->hub link is now a single yamux-multiplexed
 /// connection (one logical stream per request) instead of one TCP connection
 /// per request. v5: adds UDP relay (SOCKS5 UDP ASSOCIATE) via `HubToNode::UdpOpen`
-/// + the `UdpDatagram` frame, so a node can carry a client's UDP traffic.
-pub const PROTOCOL_VERSION: u16 = 5;
+/// plus the `UdpDatagram` frame. v6: adds `HubToNode::HubVersion` (self-update);
+/// the hub now accepts a RANGE of node versions and gates newer messages by the
+/// node's reported version, so an additive bump no longer forces a reinstall.
+pub const PROTOCOL_VERSION: u16 = 6;
+
+/// Oldest node protocol the hub still accepts. The yamux transport landed in v4,
+/// so v4+ share wire framing and differ only by additive messages the hub gates
+/// per node. A v3 node uses the old conn-per-request framing and cannot attach.
+pub const MIN_PROTOCOL_VERSION: u16 = 4;
 
 /// Stable identity the hub assigns to a node at enrollment.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -83,6 +90,12 @@ pub enum HubToNode {
     UdpOpen {
         conn_id: u64,
         nonce: u64,
+    },
+    /// The hub's own version, sent once after enrollment to nodes new enough to
+    /// understand it (gated by the node's reported protocol). Lets a node notice
+    /// it is behind and self-update. Appended last to keep discriminants stable.
+    HubVersion {
+        version: String,
     },
 }
 
@@ -172,7 +185,8 @@ mod tests {
 
     #[test]
     fn test_protocol_version() {
-        assert_eq!(PROTOCOL_VERSION, 5);
+        assert_eq!(PROTOCOL_VERSION, 6);
+        assert_eq!(MIN_PROTOCOL_VERSION, 4);
     }
 
     #[test]

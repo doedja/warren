@@ -69,6 +69,7 @@ async fn end_to_end_proxy_through_node() {
             tls: false,
             hub_fingerprint: None,
             insecure: false,
+            auto_update: false,
         })
         .await;
     });
@@ -171,6 +172,7 @@ async fn rejects_bad_auth_and_allows_good() {
             tls: false,
             hub_fingerprint: None,
             insecure: false,
+            auto_update: false,
         })
         .await;
     });
@@ -247,6 +249,7 @@ async fn routes_to_named_device_and_rejects_unknown() {
             tls: false,
             hub_fingerprint: None,
             insecure: false,
+            auto_update: false,
         })
         .await;
     });
@@ -370,6 +373,7 @@ async fn end_to_end_udp_associate() {
             tls: false,
             hub_fingerprint: None,
             insecure: false,
+            auto_update: false,
         })
         .await;
     });
