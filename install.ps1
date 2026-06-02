@@ -44,6 +44,8 @@ if ($arch -ne 'AMD64') {
 $tag = (Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest" -UseBasicParsing).tag_name
 if (-not $tag) { Write-Error 'warren: could not resolve the latest release tag.'; return }
 $url = "https://github.com/$repo/releases/download/$tag/warren-$tag-windows-x86_64.zip"
+# Checksum asset is named after the archive WITHOUT its extension (.sha256, not .zip.sha256).
+$sumUrl = "https://github.com/$repo/releases/download/$tag/warren-$tag-windows-x86_64.sha256"
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 
 # If a node is already running, stop it first so its binary can be replaced
@@ -62,7 +64,7 @@ Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
 # running anything. Fail closed; set $env:WARREN_SKIP_VERIFY=1 to bypass.
 if ($env:WARREN_SKIP_VERIFY -ne '1') {
   try {
-    $sumline = (Invoke-WebRequest -Uri "$url.sha256" -UseBasicParsing).Content
+    $sumline = (Invoke-WebRequest -Uri $sumUrl -UseBasicParsing).Content
   } catch {
     Remove-Item $zip -ErrorAction SilentlyContinue
     Write-Error 'warren: could not fetch checksum. Set $env:WARREN_SKIP_VERIFY=1 to bypass (not recommended).'; return

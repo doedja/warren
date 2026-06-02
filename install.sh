@@ -96,6 +96,9 @@ if [ -z "$tag" ]; then
   exit 1
 fi
 url="https://github.com/$REPO/releases/download/$tag/warren-$tag-$asset.tar.gz"
+# Checksum asset is named after the archive WITHOUT its extension:
+# warren-$tag-$asset.sha256 (not .tar.gz.sha256).
+sum_url="https://github.com/$REPO/releases/download/$tag/warren-$tag-$asset.sha256"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
@@ -113,9 +116,9 @@ fi
 # or running anything. Auto-update re-runs this script, so self-updates are
 # covered too. Fail closed; WARREN_SKIP_VERIFY=1 bypasses (not recommended).
 if [ "${WARREN_SKIP_VERIFY:-0}" != "1" ]; then
-  expected="$(fetch "$url.sha256" 2>/dev/null | awk '{print $1}' | head -n1)"
+  expected="$(fetch "$sum_url" 2>/dev/null | awk '{print $1}' | head -n1)"
   if [ -z "$expected" ]; then
-    echo "warren: could not fetch checksum ($url.sha256)." >&2
+    echo "warren: could not fetch checksum ($sum_url)." >&2
     echo "        set WARREN_SKIP_VERIFY=1 to bypass (not recommended)." >&2
     exit 1
   fi
