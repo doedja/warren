@@ -50,14 +50,15 @@ jobs:
 
   # Enforce the declared MSRV (rust-version in Cargo.toml). A build with the
   # exact pinned toolchain fails the job if a dependency or new syntax pushes the
-  # real minimum above 1.74, so the claim cannot silently rot.
+  # real minimum above 1.88, so the claim cannot silently rot. (The floor is set
+  # by the `time` crate, which requires 1.88; keep this in sync with Cargo.toml.)
   msrv:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Setup Rust 1.74
-        uses: dtolnay/rust-toolchain@1.74
+      - name: Setup Rust 1.88
+        uses: dtolnay/rust-toolchain@1.88
       - name: Cache
         uses: Swatinem/rust-cache@v2
       - name: Build on MSRV

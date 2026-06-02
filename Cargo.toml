@@ -7,7 +7,7 @@ version = "0.4.6"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/doedja/warren"
-rust-version = "1.74"
+rust-version = "1.88"
 
 [workspace.dependencies]
 # shared across crates; pinned loosely, real versions resolved by Cargo.lock
