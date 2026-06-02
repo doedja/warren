@@ -765,72 +765,67 @@ async fn install_service(args: RunArgs) -> Result<()> {
 
 /// Windows: a Scheduled Task that runs the node at startup as SYSTEM.
 ///
-/// Defined via an XML import (not the flat `/TR` form) so it can carry the
-/// parity settings the simple form cannot express: restart-on-failure (matches
-/// systemd `Restart=always` / launchd `KeepAlive`), no execution time limit (the
-/// flat form inherits the 72h default and would kill a long-running node), and
-/// run-on-batteries (laptops). Without these a crashed or long-lived node stays
-/// down until the next reboot.
+/// Built with PowerShell's ScheduledTask cmdlets, which generate schema-valid
+/// task XML for us. Hand-written XML is too fragile here: the Settings elements
+/// must appear in a fixed order, and the restart Interval has a 1-minute minimum
+/// (PT15S is rejected as "out of range"). The cmdlets give us the parity the
+/// flat `schtasks /TR` form cannot: restart-on-failure (matches systemd
+/// `Restart=always` / launchd `KeepAlive`), no execution time limit (the flat
+/// form inherits the 72h default and would kill a long-running node), and
+/// run-on-batteries. If PowerShell is unavailable or fails, fall back to the
+/// flat form so the node still starts at boot (just without auto-restart).
 fn install_windows(argv: &[String]) -> Result<()> {
-    let command = xml_escape(argv[0].as_str());
-    // Quote args containing spaces (e.g. a --name with spaces) before joining.
-    let arguments: String = argv[1..]
-        .iter()
-        .map(|a| {
-            if a.contains(' ') {
-                format!("\"{a}\"")
-            } else {
-                a.clone()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-    let arguments = xml_escape(&arguments);
-    // S-1-5-18 is the well-known SID for the local SYSTEM account.
-    let xml = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n\
-         <Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n\
-         <Triggers><BootTrigger><Enabled>true</Enabled></BootTrigger></Triggers>\n\
-         <Principals><Principal id=\"Author\"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>\n\
-         <Settings>\n\
-         <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n\
-         <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n\
-         <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n\
-         <AllowHardTerminate>true</AllowHardTerminate>\n\
-         <StartWhenAvailable>true</StartWhenAvailable>\n\
-         <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n\
-         <RestartOnFailure><Interval>PT15S</Interval><Count>999</Count></RestartOnFailure>\n\
-         <Enabled>true</Enabled>\n\
-         </Settings>\n\
-         <Actions Context=\"Author\"><Exec><Command>{command}</Command><Arguments>{arguments}</Arguments></Exec></Actions>\n\
-         </Task>\n"
+    let exe = ps_single_quote(&argv[0]);
+    let args = ps_single_quote(&argv[1..].join(" "));
+    // RestartInterval is 1 minute (the Task Scheduler minimum); ExecutionTimeLimit
+    // of zero means no limit; SYSTEM + Highest, triggered at boot.
+    let ps = format!(
+        "$ErrorActionPreference='Stop'; \
+         $a=New-ScheduledTaskAction -Execute {exe} -Argument {args}; \
+         $t=New-ScheduledTaskTrigger -AtStartup; \
+         $p=New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest; \
+         $s=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartInterval (New-TimeSpan -Minutes 1) -RestartCount 999; \
+         Register-ScheduledTask -TaskName 'warren-node' -Action $a -Trigger $t -Principal $p -Settings $s -Force | Out-Null"
     );
-    // schtasks /Create /XML wants a UTF-16 file (matching the XML declaration).
-    let dir = std::env::var("TEMP").unwrap_or_else(|_| ".".into());
-    let xml_path = format!("{dir}\\warren-node-task.xml");
-    let mut bytes: Vec<u8> = vec![0xFF, 0xFE]; // UTF-16LE BOM
-    for unit in xml.encode_utf16() {
-        bytes.extend_from_slice(&unit.to_le_bytes());
+    let registered = run_cmd_quiet(
+        "powershell",
+        &["-NoProfile", "-NonInteractive", "-Command", &ps],
+    );
+    if !registered {
+        // Fallback: the basic boot task without restart-on-failure, using the
+        // flat schtasks form that has always worked. Better a node that starts
+        // at boot than no service at all.
+        let tr = format!("\"{}\" {}", argv[0], argv[1..].join(" "));
+        run_cmd(
+            "schtasks",
+            &[
+                "/Create",
+                "/TN",
+                "warren-node",
+                "/TR",
+                tr.as_str(),
+                "/SC",
+                "ONSTART",
+                "/RU",
+                "SYSTEM",
+                "/RL",
+                "HIGHEST",
+                "/F",
+            ],
+        )
+        .context("schtasks /Create failed (run from an elevated/admin shell?)")?;
     }
-    std::fs::write(&xml_path, bytes).with_context(|| format!("write {xml_path}"))?;
-    let res = run_cmd(
-        "schtasks",
-        &["/Create", "/TN", "warren-node", "/XML", &xml_path, "/F"],
-    );
-    std::fs::remove_file(&xml_path).ok();
-    res.context("schtasks /Create failed (run from an elevated/admin shell?)")?;
-    let _ = run_cmd("schtasks", &["/Run", "/TN", "warren-node"]);
+    let _ = run_cmd_quiet("schtasks", &["/Run", "/TN", "warren-node"]);
     println!(
         "installed Windows scheduled task 'warren-node' (runs at startup, restarts on failure)"
     );
     Ok(())
 }
 
-/// Minimal XML text escaping for values embedded in the task definition.
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+/// Wrap a value as a PowerShell single-quoted literal (doubling embedded quotes),
+/// so an exe path or argument cannot break out of the -Command string.
+fn ps_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
 }
 
 fn install_systemd(argv: &[String]) -> Result<()> {

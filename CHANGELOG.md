@@ -7,6 +7,18 @@ workflow publishes each version's section here as its GitHub release notes.
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-06-02
+
+### Fixed
+- Windows node install failed with "The task XML contains a value which is
+  incorrectly formatted or out of range" (the restart Interval `PT15S` is below
+  the Task Scheduler 1-minute minimum, and hand-written task XML is order-
+  sensitive). The startup task is now built with PowerShell's ScheduledTask
+  cmdlets, which generate valid XML: restart-on-failure every 1 minute, no
+  execution time limit, run-on-batteries, SYSTEM at boot. If PowerShell is
+  unavailable it falls back to the flat `schtasks` boot task, so install never
+  hard-fails.
+
 ## [0.4.4] - 2026-06-02
 
 ### Added
@@ -146,7 +158,8 @@ workflow publishes each version's section here as its GitHub release notes.
 - Dashboard refresh: a stat strip, setup stepper, version badge, and unified copy
   buttons.
 
-[Unreleased]: https://github.com/doedja/warren/compare/v0.4.4...HEAD
+[Unreleased]: https://github.com/doedja/warren/compare/v0.4.5...HEAD
+[0.4.5]: https://github.com/doedja/warren/releases/tag/v0.4.5
 [0.4.4]: https://github.com/doedja/warren/releases/tag/v0.4.4
 [0.4.3]: https://github.com/doedja/warren/releases/tag/v0.4.3
 [0.4.2]: https://github.com/doedja/warren/releases/tag/v0.4.2
