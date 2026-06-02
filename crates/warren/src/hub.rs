@@ -11,6 +11,7 @@
 //! proxy auto-detects HTTP CONNECT, SOCKS5, and plain-HTTP on one port.
 
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
@@ -23,13 +24,15 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use clap::Args;
 use serde::{Deserialize, Serialize};
-use tokio::io::{copy_bidirectional, split, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{copy_bidirectional, split, AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::{timeout, Duration};
 use tokio_rustls::TlsAcceptor;
 
-use warren_proto::{DataHello, Greeting, Hello, HelloReply, HubToNode, NodeId, NodeToHub};
+use warren_proto::{
+    DataHello, Greeting, Hello, HelloReply, HubToNode, NodeId, NodeToHub, UdpDatagram,
+};
 
 use crate::conn::Conn;
 use crate::identity;
@@ -156,7 +159,22 @@ pub struct HubConfig {
     pub public_node_addr: Option<String>,
     pub public_proxy_addr: Option<String>,
     pub fingerprint: Option<String>,
+    /// Pre-bound UDP socket for the SOCKS5 UDP relay (shared across associations,
+    /// demuxed by client IP). `None` disables UDP ASSOCIATE.
+    pub udp_relay: Option<UdpSocket>,
 }
+
+/// A live UDP association: the channel that forwards client datagrams to the
+/// node's relay stream, and the client's source address for replies.
+struct UdpAssoc {
+    /// Bounded so a client flooding faster than its node drains drops datagrams
+    /// (UDP is lossy) instead of growing hub memory without limit.
+    to_node: mpsc::Sender<UdpDatagram>,
+    client_src: Arc<StdMutex<Option<SocketAddr>>>,
+}
+
+/// Per-association queue depth from the demux to a node's relay stream.
+const UDP_QUEUE_DEPTH: usize = 1024;
 
 struct Hub {
     store: Arc<Store>,
@@ -164,6 +182,10 @@ struct Hub {
     public_node_addr: Option<String>,
     public_proxy_addr: Option<String>,
     fingerprint: Option<String>,
+    /// Shared UDP relay socket (SOCKS5 UDP ASSOCIATE) + live associations keyed
+    /// by client IP. The relay is reachable at the proxy address on UDP.
+    udp_relay: Option<Arc<UdpSocket>>,
+    udp_assoc: Mutex<HashMap<IpAddr, UdpAssoc>>,
     nodes: Mutex<Vec<NodeEntry>>,
     /// conn_id -> (expected data-conn nonce, waker for the client). The nonce
     /// authenticates the data connection: only the node we sent the Dial to
@@ -493,6 +515,17 @@ pub async fn run(args: HubArgs) -> Result<()> {
         _ => None,
     };
 
+    // UDP relay shares the proxy address (UDP namespace), so clients send UDP
+    // datagrams to the same host:port they use for the proxy. Best-effort: if the
+    // bind fails, UDP ASSOCIATE is simply unavailable.
+    let udp_relay = match UdpSocket::bind(&args.proxy_listen).await {
+        Ok(u) => Some(u),
+        Err(e) => {
+            tracing::warn!(error = %e, addr = %args.proxy_listen, "UDP relay bind failed; UDP ASSOCIATE disabled");
+            None
+        }
+    };
+
     let cfg = HubConfig {
         store,
         tls,
@@ -500,6 +533,7 @@ pub async fn run(args: HubArgs) -> Result<()> {
         public_node_addr: args.public_node_addr,
         public_proxy_addr: args.public_proxy_addr,
         fingerprint,
+        udp_relay,
     };
     run_with_listeners(node_listener, proxy_listener, cfg).await
 }
@@ -516,6 +550,7 @@ pub async fn run_with_listeners(
         public_node_addr,
         public_proxy_addr,
         fingerprint,
+        udp_relay,
     } = cfg;
     let hub = Arc::new(Hub {
         store,
@@ -523,6 +558,8 @@ pub async fn run_with_listeners(
         public_node_addr,
         public_proxy_addr,
         fingerprint,
+        udp_relay: udp_relay.map(Arc::new),
+        udp_assoc: Mutex::new(HashMap::new()),
         nodes: Mutex::new(Vec::new()),
         pending: Mutex::new(HashMap::new()),
         rr: AtomicUsize::new(0),
@@ -532,6 +569,53 @@ pub async fn run_with_listeners(
         user_bytes: Mutex::new(HashMap::new()),
         node_stats: Mutex::new(HashMap::new()),
     });
+
+    // Central UDP demux: one socket, datagrams routed to an association by the
+    // client's source IP (set when the association is created).
+    if let Some(relay) = hub.udp_relay.clone() {
+        let h = hub.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+            loop {
+                let (n, src) = match relay.recv_from(&mut buf).await {
+                    Ok(v) => v,
+                    // UDP recv errors are typically per-datagram (e.g. an ICMP
+                    // port-unreachable surfaced on the next recv). Keep serving;
+                    // never kill the relay for every association on one error.
+                    Err(_) => continue,
+                };
+                // Look up by client IP, then drop the map lock before parsing or
+                // copying so one association cannot stall the others.
+                let assoc = {
+                    let m = h.udp_assoc.lock().await;
+                    m.get(&src.ip())
+                        .map(|a| (a.to_node.clone(), a.client_src.clone()))
+                };
+                let Some((to_node, client_src)) = assoc else {
+                    continue;
+                };
+                // Lock the association to the first client socket we hear from and
+                // ignore datagrams from any other source (anti-injection: an
+                // off-path spoof of the client IP cannot hijack the reply path).
+                {
+                    let mut cs = client_src.lock().unwrap();
+                    match *cs {
+                        None => *cs = Some(src),
+                        Some(known) if known != src => continue,
+                        _ => {}
+                    }
+                }
+                if let Some((host, port, off)) = socks5::parse_udp_header(&buf[..n]) {
+                    // Bounded queue: drop on overflow rather than grow hub memory.
+                    let _ = to_node.try_send(UdpDatagram {
+                        host,
+                        port,
+                        data: buf[off..n].to_vec(),
+                    });
+                }
+            }
+        });
+    }
 
     tracing::info!(
         node_listen = ?node_listener.local_addr().ok(),
@@ -914,7 +998,14 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
     let (mode, host, port) = if peek[0] == 0x05 {
         let verify_opt: Option<&socks5::Verifier> = if need_auth { Some(&verify) } else { None };
         match socks5::negotiate(&mut client, verify_opt).await? {
-            Some((h, p)) => (Mode::Socks5, h, p),
+            Some(socks5::Socks5Req::Connect { host, port }) => (Mode::Socks5, host, port),
+            Some(socks5::Socks5Req::UdpAssociate) => {
+                // UDP relay: a different shape from the TCP splice, so it gets its
+                // own handler. Route/user were captured by the auth closure above.
+                let route = std::mem::take(&mut *route_cell.lock().unwrap());
+                let base_user = std::mem::take(&mut *user_cell.lock().unwrap());
+                return handle_udp_associate(client, hub, route, base_user).await;
+            }
             None => return Ok(()), // rejected, reply already sent
         }
     } else {
@@ -1092,6 +1183,136 @@ async fn reject(client: &mut TcpStream, mode: &Mode) -> std::io::Result<()> {
         Mode::Connect | Mode::Http(_) => proxy::write_bad_gateway(client).await,
         Mode::Socks5 => socks5::write_reply(client, socks5::REP_GENERAL_FAILURE).await,
     }
+}
+
+/// SOCKS5 UDP ASSOCIATE: pick a node, open a UDP relay stream to it, register the
+/// association (keyed by client IP), and bridge client datagrams to/from the
+/// node's residential UDP egress. The association lives until the client's TCP
+/// control connection closes. Datagrams ride the shared relay socket; the central
+/// demux task routes inbound ones here by client IP.
+async fn handle_udp_associate(
+    mut client: TcpStream,
+    hub: Arc<Hub>,
+    route: Route,
+    base_user: String,
+) -> Result<()> {
+    let _ = &base_user; // UDP byte metering not tracked per-user yet.
+    let Some(relay) = hub.udp_relay.clone() else {
+        socks5::write_reply(&mut client, socks5::REP_GENERAL_FAILURE).await?;
+        return Ok(());
+    };
+
+    // Pick a node (route-aware), preferring healthy + least-loaded. UDP has no
+    // per-datagram failover; one node carries the whole association.
+    let nodes = match &route {
+        Route::Device(name) => hub.snapshot(Some(name)).await,
+        Route::Region(country) => hub.snapshot_region(country).await,
+        _ => hub.snapshot(None).await,
+    };
+    let chosen = nodes
+        .iter()
+        .filter(|n| n.3.load(Ordering::Relaxed) < UNHEALTHY_AT)
+        .min_by_key(|n| n.5.load(Ordering::Relaxed))
+        .or_else(|| nodes.iter().min_by_key(|n| n.5.load(Ordering::Relaxed)));
+    let Some((node_id, _name, node_tx, _fails, _host_fails, in_flight)) = chosen else {
+        socks5::write_reply(&mut client, socks5::REP_GENERAL_FAILURE).await?;
+        return Ok(());
+    };
+    let node_id = node_id.0.clone();
+    let _g = mux::InFlightGuard::new(in_flight.clone());
+
+    // Open the relay stream on the node (same conn_id/nonce handshake as a dial).
+    let conn_id = hub.next_conn_id();
+    let nonce = rand::random::<u64>();
+    let (otx, orx) = oneshot::channel::<MuxStream>();
+    hub.insert_pending(conn_id, nonce, otx).await;
+    if node_tx.send(HubToNode::UdpOpen { conn_id, nonce }).is_err() {
+        hub.take_pending(conn_id).await;
+        socks5::write_reply(&mut client, socks5::REP_GENERAL_FAILURE).await?;
+        return Ok(());
+    }
+    let stream = match timeout(Duration::from_secs(15), orx).await {
+        Ok(Ok(s)) => s,
+        _ => {
+            hub.take_pending(conn_id).await;
+            socks5::write_reply(&mut client, socks5::REP_GENERAL_FAILURE).await?;
+            return Ok(());
+        }
+    };
+    tracing::debug!(node = %node_id, "udp associate");
+
+    // Tell the client where to send datagrams BEFORE registering the association,
+    // so a failed reply write cannot leak a map entry (the client only sends
+    // datagrams after this reply, a full round trip away).
+    let client_ip = client.peer_addr()?.ip();
+    let bnd = udp_bnd_addr(&hub, &relay, &client);
+    socks5::write_reply_addr(&mut client, socks5::REP_SUCCESS, bnd).await?;
+
+    let (to_node, mut node_rx) = mpsc::channel::<UdpDatagram>(UDP_QUEUE_DEPTH);
+    let client_src = Arc::new(StdMutex::new(None::<SocketAddr>));
+    hub.udp_assoc.lock().await.insert(
+        client_ip,
+        UdpAssoc {
+            to_node,
+            client_src: client_src.clone(),
+        },
+    );
+
+    let (mut srd, mut swr) = split(stream);
+
+    // client -> node: drain the channel (fed by the central demux) to the stream.
+    let writer = tokio::spawn(async move {
+        while let Some(dg) = node_rx.recv().await {
+            if write_msg(&mut swr, &dg).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // node -> client: read replies, wrap in the SOCKS5 UDP header, send via the
+    // relay to the client's learned source address.
+    let relay_tx = relay.clone();
+    let csrc = client_src.clone();
+    let mut reader = tokio::spawn(async move {
+        while let Ok(dg) = read_msg::<_, UdpDatagram>(&mut srd).await {
+            let dest = *csrc.lock().unwrap();
+            if let Some(ca) = dest {
+                let pkt = socks5::wrap_udp(&dg.host, dg.port, &dg.data);
+                let _ = relay_tx.send_to(&pkt, ca).await;
+            }
+        }
+    });
+
+    // The association ends when EITHER the client closes its TCP control conn OR
+    // the node relay stream dies (reader task returns), so a dead node does not
+    // leak the association + tasks until the client happens to disconnect.
+    let mut ctrl = [0u8; 1];
+    tokio::select! {
+        _ = async { while client.read(&mut ctrl).await.unwrap_or(0) > 0 {} } => {}
+        _ = &mut reader => {}
+    }
+
+    hub.udp_assoc.lock().await.remove(&client_ip);
+    writer.abort();
+    reader.abort();
+    Ok(())
+}
+
+/// BND address handed to the client for UDP datagrams: the configured public
+/// proxy address if it parses (the relay is reachable there), else the local
+/// address the client connected to with the relay socket's port.
+fn udp_bnd_addr(hub: &Hub, relay: &UdpSocket, client: &TcpStream) -> SocketAddr {
+    if let Some(pa) = &hub.public_proxy_addr {
+        if let Ok(sa) = pa.parse::<SocketAddr>() {
+            return sa;
+        }
+    }
+    let port = relay.local_addr().map(|a| a.port()).unwrap_or(0);
+    let ip = client
+        .local_addr()
+        .map(|a| a.ip())
+        .unwrap_or(IpAddr::from([0u8, 0, 0, 0]));
+    SocketAddr::new(ip, port)
 }
 
 pub async fn enroll(args: EnrollArgs) -> Result<()> {

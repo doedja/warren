@@ -6,8 +6,9 @@ use serde::{Deserialize, Serialize};
 /// Protocol version. Bump on any breaking change to the message shapes OR the
 /// transport framing. v4: the node<->hub link is now a single yamux-multiplexed
 /// connection (one logical stream per request) instead of one TCP connection
-/// per request. The message shapes below are unchanged; only the framing moved.
-pub const PROTOCOL_VERSION: u16 = 4;
+/// per request. v5: adds UDP relay (SOCKS5 UDP ASSOCIATE) via `HubToNode::UdpOpen`
+/// + the `UdpDatagram` frame, so a node can carry a client's UDP traffic.
+pub const PROTOCOL_VERSION: u16 = 5;
 
 /// Stable identity the hub assigns to a node at enrollment.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -74,6 +75,25 @@ pub enum HubToNode {
     Ping {
         nonce: u64,
     },
+    /// Set up a UDP relay for a SOCKS5 UDP ASSOCIATE. Like [`Dial`] but the node
+    /// opens a relay stream (tagged with `conn_id`/`nonce` in [`DataHello`]) that
+    /// carries [`UdpDatagram`] frames instead of a raw TCP splice. Targets are
+    /// per-datagram, so no host/port here. Added at the END to keep the existing
+    /// variant discriminants stable.
+    UdpOpen {
+        conn_id: u64,
+        nonce: u64,
+    },
+}
+
+/// One UDP datagram carried over a relay stream. Hub->node: the destination to
+/// send to. Node->hub: the source a reply came from. Length-prefixed by the
+/// `warren` crate's framing, same as every other message.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UdpDatagram {
+    pub host: String,
+    pub port: u16,
+    pub data: Vec<u8>,
 }
 
 /// Messages from node to hub on the control connection after the handshake.
@@ -152,7 +172,18 @@ mod tests {
 
     #[test]
     fn test_protocol_version() {
-        assert_eq!(PROTOCOL_VERSION, 4);
+        assert_eq!(PROTOCOL_VERSION, 5);
+    }
+
+    #[test]
+    fn test_udp_datagram_roundtrip() {
+        let d = UdpDatagram {
+            host: "1.1.1.1".into(),
+            port: 53,
+            data: vec![0xde, 0xad, 0xbe, 0xef],
+        };
+        let decoded: UdpDatagram = decode(&encode(&d)).expect("decode");
+        assert_eq!(d, decoded);
     }
 
     #[test]

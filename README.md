@@ -85,7 +85,16 @@ IP). Any key works; reuse it across requests:
 curl -x http://warren-session-ab12:PASSWORD@SERVER:8000 https://api.ipify.org
 ```
 
-The dashboard's Live nodes shows each device's current **exit IP and location**.
+Or route by **region**: `user-region-COUNTRY` leaves through a device whose
+reported location matches (e.g. `warren-region-Indonesia`), with no fallback to
+other regions if none match:
+
+```bash
+curl -x http://warren-region-Indonesia:PASSWORD@SERVER:8000 https://api.ipify.org
+```
+
+The dashboard's Live nodes shows each device's **exit IP, location, health, and
+success rate**.
 
 ## Why one binary
 
@@ -130,7 +139,8 @@ approval, your proxy users, and enrollment tokens, each labeled with what it doe
 - **Pick the pool, one device, or a sticky session.** `user:pass` auto-picks a
   healthy device; `user+name:pass` pins one named device; `user-session-K:pass`
   keeps a session on one device while it stays healthy.
-- **HTTP CONNECT, SOCKS5, and plain HTTP**, all on the same port, with auth.
+- **HTTP CONNECT, SOCKS5, and plain HTTP** on one port, with auth, plus **UDP**
+  via SOCKS5 UDP ASSOCIATE (DNS, QUIC, WebRTC media) out the same device.
 - A **live web dashboard** to add devices, approve them, copy install commands,
   and see each device's current exit IP and location.
 - **Encrypted device link** (TLS on by default; the device pins the hub's key).
@@ -236,13 +246,16 @@ mint one on first run, printed in the logs).
   port. HTTPS over CONNECT is end to end: the target sees the device's IP, the hub
   only relays encrypted bytes, and the device resolves DNS (no DNS leak). It is
   per-app, not whole-machine, so only what you point at the proxy uses it.
-- **TCP only.** SOCKS5 supports CONNECT, not UDP-associate, so UDP and QUIC are
-  not carried; clients fall back to TCP. Disable QUIC/WebRTC in a browser if you
-  want a hard guarantee nothing slips around the proxy.
+- **UDP, too.** SOCKS5 UDP ASSOCIATE is supported, so UDP datagrams (DNS, QUIC /
+  HTTP3, and WebRTC media) egress through a device as well. The relay shares the
+  proxy's host:port on UDP, so a client points at the same address. Caveats: the
+  client must actually route its UDP through the proxy (native SOCKS5-UDP apps or
+  a system tun2socks do; browsers bypass SOCKS for WebRTC by default, the usual
+  "WebRTC leak"); egress targets are IPv4 for now; one association per client IP.
 - **How a device is chosen:** round-robin across the pool, biased toward devices
-  that are healthy and recently succeeded on the target host. A device that fails
-  three dials in a row is skipped until it recovers. `user+name` overrides this
-  and pins one named device.
+  that are healthy, least-loaded, and recently succeeded on the target host. A
+  device that fails three dials in a row is skipped until it recovers. `user+name`
+  overrides this and pins one named device.
 - **Failover:** the hub tries the freshest device first and retries another if one
   fails. If no device can serve, it errors out; it never quietly falls back to
   your real IP. (A pinned `user+name` request fails rather than using a different
@@ -256,9 +269,7 @@ One binary, three subcommands. Run any with `--help` for the full list.
 
 | flag | default | what it does |
 |------|---------|--------------|
-| flag | default | what it does |
-|------|---------|--------------|
-| `--listen` | `0.0.0.0:7000` | address devices dial in on (control + data) |
+| `--listen` | `0.0.0.0:7000` | address devices dial in on (one multiplexed link) |
 | `--proxy-listen` | `0.0.0.0:8000` | address apps send proxy traffic to |
 | `--public-node-addr` | none | the address devices reach the hub on; set it so the printed/dashboard join code is complete |
 | `--enroll-token` | auto | join secret; if omitted and none exists, one is generated and printed |

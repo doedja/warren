@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 use warren::hub::{run_with_listeners, HubConfig};
 use warren::node::{run_agent, RunArgs};
@@ -49,6 +49,7 @@ async fn end_to_end_proxy_through_node() {
                 public_node_addr: None,
                 public_proxy_addr: None,
                 fingerprint: None,
+                udp_relay: None,
             }
         })
         .await;
@@ -152,6 +153,7 @@ async fn rejects_bad_auth_and_allows_good() {
                 public_node_addr: None,
                 public_proxy_addr: None,
                 fingerprint: None,
+                udp_relay: None,
             }
         })
         .await;
@@ -227,6 +229,7 @@ async fn routes_to_named_device_and_rejects_unknown() {
                 public_node_addr: None,
                 public_proxy_addr: None,
                 fingerprint: None,
+                udp_relay: None,
             }
         })
         .await;
@@ -313,4 +316,121 @@ async fn proxy_attempt(
     let mut buf = [0u8; 4];
     c.read_exact(&mut buf).await?;
     Ok((200, &buf == b"PING"))
+}
+
+// End-to-end UDP: client -> hub (SOCKS5 UDP ASSOCIATE) -> node -> UDP echo -> back.
+#[tokio::test]
+async fn end_to_end_udp_associate() {
+    // 1. UDP echo server: echoes each datagram back to its sender.
+    let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let echo_addr = echo.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut b = [0u8; 2048];
+        while let Ok((n, src)) = echo.recv_from(&mut b).await {
+            let _ = echo.send_to(&b[..n], src).await;
+        }
+    });
+
+    // 2. Hub on ephemeral ports, with a UDP relay socket bound on localhost.
+    let node_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let node_addr = node_l.local_addr().unwrap();
+    let proxy_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_l.local_addr().unwrap();
+    let udp_relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    tokio::spawn(async move {
+        let store = std::sync::Arc::new(warren::store::Store::open(":memory:").unwrap());
+        store.add_token("secret", "test").unwrap();
+        let _ = run_with_listeners(
+            node_l,
+            proxy_l,
+            HubConfig {
+                store,
+                tls: None,
+                admin: None,
+                public_node_addr: None,
+                public_proxy_addr: None,
+                fingerprint: None,
+                udp_relay: Some(udp_relay),
+            },
+        )
+        .await;
+    });
+
+    // 3. One node agent.
+    tokio::spawn(async move {
+        let _ = run_agent(RunArgs {
+            join: None,
+            hub: Some(node_addr.to_string()),
+            token: Some("secret".into()),
+            key_file: Some(format!(
+                "{}/warren-e2e-udp.key",
+                std::env::temp_dir().display()
+            )),
+            name: "udp-node".into(),
+            tls: false,
+            hub_fingerprint: None,
+            insecure: false,
+        })
+        .await;
+    });
+
+    // 4. Retry the whole associate+datagram until the node has enrolled.
+    let mut last = String::from("never attempted");
+    for _ in 0..50 {
+        match try_udp(proxy_addr, echo_addr).await {
+            Ok(true) => return,
+            Ok(false) => last = "wrong echo".to_string(),
+            Err(e) => last = e.to_string(),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("udp associate never round-tripped: {last}");
+}
+
+/// One SOCKS5 UDP ASSOCIATE attempt: handshake over TCP, learn the relay addr,
+/// send a wrapped datagram to the echo server, and check it comes back.
+async fn try_udp(proxy_addr: SocketAddr, echo_addr: SocketAddr) -> std::io::Result<bool> {
+    let mut c = TcpStream::connect(proxy_addr).await?;
+    // SOCKS5 greeting: 1 method, no-auth.
+    c.write_all(&[0x05, 0x01, 0x00]).await?;
+    c.flush().await?;
+    let mut m = [0u8; 2];
+    c.read_exact(&mut m).await?;
+    if m != [0x05, 0x00] {
+        return Ok(false);
+    }
+    // UDP ASSOCIATE request: VER CMD=3 RSV ATYP=IPv4 0.0.0.0:0.
+    c.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await?;
+    c.flush().await?;
+    // Reply: VER REP RSV ATYP(=IPv4) BND.ADDR(4) BND.PORT(2).
+    let mut rep = [0u8; 4];
+    c.read_exact(&mut rep).await?;
+    if rep[1] != 0x00 || rep[3] != 0x01 {
+        return Ok(false);
+    }
+    let mut a = [0u8; 4];
+    c.read_exact(&mut a).await?;
+    let mut p = [0u8; 2];
+    c.read_exact(&mut p).await?;
+    let bnd = SocketAddr::from((a, u16::from_be_bytes(p)));
+
+    // Send a wrapped datagram to the echo server via the relay, expect it back.
+    let cudp = UdpSocket::bind("127.0.0.1:0").await?;
+    let ip = match echo_addr.ip() {
+        std::net::IpAddr::V4(v) => v.to_string(),
+        std::net::IpAddr::V6(v) => v.to_string(),
+    };
+    let dgram = warren::socks5::wrap_udp(&ip, echo_addr.port(), b"pong");
+    cudp.send_to(&dgram, bnd).await?;
+
+    let mut buf = [0u8; 2048];
+    let n = match tokio::time::timeout(Duration::from_millis(800), cudp.recv_from(&mut buf)).await {
+        Ok(Ok((n, _))) => n,
+        _ => return Ok(false),
+    };
+    match warren::socks5::parse_udp_header(&buf[..n]) {
+        Some((_, _, off)) => Ok(&buf[off..n] == b"pong"),
+        None => Ok(false),
+    }
 }

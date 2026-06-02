@@ -1,9 +1,12 @@
 //! Minimal SOCKS5 server (RFC 1928 + 1929 username/password auth).
 //!
-//! Only the CONNECT command is supported (TCP). [`negotiate`] runs the method
-//! handshake, optional user/pass auth, and reads the CONNECT request, returning
-//! the target. The caller dials a node, then sends [`write_reply`] before
-//! splicing.
+//! CONNECT (TCP) and UDP ASSOCIATE (UDP relay) are supported. [`negotiate`] runs
+//! the method handshake, optional user/pass auth, and reads the request,
+//! returning a [`Socks5Req`]. For CONNECT the caller dials a node and sends
+//! [`write_reply`] before splicing; for UDP ASSOCIATE the caller binds a relay
+//! socket and replies with its address via [`write_reply_addr`].
+
+use std::net::SocketAddr;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -12,10 +15,25 @@ const METHOD_NOAUTH: u8 = 0x00;
 const METHOD_USERPASS: u8 = 0x02;
 const METHOD_NONE: u8 = 0xFF;
 const CMD_CONNECT: u8 = 0x01;
+const CMD_UDP_ASSOCIATE: u8 = 0x03;
+const ATYP_IPV4: u8 = 0x01;
+const ATYP_DOMAIN: u8 = 0x03;
+const ATYP_IPV6: u8 = 0x04;
 
 /// SOCKS5 reply codes (subset).
 pub const REP_SUCCESS: u8 = 0x00;
 pub const REP_GENERAL_FAILURE: u8 = 0x01;
+
+/// What the client asked for after the handshake.
+#[derive(Debug, PartialEq)]
+pub enum Socks5Req {
+    /// CONNECT to a TCP target.
+    Connect { host: String, port: u16 },
+    /// UDP ASSOCIATE: the client wants a UDP relay. Its declared source address
+    /// is advisory (often 0.0.0.0:0), so we drop it and learn the real source
+    /// from the first datagram.
+    UdpAssociate,
+}
 
 /// Username/password verifier: `(user, pass) -> ok`.
 pub type Verifier = dyn Fn(&str, &str) -> bool + Send + Sync;
@@ -24,14 +42,13 @@ fn invalid(msg: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg)
 }
 
-/// Run the SOCKS5 handshake. Returns `Some((host, port))` when a CONNECT
-/// request is accepted and ready to dial; `None` when the client was rejected
-/// (auth/method failure or unsupported command), with the rejection already
-/// written.
+/// Run the SOCKS5 handshake. Returns `Some(Socks5Req)` when a CONNECT or UDP
+/// ASSOCIATE request is accepted; `None` when the client was rejected (auth /
+/// method failure or unsupported command), with the rejection already written.
 pub async fn negotiate<S: AsyncRead + AsyncWrite + Unpin>(
     s: &mut S,
     verify: Option<&Verifier>,
-) -> std::io::Result<Option<(String, u16)>> {
+) -> std::io::Result<Option<Socks5Req>> {
     // Greeting: VER, NMETHODS, METHODS...
     let mut head = [0u8; 2];
     s.read_exact(&mut head).await?;
@@ -73,24 +90,43 @@ pub async fn negotiate<S: AsyncRead + AsyncWrite + Unpin>(
     if req[0] != VER {
         return Err(invalid("bad request version"));
     }
-    if req[1] != CMD_CONNECT {
-        write_reply(s, 0x07).await?; // command not supported
-        return Ok(None);
+    match req[1] {
+        CMD_CONNECT => {
+            let (host, port) = read_addr_port(s, req[3]).await?;
+            Ok(Some(Socks5Req::Connect { host, port }))
+        }
+        CMD_UDP_ASSOCIATE => {
+            // Consume the declared source addr+port (advisory; we learn the real
+            // source from the first relayed datagram) and accept the associate.
+            let _ = read_addr_port(s, req[3]).await?;
+            Ok(Some(Socks5Req::UdpAssociate))
+        }
+        _ => {
+            write_reply(s, 0x07).await?; // command not supported
+            Ok(None)
+        }
     }
-    let host = match req[3] {
-        0x01 => {
+}
+
+/// Read ATYP-tagged address + 2-byte port from the request body.
+async fn read_addr_port<S: AsyncRead + Unpin>(
+    s: &mut S,
+    atyp: u8,
+) -> std::io::Result<(String, u16)> {
+    let host = match atyp {
+        ATYP_IPV4 => {
             let mut a = [0u8; 4];
             s.read_exact(&mut a).await?;
             std::net::Ipv4Addr::new(a[0], a[1], a[2], a[3]).to_string()
         }
-        0x03 => {
+        ATYP_DOMAIN => {
             let mut len = [0u8; 1];
             s.read_exact(&mut len).await?;
             let mut name = vec![0u8; len[0] as usize];
             s.read_exact(&mut name).await?;
             String::from_utf8(name).map_err(|_| invalid("bad domain"))?
         }
-        0x04 => {
+        ATYP_IPV6 => {
             let mut a = [0u8; 16];
             s.read_exact(&mut a).await?;
             let segs: [u16; 8] =
@@ -100,16 +136,11 @@ pub async fn negotiate<S: AsyncRead + AsyncWrite + Unpin>(
             )
             .to_string()
         }
-        _ => {
-            write_reply(s, 0x08).await?; // address type not supported
-            return Ok(None);
-        }
+        _ => return Err(invalid("address type not supported")),
     };
     let mut port = [0u8; 2];
     s.read_exact(&mut port).await?;
-    let port = u16::from_be_bytes(port);
-
-    Ok(Some((host, port)))
+    Ok((host, u16::from_be_bytes(port)))
 }
 
 async fn userpass_auth<S: AsyncRead + AsyncWrite + Unpin>(
@@ -148,6 +179,97 @@ pub async fn write_reply<S: AsyncWrite + Unpin>(s: &mut S, code: u8) -> std::io:
     s.flush().await
 }
 
+/// Write a SOCKS5 reply carrying a real bound address. Used for UDP ASSOCIATE,
+/// where the client must learn the relay socket to send its datagrams to.
+pub async fn write_reply_addr<S: AsyncWrite + Unpin>(
+    s: &mut S,
+    code: u8,
+    addr: SocketAddr,
+) -> std::io::Result<()> {
+    let mut out = vec![VER, code, 0x00];
+    match addr {
+        SocketAddr::V4(a) => {
+            out.push(ATYP_IPV4);
+            out.extend_from_slice(&a.ip().octets());
+        }
+        SocketAddr::V6(a) => {
+            out.push(ATYP_IPV6);
+            out.extend_from_slice(&a.ip().octets());
+        }
+    }
+    out.extend_from_slice(&addr.port().to_be_bytes());
+    s.write_all(&out).await?;
+    s.flush().await
+}
+
+/// Parse a SOCKS5 UDP request header (RFC 1928 sec 7) off a datagram the client
+/// sent to the relay: RSV(2) FRAG(1) ATYP ADDR PORT(2) DATA. Returns
+/// `(host, port, data_offset)`. Returns None on a short buffer, an unknown ATYP,
+/// or a fragmented datagram (FRAG != 0), which we do not reassemble.
+pub fn parse_udp_header(buf: &[u8]) -> Option<(String, u16, usize)> {
+    if buf.len() < 4 || buf[2] != 0 {
+        return None;
+    }
+    let (host, i) = match buf[3] {
+        ATYP_IPV4 => {
+            if buf.len() < 10 {
+                return None;
+            }
+            (
+                std::net::Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]).to_string(),
+                8,
+            )
+        }
+        ATYP_DOMAIN => {
+            let len = *buf.get(4)? as usize;
+            let end = 5 + len;
+            if buf.len() < end + 2 {
+                return None;
+            }
+            (String::from_utf8(buf[5..end].to_vec()).ok()?, end)
+        }
+        ATYP_IPV6 => {
+            if buf.len() < 22 {
+                return None;
+            }
+            let segs: [u16; 8] =
+                std::array::from_fn(|k| u16::from_be_bytes([buf[4 + 2 * k], buf[4 + 2 * k + 1]]));
+            (
+                std::net::Ipv6Addr::new(
+                    segs[0], segs[1], segs[2], segs[3], segs[4], segs[5], segs[6], segs[7],
+                )
+                .to_string(),
+                20,
+            )
+        }
+        _ => return None,
+    };
+    let port = u16::from_be_bytes([buf[i], buf[i + 1]]);
+    Some((host, port, i + 2))
+}
+
+/// Build a SOCKS5 UDP reply datagram for a packet coming back from `host:port`:
+/// the RSV/FRAG/ATYP/ADDR/PORT header followed by `data`, ready to send to the
+/// client's UDP socket.
+pub fn wrap_udp(host: &str, port: u16, data: &[u8]) -> Vec<u8> {
+    let mut out = vec![0x00, 0x00, 0x00]; // RSV, RSV, FRAG=0
+    if let Ok(v4) = host.parse::<std::net::Ipv4Addr>() {
+        out.push(ATYP_IPV4);
+        out.extend_from_slice(&v4.octets());
+    } else if let Ok(v6) = host.parse::<std::net::Ipv6Addr>() {
+        out.push(ATYP_IPV6);
+        out.extend_from_slice(&v6.octets());
+    } else {
+        let h = host.as_bytes();
+        out.push(ATYP_DOMAIN);
+        out.push(h.len() as u8);
+        out.extend_from_slice(h);
+    }
+    out.extend_from_slice(&port.to_be_bytes());
+    out.extend_from_slice(data);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,7 +290,45 @@ mod tests {
         let server = bytes; // client-to-server stream
         let mut io = tokio_test_duplex(server).await;
         let got = negotiate(&mut io, None).await.unwrap();
-        assert_eq!(got, Some(("example.com".to_string(), 443)));
+        assert_eq!(
+            got,
+            Some(Socks5Req::Connect {
+                host: "example.com".to_string(),
+                port: 443
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn negotiate_udp_associate() {
+        // greeting + request: CMD=UDP_ASSOCIATE, ATYP=IPv4, 0.0.0.0:0 (advisory).
+        let mut v = vec![VER, 1, METHOD_NOAUTH];
+        v.extend_from_slice(&[VER, CMD_UDP_ASSOCIATE, 0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0]);
+        let mut io = tokio_test_duplex(v).await;
+        let got = negotiate(&mut io, None).await.unwrap();
+        assert_eq!(got, Some(Socks5Req::UdpAssociate));
+    }
+
+    #[test]
+    fn udp_header_roundtrip() {
+        // wrap_udp builds a reply header; parse_udp_header reads a request header.
+        // Same on-wire layout, so a wrap then parse round-trips host/port/data.
+        let dgram = wrap_udp("1.1.1.1", 53, b"\xde\xad");
+        let (host, port, off) = parse_udp_header(&dgram).expect("parse");
+        assert_eq!((host.as_str(), port), ("1.1.1.1", 53));
+        assert_eq!(&dgram[off..], b"\xde\xad");
+    }
+
+    #[test]
+    fn udp_header_domain_and_fragment() {
+        let dgram = wrap_udp("dns.example", 5353, b"x");
+        let (host, port, off) = parse_udp_header(&dgram).expect("parse domain");
+        assert_eq!((host.as_str(), port), ("dns.example", 5353));
+        assert_eq!(&dgram[off..], b"x");
+        // FRAG != 0 is rejected (we do not reassemble).
+        let mut frag = dgram.clone();
+        frag[2] = 1;
+        assert!(parse_udp_header(&frag).is_none());
     }
 
     #[tokio::test]

@@ -17,13 +17,14 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Args, Subcommand};
 use rand::Rng;
 use tokio::io::{copy_bidirectional, split};
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch};
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::TlsConnector;
 
 use warren_proto::{
-    DataHello, Greeting, Hello, HelloReply, HubToNode, NodeToHub, Platform, PROTOCOL_VERSION,
+    DataHello, Greeting, Hello, HelloReply, HubToNode, NodeToHub, Platform, UdpDatagram,
+    PROTOCOL_VERSION,
 };
 
 use crate::conn::Conn;
@@ -374,6 +375,15 @@ async fn connect_once(
                                 handle_dial(opener, conn_id, nonce, host, port, ntx2).await;
                             });
                         }
+                        HubToNode::UdpOpen { conn_id, nonce } => {
+                            let opener = opener.clone();
+                            let ntx2 = ntx.clone();
+                            let guard = mux::InFlightGuard::new(in_flight.clone());
+                            tokio::spawn(async move {
+                                let _g = guard;
+                                handle_udp(opener, conn_id, nonce, ntx2).await;
+                            });
+                        }
                     },
                     Ok(Err(e)) => break 'read Err(e.into()),
                     Err(_) => break 'read Err(anyhow!("node<->hub read timed out (dead hub)")),
@@ -476,6 +486,70 @@ async fn handle_dial(
     }
 
     let _ = copy_bidirectional(&mut data, &mut target).await;
+}
+
+/// Serve a UDP relay for a SOCKS5 UDP ASSOCIATE: open the relay stream, then
+/// bridge `UdpDatagram` frames to/from a residential UDP egress socket. One
+/// socket carries every target the client talks to on this association; replies
+/// are framed back tagged with the responder's address. Ends when the stream or
+/// the egress socket closes.
+async fn handle_udp(
+    opener: mux::Opener,
+    conn_id: u64,
+    nonce: u64,
+    ntx: mpsc::UnboundedSender<NodeToHub>,
+) {
+    let mut stream = match mux::open(&opener).await {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = ntx.send(NodeToHub::DialFailed {
+                conn_id,
+                reason: format!("open udp stream: {e}"),
+            });
+            return;
+        }
+    };
+    if let Err(e) = write_msg(&mut stream, &Greeting::Data(DataHello { conn_id, nonce })).await {
+        let _ = ntx.send(NodeToHub::DialFailed {
+            conn_id,
+            reason: format!("udp hello: {e}"),
+        });
+        return;
+    }
+    let udp = match UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).await {
+        Ok(u) => Arc::new(u),
+        Err(e) => {
+            let _ = ntx.send(NodeToHub::DialFailed {
+                conn_id,
+                reason: format!("udp bind: {e}"),
+            });
+            return;
+        }
+    };
+
+    let (mut srd, mut swr) = split(stream);
+
+    // Egress replies -> hub, tagged with the responder's address.
+    let udp_rx = udp.clone();
+    let reader = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+        while let Ok((n, src)) = udp_rx.recv_from(&mut buf).await {
+            let dg = UdpDatagram {
+                host: src.ip().to_string(),
+                port: src.port(),
+                data: buf[..n].to_vec(),
+            };
+            if write_msg(&mut swr, &dg).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Client datagrams from the hub -> the target, from this node's egress.
+    while let Ok(dg) = read_msg::<_, UdpDatagram>(&mut srd).await {
+        let _ = udp.send_to(&dg.data, (dg.host.as_str(), dg.port)).await;
+    }
+    reader.abort();
 }
 
 const SYSTEMD_UNIT: &str = "/etc/systemd/system/warren-node.service";
