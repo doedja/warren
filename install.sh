@@ -182,9 +182,15 @@ if [ "$#" -gt 0 ] && [ "$termux" = 1 ]; then
   # Android: no systemd/launchd; wire up wake-lock + boot-restart + start now.
   setup_termux "$@"
 elif [ "$#" -gt 0 ]; then
-  # Register a boot service with the passed args (needs root for systemd).
+  # Register a boot service with the passed args.
   echo "warren: installing node service..." >&2
-  if [ "$(id -u)" = "0" ]; then
+  # macOS uses a per-user LaunchAgent: it must be installed AS the user, never
+  # under sudo. A root `launchctl` load targets the wrong domain and the agent
+  # silently never starts. systemd (Linux) is a system service and does need
+  # root, so only escalate there.
+  if [ "$os" = "Darwin" ]; then
+    "$dest" node install "$@"
+  elif [ "$(id -u)" = "0" ]; then
     "$dest" node install "$@"
   elif [ -n "$sudo" ]; then
     $sudo "$dest" node install "$@"

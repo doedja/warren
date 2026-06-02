@@ -90,6 +90,16 @@ if (-not $found) { Write-Error 'warren: warren.exe not found in archive.'; retur
 if ($found.FullName -ne $exe) { Copy-Item $found.FullName $exe -Force }
 Write-Host "warren: installed at $exe"
 
+# Registering the SYSTEM startup task needs an elevated shell. Check up front so
+# the failure is a clear message, not a cryptic schtasks "Access is denied".
+if ($Join -or $Hub) {
+  $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
+  if (-not $isAdmin) {
+    Write-Error 'warren: registering the startup service needs an elevated PowerShell (Run as Administrator). The binary is installed; re-run elevated to register the node, or run it manually with "warren node run".'
+    return
+  }
+}
+
 if ($Join) {
   $a = @('node', 'install', '--join', $Join)
   if ($Name) { $a += @('--name', $Name) }

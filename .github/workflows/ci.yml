@@ -24,3 +24,26 @@ jobs:
         run: cargo build --verbose
       - name: Test
         run: cargo test --verbose
+
+  # Compile (build + clippy) on macOS and Windows so the platform-specific
+  # service-install paths (launchd, schtasks) are actually checked on their real
+  # targets. The ubuntu job above owns fmt + tests.
+  cross-compile:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Build
+        run: cargo build --verbose

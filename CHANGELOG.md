@@ -7,6 +7,34 @@ workflow publishes each version's section here as its GitHub release notes.
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-06-02
+
+### Fixed
+- macOS node install no longer requires (and must not use) `sudo`. A launchd
+  LaunchAgent is per-user: when the installer ran it under `sudo`, the root
+  `launchctl load` targeted the wrong domain, so the agent silently never
+  started and the node never appeared on the hub. `install.sh` now installs the
+  service as the user on macOS, and `node install` loads into the user's GUI
+  domain (`gui/<uid>`).
+- macOS install run as root anyway (`sudo sh install.sh`, or a root shell) now
+  resolves the real login user (`SUDO_USER`, else the console session owner),
+  bootstraps into that user's domain, and `chown`s the plist back to them so no
+  root-owned agent is left behind and later upgrades/uninstalls work without
+  sudo.
+- macOS (re)install rides out the launchd `bootout`/`bootstrap` race
+  (KeepAlive teardown settles asynchronously and an immediate bootstrap can fail
+  with EIO): it retries, then falls back to the legacy `load -w`.
+
+### Changed
+- Windows startup task is now defined from a task XML so it carries
+  restart-on-failure (parity with systemd `Restart=always` / launchd
+  `KeepAlive`: a crashed node recovers instead of staying down until reboot), no
+  execution time limit (the flat form inherited the 72h default), and
+  run-on-batteries. `install.ps1` checks for an elevated shell up front and
+  fails with a clear message instead of a cryptic `schtasks` access error.
+- CI now also compiles (build + clippy) on macOS and Windows, so the
+  platform-specific service-install paths are checked on their real targets.
+
 ## [0.4.2] - 2026-06-02
 
 ### Added
@@ -96,7 +124,8 @@ workflow publishes each version's section here as its GitHub release notes.
 - Dashboard refresh: a stat strip, setup stepper, version badge, and unified copy
   buttons.
 
-[Unreleased]: https://github.com/doedja/warren/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/doedja/warren/compare/v0.4.3...HEAD
+[0.4.3]: https://github.com/doedja/warren/releases/tag/v0.4.3
 [0.4.2]: https://github.com/doedja/warren/releases/tag/v0.4.2
 [0.4.1]: https://github.com/doedja/warren/releases/tag/v0.4.1
 [0.4.0]: https://github.com/doedja/warren/releases/tag/v0.4.0

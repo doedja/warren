@@ -764,29 +764,73 @@ async fn install_service(args: RunArgs) -> Result<()> {
 }
 
 /// Windows: a Scheduled Task that runs the node at startup as SYSTEM.
+///
+/// Defined via an XML import (not the flat `/TR` form) so it can carry the
+/// parity settings the simple form cannot express: restart-on-failure (matches
+/// systemd `Restart=always` / launchd `KeepAlive`), no execution time limit (the
+/// flat form inherits the 72h default and would kill a long-running node), and
+/// run-on-batteries (laptops). Without these a crashed or long-lived node stays
+/// down until the next reboot.
 fn install_windows(argv: &[String]) -> Result<()> {
-    // /TR takes one string; quote the exe path, append the rest.
-    let tr = format!("\"{}\" {}", argv[0], argv[1..].join(" "));
-    run_cmd(
+    let command = xml_escape(argv[0].as_str());
+    // Quote args containing spaces (e.g. a --name with spaces) before joining.
+    let arguments: String = argv[1..]
+        .iter()
+        .map(|a| {
+            if a.contains(' ') {
+                format!("\"{a}\"")
+            } else {
+                a.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let arguments = xml_escape(&arguments);
+    // S-1-5-18 is the well-known SID for the local SYSTEM account.
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n\
+         <Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n\
+         <Triggers><BootTrigger><Enabled>true</Enabled></BootTrigger></Triggers>\n\
+         <Principals><Principal id=\"Author\"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>\n\
+         <Settings>\n\
+         <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n\
+         <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n\
+         <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n\
+         <AllowHardTerminate>true</AllowHardTerminate>\n\
+         <StartWhenAvailable>true</StartWhenAvailable>\n\
+         <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n\
+         <RestartOnFailure><Interval>PT15S</Interval><Count>999</Count></RestartOnFailure>\n\
+         <Enabled>true</Enabled>\n\
+         </Settings>\n\
+         <Actions Context=\"Author\"><Exec><Command>{command}</Command><Arguments>{arguments}</Arguments></Exec></Actions>\n\
+         </Task>\n"
+    );
+    // schtasks /Create /XML wants a UTF-16 file (matching the XML declaration).
+    let dir = std::env::var("TEMP").unwrap_or_else(|_| ".".into());
+    let xml_path = format!("{dir}\\warren-node-task.xml");
+    let mut bytes: Vec<u8> = vec![0xFF, 0xFE]; // UTF-16LE BOM
+    for unit in xml.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    std::fs::write(&xml_path, bytes).with_context(|| format!("write {xml_path}"))?;
+    let res = run_cmd(
         "schtasks",
-        &[
-            "/Create",
-            "/TN",
-            "warren-node",
-            "/TR",
-            tr.as_str(),
-            "/SC",
-            "ONSTART",
-            "/RU",
-            "SYSTEM",
-            "/RL",
-            "HIGHEST",
-            "/F",
-        ],
-    )?;
+        &["/Create", "/TN", "warren-node", "/XML", &xml_path, "/F"],
+    );
+    std::fs::remove_file(&xml_path).ok();
+    res.context("schtasks /Create failed (run from an elevated/admin shell?)")?;
     let _ = run_cmd("schtasks", &["/Run", "/TN", "warren-node"]);
-    println!("installed Windows scheduled task 'warren-node' (runs at startup)");
+    println!(
+        "installed Windows scheduled task 'warren-node' (runs at startup, restarts on failure)"
+    );
     Ok(())
+}
+
+/// Minimal XML text escaping for values embedded in the task definition.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn install_systemd(argv: &[String]) -> Result<()> {
@@ -812,7 +856,14 @@ fn install_systemd(argv: &[String]) -> Result<()> {
 }
 
 fn install_launchd(argv: &[String]) -> Result<()> {
-    let plist_path = launchd_path()?;
+    // A launchd LaunchAgent is per-user. It must be loaded into the target
+    // user's GUI domain (gui/<uid>), not root's. If the installer runs as root
+    // (curl | sudo sh, or `sudo warren node install`), a root `launchctl load`
+    // lands the agent in the wrong domain and it silently never starts. Resolve
+    // the real login user instead, and chown the plist to them so it stays
+    // user-managed (an upgrade/uninstall later runs without sudo).
+    let t = macos_target()?;
+    let plist_path = format!("{}/Library/LaunchAgents/{LAUNCHD_LABEL}.plist", t.home);
     let args_xml: String = argv
         .iter()
         .map(|a| format!("    <string>{a}</string>\n"))
@@ -829,17 +880,158 @@ fn install_launchd(argv: &[String]) -> Result<()> {
     );
     if let Some(dir) = std::path::Path::new(&plist_path).parent() {
         std::fs::create_dir_all(dir).ok();
+        // If we ran as root, the LaunchAgents dir we may have just created is
+        // root-owned; hand it back to the user so they can manage it.
+        if current_euid() == 0 {
+            chown_to(&dir.to_string_lossy(), t.uid, t.gid);
+        }
     }
     std::fs::write(&plist_path, plist).with_context(|| format!("write {plist_path}"))?;
-    run_cmd("launchctl", &["load", "-w", &plist_path])?;
-    println!("installed and loaded launchd agent: {plist_path}");
+    if current_euid() == 0 {
+        chown_to(&plist_path, t.uid, t.gid);
+    }
+    let domain = format!("gui/{}", t.uid);
+    load_launchd(&domain, &plist_path)?;
+    println!("installed and loaded launchd agent: {plist_path} (domain {domain})");
     Ok(())
 }
 
-fn launchd_path() -> Result<String> {
-    let home = std::env::var("HOME").context("HOME not set")?;
-    Ok(format!("{home}/Library/LaunchAgents/{LAUNCHD_LABEL}.plist"))
+/// (Re)load a LaunchAgent into a GUI domain. bootout + bootstrap is the modern
+/// path; a KeepAlive service torn down by bootout settles asynchronously, so an
+/// immediate bootstrap can fail with EIO (error 5). Retry a few times, then fall
+/// back to the legacy `load -w` for pre-bootstrap macOS.
+fn load_launchd(domain: &str, plist_path: &str) -> Result<()> {
+    let service = format!("{domain}/{LAUNCHD_LABEL}");
+    let _ = run_cmd_quiet("launchctl", &["bootout", &service]);
+    for _ in 0..4 {
+        if run_cmd_quiet("launchctl", &["bootstrap", domain, plist_path]) {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        let _ = run_cmd_quiet("launchctl", &["bootout", &service]);
+    }
+    // Loud fallback: surfaces the real launchctl error if this also fails.
+    run_cmd("launchctl", &["load", "-w", plist_path])
 }
+
+/// The user the agent should run as: uid, gid, and home directory.
+struct MacTarget {
+    uid: u32,
+    gid: u32,
+    home: String,
+}
+
+/// Resolve the login user even when the installer runs as root. Priority:
+/// SUDO_USER (sudo), then the console (GUI session) owner (plain root), then the
+/// current user. Loading an agent into root's own domain (gui/0) does not work,
+/// so root installs must target the human user's domain.
+fn macos_target() -> Result<MacTarget> {
+    let user = std::env::var("SUDO_USER")
+        .ok()
+        .filter(|u| !u.trim().is_empty())
+        .map(|u| u.trim().to_string())
+        .or_else(|| {
+            if current_euid() == 0 {
+                console_user()
+            } else {
+                None
+            }
+        });
+    if let Some(user) = user {
+        let uid = id_num("-u", &user).with_context(|| format!("resolve uid for {user}"))?;
+        let gid = id_num("-g", &user).with_context(|| format!("resolve gid for {user}"))?;
+        return Ok(MacTarget {
+            uid,
+            gid,
+            home: home_for_user(&user),
+        });
+    }
+    Ok(MacTarget {
+        uid: current_euid(),
+        gid: current_egid(),
+        home: std::env::var("HOME").context("HOME not set")?,
+    })
+}
+
+/// The GUI/console session owner (`stat -f%Su /dev/console`), or None when it is
+/// root/loginwindow (no human session to target).
+fn console_user() -> Option<String> {
+    let out = std::process::Command::new("stat")
+        .args(["-f", "%Su", "/dev/console"])
+        .output()
+        .ok()?;
+    let user = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    if user.is_empty() || user == "root" || user == "loginwindow" {
+        None
+    } else {
+        Some(user)
+    }
+}
+
+/// `id <flag> <user>` as a number (e.g. `id -u alice`).
+fn id_num(flag: &str, user: &str) -> Result<u32> {
+    let out = std::process::Command::new("id")
+        .args([flag, user])
+        .output()?;
+    String::from_utf8(out.stdout)?
+        .trim()
+        .parse::<u32>()
+        .map_err(Into::into)
+}
+
+fn current_euid() -> u32 {
+    id_self("-u")
+}
+
+fn current_egid() -> u32 {
+    id_self("-g")
+}
+
+fn id_self(flag: &str) -> u32 {
+    std::process::Command::new("id")
+        .arg(flag)
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+/// Look up a macOS user's home dir (dscl), falling back to the /Users convention.
+fn home_for_user(user: &str) -> String {
+    if let Ok(out) = std::process::Command::new("dscl")
+        .args([".", "-read", &format!("/Users/{user}"), "NFSHomeDirectory"])
+        .output()
+    {
+        if let Ok(s) = String::from_utf8(out.stdout) {
+            if let Some(path) = s.split_whitespace().last() {
+                if path.starts_with('/') {
+                    return path.to_string();
+                }
+            }
+        }
+    }
+    format!("/Users/{user}")
+}
+
+fn run_cmd_quiet(cmd: &str, args: &[&str]) -> bool {
+    std::process::Command::new(cmd)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// chown a path to (uid, gid). No-op on non-unix (the crate also builds for
+/// Windows, where std::os::unix is absent and this path never runs).
+#[cfg(unix)]
+fn chown_to(path: &str, uid: u32, gid: u32) {
+    let _ = std::os::unix::fs::chown(path, Some(uid), Some(gid));
+}
+#[cfg(not(unix))]
+fn chown_to(_path: &str, _uid: u32, _gid: u32) {}
 
 async fn uninstall_service() -> Result<()> {
     match current_platform() {
@@ -850,8 +1042,13 @@ async fn uninstall_service() -> Result<()> {
             println!("removed systemd service: warren-node");
         }
         Platform::MacOs => {
-            let plist_path = launchd_path()?;
-            let _ = run_cmd("launchctl", &["unload", "-w", &plist_path]);
+            let t = macos_target()?;
+            let plist_path = format!("{}/Library/LaunchAgents/{LAUNCHD_LABEL}.plist", t.home);
+            let service = format!("gui/{}/{LAUNCHD_LABEL}", t.uid);
+            // bootout the modern way; fall back to legacy unload.
+            if !run_cmd_quiet("launchctl", &["bootout", &service]) {
+                let _ = run_cmd_quiet("launchctl", &["unload", "-w", &plist_path]);
+            }
             std::fs::remove_file(&plist_path).ok();
             println!("removed launchd agent: {plist_path}");
         }
