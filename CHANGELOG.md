@@ -7,6 +7,28 @@ workflow publishes each version's section here as its GitHub release notes.
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-06-02
+
+### Added
+- Node groups via enrollment tokens. The token's name is now a group label:
+  every node that joins with a given token belongs to that group, and a client
+  can route through the whole group with the proxy username `user-group-NAME`
+  (case-insensitive, no fallback if the group is empty), alongside the existing
+  `+device`, `-region-`, and `-session-` selectors. Pure hub-side routing, no
+  protocol change, existing nodes unaffected.
+- Dashboard: each node shows its group as a badge next to its name; each
+  enrollment token has a "rename" button (renaming relabels the group; connected
+  nodes pick up the new label on their next reconnect) and a "copy group cmd"
+  button that yields the ready `user-group-NAME` curl.
+
+### Changed
+- Enrollment-token names are now validated on create and rename (the name
+  doubles as the `user-group-NAME` routing selector). Names are restricted to
+  `[A-Za-z0-9._-]` and may not contain the reserved routing markers
+  (`-region-`, `-session-`, `-group-`), so a name can no longer break the copied
+  group curl or be silently swallowed by `parse_route`. The API rejects an
+  invalid or empty name with 400.
+
 ## [0.4.3] - 2026-06-02
 
 ### Fixed
@@ -124,7 +146,8 @@ workflow publishes each version's section here as its GitHub release notes.
 - Dashboard refresh: a stat strip, setup stepper, version badge, and unified copy
   buttons.
 
-[Unreleased]: https://github.com/doedja/warren/compare/v0.4.3...HEAD
+[Unreleased]: https://github.com/doedja/warren/compare/v0.4.4...HEAD
+[0.4.4]: https://github.com/doedja/warren/releases/tag/v0.4.4
 [0.4.3]: https://github.com/doedja/warren/releases/tag/v0.4.3
 [0.4.2]: https://github.com/doedja/warren/releases/tag/v0.4.2
 [0.4.1]: https://github.com/doedja/warren/releases/tag/v0.4.1

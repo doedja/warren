@@ -93,6 +93,15 @@ other regions if none match:
 curl -x http://warren-region-Indonesia:PASSWORD@SERVER:8000 https://api.ipify.org
 ```
 
+Or route by **group**: every node that enrolled with the same token is a group,
+named after that token. `user-group-NAME` leaves through any node in the group
+(no fallback if it is empty), so one token can stand for "my home boxes" or "the
+US batch". Rename a token on the dashboard to relabel its group:
+
+```bash
+curl -x http://warren-group-residential:PASSWORD@SERVER:8000 https://api.ipify.org
+```
+
 The dashboard's Live nodes shows each device's **exit IP, location, health, and
 success rate**.
 
@@ -165,8 +174,10 @@ associations, for scraping into Grafana or alerting.
 ## What you get
 
 - One proxy endpoint for a pool of your own devices, with automatic failover.
-- **Pick the pool, one device, or a sticky session.** `user:pass` auto-picks a
-  healthy device; `user+name:pass` pins one named device; `user-session-K:pass`
+- **Pick the pool, one device, a region, a group, or a sticky session.**
+  `user:pass` auto-picks a healthy device; `user+name:pass` pins one named
+  device; `user-region-COUNTRY:pass` picks by location; `user-group-NAME:pass`
+  picks any node that joined with the token named NAME; `user-session-K:pass`
   keeps a session on one device while it stays healthy.
 - **HTTP CONNECT, SOCKS5, and plain HTTP** on one port, with auth, plus **UDP**
   via SOCKS5 UDP ASSOCIATE (DNS, QUIC, WebRTC media) out the same device.

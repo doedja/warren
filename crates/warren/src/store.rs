@@ -37,7 +37,35 @@ impl Store {
         })
     }
 
+    /// A token's name doubles as its group label and, through that, the
+    /// `user-group-NAME` proxy-routing selector. So it must be selector-safe:
+    /// a name with whitespace or `:`/`@`/`+`/`&` breaks the copied curl, and one
+    /// containing `-region-`/`-session-`/`-group-` is swallowed by the
+    /// higher-priority branches in `parse_route` and never routes as a group.
+    /// Restrict to `[A-Za-z0-9._-]` (which also keeps it curl- and shell-safe)
+    /// and forbid the reserved routing markers.
+    pub fn validate_token_name(name: &str) -> Result<()> {
+        if name.is_empty() {
+            anyhow::bail!("token name cannot be empty");
+        }
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        {
+            anyhow::bail!(
+                "token name may only contain letters, digits, '.', '_', '-' (it is also the user-group-NAME routing selector)"
+            );
+        }
+        for marker in ["-session-", "-region-", "-group-"] {
+            if name.contains(marker) {
+                anyhow::bail!("token name may not contain '{marker}' (reserved routing selector)");
+            }
+        }
+        Ok(())
+    }
+
     pub fn add_token(&self, token: &str, name: &str) -> Result<()> {
+        Self::validate_token_name(name)?;
         let conn = self.conn.lock().unwrap();
         let created = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -67,6 +95,17 @@ impl Store {
         Ok(result)
     }
 
+    /// Rename a token (changes its group label). Returns false if no such token.
+    pub fn rename_token(&self, token: &str, name: &str) -> Result<bool> {
+        Self::validate_token_name(name)?;
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute(
+            "UPDATE enroll_tokens SET name = ?2 WHERE token = ?1",
+            rusqlite::params![token, name],
+        )?;
+        Ok(updated > 0)
+    }
+
     pub fn delete_token(&self, token: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let removed = conn.execute(
@@ -74,6 +113,24 @@ impl Store {
             rusqlite::params![token],
         )?;
         Ok(removed > 0)
+    }
+
+    /// The group label for a token: its name, if the token exists and the name is
+    /// non-empty. A node that enrolled with this token belongs to that group, so a
+    /// client can route to the whole group with `user-group-NAME`. Returns None
+    /// for an unknown token or a token with an empty name (ungrouped).
+    pub fn token_name(&self, token: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        match conn.query_row(
+            "SELECT name FROM enroll_tokens WHERE token = ?1",
+            rusqlite::params![token],
+            |r| r.get::<_, String>(0),
+        ) {
+            Ok(name) if !name.is_empty() => Ok(Some(name)),
+            Ok(_) => Ok(None),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub fn token_valid(&self, token: &str) -> Result<bool> {
@@ -108,6 +165,11 @@ impl Store {
         if username.contains("-region-") {
             anyhow::bail!(
                 "proxy username may not contain '-region-' (it is reserved for region selection)"
+            );
+        }
+        if username.contains("-group-") {
+            anyhow::bail!(
+                "proxy username may not contain '-group-' (it is reserved for node-group selection)"
             );
         }
         let conn = self.conn.lock().unwrap();
@@ -291,9 +353,43 @@ mod tests {
         store.add_token("t", "n")?;
         assert!(store.token_valid("t")?);
         assert!(!store.token_valid("z")?);
+        // token_name is the group label; unknown -> None.
+        assert_eq!(store.token_name("t")?, Some("n".to_string()));
+        assert_eq!(store.token_name("z")?, None);
+        // rename relabels the group; unknown token -> false.
+        assert!(store.rename_token("t", "residential")?);
+        assert_eq!(store.token_name("t")?, Some("residential".to_string()));
+        assert!(!store.rename_token("z", "x")?);
         assert!(store.delete_token("t")?);
         assert!(!store.token_valid("t")?);
         Ok(())
+    }
+
+    #[test]
+    fn token_name_validation() {
+        // The token name is the user-group-NAME selector, so it must be
+        // selector-safe. Empty, whitespace, reserved markers, and proxy-URL
+        // metachars are rejected on both create and rename.
+        assert!(Store::validate_token_name("residential").is_ok());
+        assert!(Store::validate_token_name("us-east_1.b").is_ok());
+        assert!(Store::validate_token_name("").is_err());
+        assert!(Store::validate_token_name("my group").is_err()); // space
+        assert!(Store::validate_token_name("eu:1").is_err()); // colon
+        assert!(Store::validate_token_name("a@b").is_err()); // at
+        assert!(Store::validate_token_name("a+b").is_err()); // plus
+        assert!(Store::validate_token_name("a&b").is_err()); // shell metachar
+        assert!(Store::validate_token_name("x-region-y").is_err()); // reserved
+        assert!(Store::validate_token_name("x-group-y").is_err()); // reserved
+        let store = Store::open(":memory:").unwrap();
+        assert!(store.add_token("tk", "bad name").is_err());
+        assert!(store.add_token("tk", "good").is_ok());
+        assert!(store.rename_token("tk", "x-session-y").is_err());
+    }
+
+    #[test]
+    fn rejects_group_in_username() {
+        let store = Store::open(":memory:").unwrap();
+        assert!(store.add_user("me-group-x", "p").is_err());
     }
 
     #[test]

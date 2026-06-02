@@ -295,7 +295,8 @@ async function loadNodes(){
     }
     const up = `<span title="${fmtDate(n.since)}">${fmtAgo(n.since)}</span>`;
     const ver = n.version ? `<code>v${esc(n.version)}</code>` : '<span class="muted">-</span>';
-    return `<tr><td><b>${esc(n.id)}</b></td><td>${ip}</td><td>${loc}</td><td>${up}</td><td>${fail}</td><td>${succ}</td><td>${fmtBytes(n.bytes)}</td><td>${ver}</td>`+
+    const grp = n.group ? ` <span class="muted" title="enroll-token group: route with user-group-${esc(n.group)}">[${esc(n.group)}]</span>` : '';
+    return `<tr><td><b>${esc(n.id)}</b>${grp}</td><td>${ip}</td><td>${loc}</td><td>${up}</td><td>${fail}</td><td>${succ}</td><td>${fmtBytes(n.bytes)}</td><td>${ver}</td>`+
       `<td><button class="ghost" onclick='copyVal(this, ${esc(JSON.stringify(c))})'>copy cmd</button></td></tr>`;
   }).join('') || '<tr><td class="empty" colspan=9>No devices online yet. Create a token below and run the install line on a device.</td></tr>';
   // Stat strip: online count + total relayed traffic.
@@ -336,6 +337,9 @@ function copyLogs(btn){ copyVal(btn, LOGS.filter(logMatch).join('\n')); }
 async function loadLogs(){ LOGS = await api('GET','/api/logs'); renderLogs(); }
 async function loadTokens(){
   const rows = await api('GET','/api/tokens');
+  const puser = INFO.proxy_user || 'USER';
+  const ppass = INFO.proxy_pass || '<PASSWORD>';
+  const proxy = INFO.proxy_addr || '<hub-host>:18080';
   document.getElementById('tokens').innerHTML = rows.map(t => {
     // With a join code, offer a copy button per OS; otherwise the manual command.
     let copy;
@@ -347,8 +351,13 @@ async function loadTokens(){
     } else {
       copy = `<button class="ghost" onclick='copyVal(this, installCmd(${esc(JSON.stringify(t.token))}))'>copy install</button> `;
     }
+    // A named token is a group: offer a quick curl that routes through any node
+    // in it (user-group-NAME), mirroring the per-device "copy cmd".
+    const gcurl = `curl -x http://${puser}-group-${t.name}:${ppass}@${proxy} https://api.ipify.org`;
+    const groupBtn = t.name ? `<button class="ghost" onclick='copyVal(this, ${esc(JSON.stringify(gcurl))})'>copy group cmd</button> ` : '';
+    const renameBtn = `<button class="ghost" onclick='renameToken(${esc(JSON.stringify(t.token))}, ${esc(JSON.stringify(t.name))})'>rename</button> `;
     return `<tr><td>${esc(t.name)}</td><td><code>${esc(t.token)}</code></td><td class="muted">${fmtDate(t.created)}</td>`+
-    `<td>${copy}<button class="ghost danger" onclick="delToken('${esc(t.token)}')">delete</button></td></tr>`;
+    `<td>${groupBtn}${copy}${renameBtn}<button class="ghost danger" onclick="delToken('${esc(t.token)}')">delete</button></td></tr>`;
   }).join('')
     || '<tr><td class="empty" colspan=4>No tokens yet. Create one to let a device join automatically.</td></tr>';
 }
@@ -359,6 +368,13 @@ async function addToken(){
   document.getElementById('tname').value=''; loadTokens();
 }
 async function delToken(t){ await api('DELETE','/api/tokens/'+encodeURIComponent(t)); loadTokens(); }
+async function renameToken(t, cur){
+  const name = (prompt('New name for this token (this is its group label)', cur || '') || '').trim();
+  if (!name || name === cur) return;
+  await api('PATCH','/api/tokens/'+encodeURIComponent(t), {name});
+  // Refresh tokens (new label + group cmd) and nodes (group badges on reconnect).
+  loadTokens(); loadNodes();
+}
 async function loadUsers(){
   const rows = await api('GET','/api/users');
   document.getElementById('users').innerHTML = rows.map(u =>

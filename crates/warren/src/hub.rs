@@ -150,6 +150,10 @@ struct NodeEntry {
     /// Public egress IP + geo, self-reported by the node (best-effort, may be
     /// empty until the first report arrives).
     info: Arc<StdMutex<NodeReport>>,
+    /// Group label: the name of the enroll token this node joined with. Lets a
+    /// client target every node in a group with `user-group-NAME`. None for nodes
+    /// that joined without a token (admin-approved) or with an unnamed token.
+    group: Option<String>,
 }
 
 #[derive(Default, Clone)]
@@ -363,6 +367,21 @@ impl Hub {
             .map(node_snap)
             .collect()
     }
+    /// Snapshot of nodes in `group` (the enroll-token name they joined with),
+    /// case-insensitive. Same shape as [`snapshot`]. No fallback if none match.
+    async fn snapshot_group(&self, group: &str) -> Vec<NodeSnap> {
+        self.nodes
+            .lock()
+            .await
+            .iter()
+            .filter(|n| {
+                n.group
+                    .as_deref()
+                    .is_some_and(|g| g.eq_ignore_ascii_case(group))
+            })
+            .map(node_snap)
+            .collect()
+    }
     async fn add_node(&self, e: NodeEntry) {
         self.nodes.lock().await.push(e);
     }
@@ -402,6 +421,7 @@ impl Hub {
                     dials: total,
                     last_error,
                     version: n.agent_version.clone(),
+                    group: n.group.clone(),
                 }
             })
             .collect()
@@ -764,6 +784,13 @@ async fn handle_node_conn(stream: TcpStream, peer_ip: IpAddr, hub: Arc<Hub>) -> 
     // external IP-echo service (the old node-side ip-api self-report failed on
     // networks that block its plaintext call). Geo is resolved hub-side below.
     info.lock().unwrap().ip = Some(peer_ip.to_string());
+    // The node's group is the name of the enroll token it presents (the node
+    // sends it on every connect from its join code), so a reconnect keeps the
+    // group without persisting it separately. None if no/unknown/unnamed token.
+    let group = hello
+        .token
+        .as_deref()
+        .and_then(|t| hub.store.token_name(t).ok().flatten());
     hub.add_node(NodeEntry {
         id: node_id.clone(),
         name: hello.node_name.clone(),
@@ -775,6 +802,7 @@ async fn handle_node_conn(stream: TcpStream, peer_ip: IpAddr, hub: Arc<Hub>) -> 
         protocol_version: hello.protocol_version,
         agent_version: hello.agent_version.clone(),
         info: info.clone(),
+        group,
     })
     .await;
     tracing::info!(node = %node_id.0, ip = %peer_ip, ver = hello.protocol_version, "node enrolled");
@@ -1012,11 +1040,14 @@ enum Route {
     /// `user-region-COUNTRY`: route through a device whose reported geo country
     /// matches (case-insensitive). No fallback to other regions if none match.
     Region(String),
+    /// `user-group-NAME`: route through any node that joined with the enroll token
+    /// named NAME (case-insensitive). No fallback if none match.
+    Group(String),
 }
 
-/// Parse `(base_user, route)` from a proxy username. `-session-` and `-region-`
-/// are checked first (both rejected at user creation, so they cannot collide),
-/// then `+`.
+/// Parse `(base_user, route)` from a proxy username. `-session-`, `-region-`, and
+/// `-group-` are checked first (all rejected at user creation, so they cannot
+/// collide), then `+`.
 fn parse_route(user: &str) -> (&str, Route) {
     if let Some((base, key)) = user.split_once("-session-") {
         if !key.is_empty() {
@@ -1026,6 +1057,11 @@ fn parse_route(user: &str) -> (&str, Route) {
     if let Some((base, region)) = user.split_once("-region-") {
         if !region.is_empty() {
             return (base, Route::Region(region.to_string()));
+        }
+    }
+    if let Some((base, group)) = user.split_once("-group-") {
+        if !group.is_empty() {
+            return (base, Route::Group(group.to_string()));
         }
     }
     match user.split_once('+') {
@@ -1126,6 +1162,7 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
     let (nodes, session_key) = match route {
         Route::Device(name) => (hub.snapshot(Some(&name)).await, None),
         Route::Region(country) => (hub.snapshot_region(&country).await, None),
+        Route::Group(group) => (hub.snapshot_group(&group).await, None),
         Route::Session(key) => match hub.session_node(&key).await {
             Some(name) => {
                 let pinned = hub.snapshot(Some(&name)).await;
@@ -1279,6 +1316,7 @@ async fn handle_udp_associate(
     let nodes: Vec<NodeSnap> = match &route {
         Route::Device(name) => hub.snapshot(Some(name)).await,
         Route::Region(country) => hub.snapshot_region(country).await,
+        Route::Group(group) => hub.snapshot_group(group).await,
         _ => hub.snapshot(None).await,
     };
     let udp: Vec<&NodeSnap> = nodes.iter().filter(|n| n.6 >= UDP_MIN_VERSION).collect();
@@ -1467,6 +1505,7 @@ struct NodeInfo {
     dials: u32,
     last_error: Option<String>,
     version: String,
+    group: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1538,7 +1577,10 @@ async fn run_admin(listen: String, ctx: AdminCtx) -> Result<()> {
         .route("/api/info", get(api_info))
         .route("/api/nodes", get(api_nodes))
         .route("/api/tokens", get(api_list_tokens).post(api_create_token))
-        .route("/api/tokens/:token", delete(api_delete_token))
+        .route(
+            "/api/tokens/:token",
+            delete(api_delete_token).patch(api_rename_token),
+        )
         .route("/api/users", get(api_list_users).post(api_create_user))
         .route("/api/users/:username", delete(api_delete_user))
         .route("/api/pending", get(api_list_pending))
@@ -1712,6 +1754,9 @@ async fn api_create_token(
     if !authed(&headers, &ctx.token) {
         return Err(StatusCode::UNAUTHORIZED);
     }
+    if Store::validate_token_name(&req.name).is_err() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let token = gen_token();
     ctx.hub.store.add_token(&token, &req.name).map_err(ise)?;
     Ok(Json(TokenResp { token }))
@@ -1727,6 +1772,29 @@ async fn api_delete_token(
     }
     ctx.hub.store.delete_token(&token).map_err(ise)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Rename a token, which relabels its group. The label is re-read from the token
+/// name only when a node (re)connects, so already-connected nodes keep the old
+/// group label until they reconnect; new joins and reconnects get the new one.
+async fn api_rename_token(
+    State(ctx): State<AdminCtx>,
+    headers: HeaderMap,
+    Path(token): Path<String>,
+    Json(req): Json<NameReq>,
+) -> Result<StatusCode, StatusCode> {
+    if !authed(&headers, &ctx.token) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    if Store::validate_token_name(&req.name).is_err() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let renamed = ctx.hub.store.rename_token(&token, &req.name).map_err(ise)?;
+    if renamed {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
 }
 
 #[derive(Serialize)]
@@ -1929,5 +1997,12 @@ mod tests {
             parse_route("me-region-Indonesia"),
             ("me", Route::Region("Indonesia".into()))
         );
+        // group tag (enroll-token name)
+        assert_eq!(
+            parse_route("me-group-residential"),
+            ("me", Route::Group("residential".into()))
+        );
+        // empty group selector is ignored (whole pool)
+        assert_eq!(parse_route("me-group-"), ("me-group-", Route::Pool));
     }
 }
