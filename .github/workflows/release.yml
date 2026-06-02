@@ -16,6 +16,10 @@ jobs:
       - uses: taiki-e/create-gh-release-action@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # Publish the matching version's section from CHANGELOG.md as the release
+          # notes. allow-missing keeps the release from failing if a tag has no entry.
+          changelog: CHANGELOG.md
+          allow-missing-changelog: true
 
   build:
     needs: create-release

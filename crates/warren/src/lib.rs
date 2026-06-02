@@ -8,6 +8,7 @@ pub mod conn;
 pub mod hub;
 pub mod identity;
 pub mod joincode;
+pub mod logbuf;
 pub mod mux;
 pub mod node;
 pub mod proxy;

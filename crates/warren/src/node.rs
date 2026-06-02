@@ -38,6 +38,12 @@ use crate::wire::{read_msg, write_msg};
 /// for in-flight splices to finish before exiting, so a redeploy does not cut
 /// live requests.
 const DRAIN_BUDGET: Duration = Duration::from_secs(20);
+/// Bound on the whole connect + enroll handshake (TCP/TLS dial, stream open,
+/// Hello, HelloReply). Without it, a connection that comes up at the transport
+/// layer but never completes enrollment (hub mid-restart, half-open link) wedges
+/// connect_once forever and the reconnect loop never runs. On timeout we return
+/// an error and fall into the existing backoff/retry, like the steady-state read.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Args, Debug)]
 pub struct NodeArgs {
@@ -355,14 +361,17 @@ async fn connect_once(
     in_flight: Arc<AtomicU32>,
     auto_update: bool,
 ) -> Result<()> {
-    let conn = dial_conn(&r.hub, connector).await?;
+    // Whole handshake is bounded by CONNECT_TIMEOUT so a transport-up but
+    // enroll-stalled hub cannot wedge us forever; a timeout returns Err and the
+    // caller (run_agent) backs off and retries.
+    let conn = tokio::time::timeout(CONNECT_TIMEOUT, dial_conn(&r.hub, connector))
+        .await
+        .map_err(|_| anyhow!("connect to hub timed out"))??;
     // One yamux connection carries everything. The node opens streams: the
     // control stream first, then one per Dial. The driver task owns the yamux
     // Connection and serves these opens; its handle aborts the driver on drop,
     // so every return path below tears the connection down without a manual call.
     let (opener, _driver) = mux::client(conn);
-
-    let mut ctrl = mux::open(&opener).await?;
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -378,9 +387,15 @@ async fn connect_once(
         platform: current_platform(),
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
     };
-    write_msg(&mut ctrl, &Greeting::Control(hello)).await?;
-
-    let reply: HelloReply = read_msg(&mut ctrl).await?;
+    // Open the control stream + exchange Hello/HelloReply under the same bound.
+    let (ctrl, reply) = tokio::time::timeout(CONNECT_TIMEOUT, async {
+        let mut ctrl = mux::open(&opener).await?;
+        write_msg(&mut ctrl, &Greeting::Control(hello)).await?;
+        let reply: HelloReply = read_msg(&mut ctrl).await?;
+        Ok::<_, anyhow::Error>((ctrl, reply))
+    })
+    .await
+    .map_err(|_| anyhow!("hub enrollment handshake timed out"))??;
     match reply {
         HelloReply::Welcome { node_id } => {
             tracing::info!(node = %node_id.0, hub = %r.hub, "enrolled")

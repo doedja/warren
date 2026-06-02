@@ -43,7 +43,17 @@ async fn main() -> Result<()> {
 }
 
 fn init_tracing() {
-    use tracing_subscriber::{fmt, EnvFilter};
+    use tracing_subscriber::{fmt, prelude::*, EnvFilter};
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    fmt().with_env_filter(filter).init();
+    // stdout/journald as before, plus an in-memory ring the hub dashboard reads
+    // (bounded in logbuf, so it never bloats).
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt::layer())
+        .with(
+            fmt::layer()
+                .with_ansi(false)
+                .with_writer(warren::logbuf::RingWriter),
+        )
+        .init();
 }

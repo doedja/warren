@@ -49,7 +49,9 @@ New-Item -ItemType Directory -Force -Path $dir | Out-Null
 # If a node is already running, stop it first so its binary can be replaced
 # (otherwise Expand-Archive hits "Access denied" on the locked warren.exe and
 # the old binary keeps running). It is restarted below by `node install`.
-schtasks /End /TN warren-node 2>$null | Out-Null
+# On a FIRST install there is no task yet; schtasks writes to stderr, which
+# $ErrorActionPreference='Stop' would turn into a fatal error, so swallow it.
+try { schtasks /End /TN warren-node 2>$null | Out-Null } catch {}
 Get-Process warren -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Milliseconds 500
 

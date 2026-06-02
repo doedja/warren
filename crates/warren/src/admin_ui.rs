@@ -38,7 +38,19 @@ pub const DASHBOARD: &str = r###"<!doctype html>
   h2 { font-size:12px; color:var(--fg); margin:0 0 3px; letter-spacing:.04em; font-weight:600; display:flex; align-items:center; gap:8px; }
   h2::before { content:""; width:3px; height:13px; border-radius:2px; background:var(--acc); opacity:.8; }
   .desc { color:var(--mut); font-size:12px; margin:0 0 12px; line-height:1.5; max-width:74ch; }
-  .hint { color:var(--acc); cursor:help; border-bottom:1px dotted var(--acc); }
+  /* Click-to-expand help (a native title= tooltip never showed for the user). */
+  .hint { font-size:12px; margin:-4px 0 10px; }
+  .hint summary { color:var(--acc); cursor:pointer; list-style:none; display:inline-flex; align-items:center; gap:6px; width:fit-content; }
+  .hint summary::-webkit-details-marker { display:none; }
+  .hint summary::before { content:"\25B8"; font-size:10px; }
+  .hint[open] summary::before { content:"\25BE"; }
+  .hint .hintbody { color:var(--mut); margin-top:6px; line-height:1.5; max-width:74ch; }
+  .foot { color:var(--faint); font-size:11px; text-align:center; padding:6px 20px 30px; }
+  .foot code { color:var(--mut); }
+  .log { background:var(--panel2); border:1px solid var(--line); border-radius:var(--radius-sm); padding:10px 12px; max-height:300px; overflow:auto; margin:0; font-size:11.5px; line-height:1.5; white-space:pre-wrap; word-break:break-word; color:var(--mut); }
+  .log .lw { color:var(--warn); }
+  .log .le { color:var(--bad); }
+  .logf.on { color:var(--fg); border-color:var(--acc); }
   .spacer { flex:1; }
   /* Status dots + pills */
   .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; vertical-align:middle; }
@@ -137,7 +149,8 @@ pub const DASHBOARD: &str = r###"<!doctype html>
 
   <section class="card">
     <h2>Enrollment tokens</h2>
-    <p class="desc">A secret that lets a new device join automatically (no manual approval). Delete it to cut off devices still holding it. <span class="hint" title="On the hub, run:  warren enroll --name device&#10;That mints a fresh token. Hand it out, then delete the old token here to cut off any device that still has the old one.">How do I rotate it?</span></p>
+    <p class="desc">A secret that lets a new device join automatically (no manual approval). Delete it to cut off devices still holding it.</p>
+    <details class="hint"><summary>How do I rotate it?</summary><div class="hintbody">On the hub, run <code>warren enroll --name device</code> to mint a fresh token. Hand it out, then delete the old token here to cut off any device that still has the old one.</div></details>
     <div class="row">
       <input id="tname" placeholder="node name">
       <button onclick="addToken()">Create token</button>
@@ -148,7 +161,7 @@ pub const DASHBOARD: &str = r###"<!doctype html>
   <section class="card">
     <h2>Live nodes</h2>
     <p class="desc">Devices connected and ready to carry requests. <b>Health</b> tracks recent dial errors (deprioritized at 3/3). <b>Success</b> is the dial success rate. Copy a device's command to route only through it.</p>
-    <table><thead><tr><th>Node</th><th>Exit IP</th><th>Location</th><th>Up since</th><th>Health</th><th>Success</th><th>Traffic</th><th></th></tr></thead><tbody id="nodes"></tbody></table>
+    <table><thead><tr><th>Node</th><th>Exit IP</th><th>Location</th><th>Up since</th><th>Health</th><th>Success</th><th>Traffic</th><th>Version</th><th></th></tr></thead><tbody id="nodes"></tbody></table>
   </section>
 
   <section class="card" id="card-pending">
@@ -162,6 +175,19 @@ pub const DASHBOARD: &str = r###"<!doctype html>
     <p class="desc">Device identities the hub trusts (each device made its own key on first run). Revoke one to remove that device for good.</p>
     <table><thead><tr><th>Name</th><th>Key</th><th>Approved</th><th></th></tr></thead><tbody id="keys"></tbody></table>
   </section>
+  <section class="card">
+    <h2>Hub log</h2>
+    <p class="desc">Recent hub activity: enrollments, disconnects (with the reason a node dropped), and errors. Newest at the bottom. This is the hub's own view, not a node's internal crash reason.</p>
+    <div class="row" style="margin-bottom:8px">
+      <button class="ghost logf on" onclick="setLogFilter(this,'all')">All</button>
+      <button class="ghost logf" onclick="setLogFilter(this,'warn')">Warn+</button>
+      <button class="ghost logf" onclick="setLogFilter(this,'error')">Errors</button>
+      <span class="spacer"></span>
+      <button class="ghost" onclick="copyLogs(this)">copy shown</button>
+    </div>
+    <pre class="log" id="hublog"></pre>
+  </section>
+  <footer class="foot">Prometheus metrics at <code>GET /metrics</code> (same admin login, for scraping into Grafana).</footer>
 </main>
 <script>
 let INFO = {};
@@ -261,9 +287,10 @@ async function loadNodes(){
       succ = `<span style="color:${col}"${err}>${pct}% <span class="muted">(${n.dials})</span></span>`;
     }
     const up = `<span title="${fmtDate(n.since)}">${fmtAgo(n.since)}</span>`;
-    return `<tr><td><b>${esc(n.id)}</b></td><td>${ip}</td><td>${loc}</td><td>${up}</td><td>${fail}</td><td>${succ}</td><td>${fmtBytes(n.bytes)}</td>`+
+    const ver = n.version ? `<code>v${esc(n.version)}</code>` : '<span class="muted">-</span>';
+    return `<tr><td><b>${esc(n.id)}</b></td><td>${ip}</td><td>${loc}</td><td>${up}</td><td>${fail}</td><td>${succ}</td><td>${fmtBytes(n.bytes)}</td><td>${ver}</td>`+
       `<td><button class="ghost" onclick='copyVal(this, ${esc(JSON.stringify(c))})'>copy cmd</button></td></tr>`;
-  }).join('') || '<tr><td class="empty" colspan=8>No devices online yet. Create a token below and run the install line on a device.</td></tr>';
+  }).join('') || '<tr><td class="empty" colspan=9>No devices online yet. Create a token below and run the install line on a device.</td></tr>';
   // Stat strip: online count + total relayed traffic.
   document.getElementById('stat-nodes').innerHTML = rows.length + ' <small>online</small>';
   const total = rows.reduce((a,n)=>a+(n.bytes||0),0);
@@ -278,6 +305,28 @@ async function loadKeys(){
   document.getElementById('card-keys').style.display = rows.length ? '' : 'none';
 }
 async function revokeKey(pk){ await api('DELETE','/api/node-keys/'+encodeURIComponent(pk)); loadKeys(); }
+let LOGS = [];
+let LOG_FILTER = 'all';
+function logMatch(l){ return LOG_FILTER === 'all' ? true : LOG_FILTER === 'warn' ? / (WARN|ERROR) /.test(l) : / ERROR /.test(l); }
+function renderLogs(){
+  const el = document.getElementById('hublog');
+  // Keep the view pinned to the newest line unless the user scrolled up to read.
+  const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  const lines = LOGS.filter(logMatch);
+  el.innerHTML = lines.map(l => {
+    const cls = / ERROR /.test(l) ? 'le' : / WARN /.test(l) ? 'lw' : '';
+    return `<span class="${cls}">${esc(l)}</span>`;
+  }).join('\n') || '<span class="muted">no matching lines</span>';
+  if (atBottom) el.scrollTop = el.scrollHeight;
+}
+function setLogFilter(btn, f){
+  LOG_FILTER = f;
+  document.querySelectorAll('.logf').forEach(b => b.classList.toggle('on', b === btn));
+  renderLogs();
+}
+// Copy exactly what is shown (respects the active filter), as plain text.
+function copyLogs(btn){ copyVal(btn, LOGS.filter(logMatch).join('\n')); }
+async function loadLogs(){ LOGS = await api('GET','/api/logs'); renderLogs(); }
 async function loadTokens(){
   const rows = await api('GET','/api/tokens');
   document.getElementById('tokens').innerHTML = rows.map(t => {
@@ -319,7 +368,7 @@ async function addUser(){
 async function delUser(u){ await api('DELETE','/api/users/'+encodeURIComponent(u)); loadUsers(); }
 function setLive(ok){ const el=document.getElementById('live'); if(!el) return; el.textContent = ok?'live':'stale'; el.style.color = ok?'var(--ok)':'var(--mut)'; }
 async function loadAll(){
-  try { await loadInfo(); await loadPending(); await loadNodes(); await loadKeys(); await loadTokens(); await loadUsers(); setLive(true); }
+  try { await loadInfo(); await loadPending(); await loadNodes(); await loadKeys(); await loadTokens(); await loadUsers(); await loadLogs(); setLive(true); }
   catch(e){ setLive(false); }
 }
 loadAll();

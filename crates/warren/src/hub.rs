@@ -144,6 +144,9 @@ struct NodeEntry {
     /// The node's reported protocol version. Routing gates version-specific
     /// features (e.g. UDP relay needs >= 5) so older nodes still serve TCP.
     protocol_version: u16,
+    /// The node's binary version (semver, e.g. "0.4.0"), shown on the dashboard
+    /// so an operator can spot nodes that need updating.
+    agent_version: String,
     /// Public egress IP + geo, self-reported by the node (best-effort, may be
     /// empty until the first report arrives).
     info: Arc<StdMutex<NodeReport>>,
@@ -398,6 +401,7 @@ impl Hub {
                     success_rate,
                     dials: total,
                     last_error,
+                    version: n.agent_version.clone(),
                 }
             })
             .collect()
@@ -769,6 +773,7 @@ async fn handle_node_conn(stream: TcpStream, peer_ip: IpAddr, hub: Arc<Hub>) -> 
         host_fails: Arc::new(StdMutex::new(HashMap::new())),
         in_flight: Arc::new(AtomicU32::new(0)),
         protocol_version: hello.protocol_version,
+        agent_version: hello.agent_version.clone(),
         info: info.clone(),
     })
     .await;
@@ -819,31 +824,34 @@ async fn handle_node_conn(stream: TcpStream, peer_ip: IpAddr, hub: Arc<Hub>) -> 
     // (no traffic for NODE_READ_TIMEOUT, ~3 missed pings) ends it and tears down.
     let ctrl_info = info.clone();
     let ctrl_hub = hub.clone();
+    // Returns WHY it ended so the disconnect can be logged with a reason: a
+    // dead-peer timeout (no NodeToHub traffic for LINK_READ_TIMEOUT, ~3 missed
+    // pings) or a control read/decode error.
     let mut ctrl_loop = tokio::spawn(async move {
-        // Loop ends (and the node is torn down) on a decode error or a dead-peer
-        // timeout: no NodeToHub traffic for LINK_READ_TIMEOUT, ~3 missed pings.
-        while let Ok(Ok(msg)) =
-            timeout(mux::LINK_READ_TIMEOUT, read_msg::<_, NodeToHub>(&mut rd)).await
-        {
-            match msg {
-                NodeToHub::Pong { .. } => {}
-                NodeToHub::DialFailed { conn_id, reason } => {
-                    tracing::debug!(conn_id, %reason, "node reported dial failed");
-                    let _ = ctrl_hub.take_pending(conn_id).await;
-                }
-                NodeToHub::Info {
-                    public_ip,
-                    country,
-                    city,
-                } => {
-                    let mut r = ctrl_info.lock().unwrap();
-                    r.ip = public_ip;
-                    r.country = country;
-                    r.city = city;
-                }
-                NodeToHub::Latency { ms } => {
-                    ctrl_info.lock().unwrap().latency_ms = Some(ms);
-                }
+        loop {
+            match timeout(mux::LINK_READ_TIMEOUT, read_msg::<_, NodeToHub>(&mut rd)).await {
+                Ok(Ok(msg)) => match msg {
+                    NodeToHub::Pong { .. } => {}
+                    NodeToHub::DialFailed { conn_id, reason } => {
+                        tracing::debug!(conn_id, %reason, "node reported dial failed");
+                        let _ = ctrl_hub.take_pending(conn_id).await;
+                    }
+                    NodeToHub::Info {
+                        public_ip,
+                        country,
+                        city,
+                    } => {
+                        let mut r = ctrl_info.lock().unwrap();
+                        r.ip = public_ip;
+                        r.country = country;
+                        r.city = city;
+                    }
+                    NodeToHub::Latency { ms } => {
+                        ctrl_info.lock().unwrap().latency_ms = Some(ms);
+                    }
+                },
+                Ok(Err(_)) => return "control connection lost",
+                Err(_) => return "stopped responding (~75s, no pong)",
             }
         }
     });
@@ -862,18 +870,18 @@ async fn handle_node_conn(stream: TcpStream, peer_ip: IpAddr, hub: Arc<Hub>) -> 
     };
 
     // Whichever ends first (connection died, or control loop hit error/timeout)
-    // tears the node down.
-    tokio::select! {
-        _ = accept => {}
-        _ = &mut ctrl_loop => {}
-    }
+    // tears the node down. The reason is logged so it shows in the hub log.
+    let reason = tokio::select! {
+        _ = accept => "connection closed",
+        r = &mut ctrl_loop => r.unwrap_or("control task ended"),
+    };
 
     hub.remove_node(&node_id).await;
     pinger.abort();
     writer.abort();
     ctrl_loop.abort();
     // _driver's DriverHandle aborts the yamux driver when it drops here.
-    tracing::info!(node = %node_id.0, "node disconnected");
+    tracing::info!(node = %node_id.0, reason, "node disconnected");
     Ok(())
 }
 
@@ -1458,6 +1466,7 @@ struct NodeInfo {
     success_rate: Option<f64>,
     dials: u32,
     last_error: Option<String>,
+    version: String,
 }
 
 #[derive(Serialize)]
@@ -1538,6 +1547,7 @@ async fn run_admin(listen: String, ctx: AdminCtx) -> Result<()> {
         .route("/api/node-keys", get(api_list_node_keys))
         .route("/api/node-keys/:pubkey", delete(api_delete_node_key))
         .route("/metrics", get(api_metrics))
+        .route("/api/logs", get(api_logs))
         .with_state(ctx);
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
@@ -1594,6 +1604,18 @@ async fn api_nodes(
         return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(Json(ctx.hub.list_node_info().await))
+}
+
+/// Recent hub log lines (bounded ring) for the dashboard's log pane. Same admin
+/// token as the rest of the admin server.
+async fn api_logs(
+    State(ctx): State<AdminCtx>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<String>>, StatusCode> {
+    if !authed(&headers, &ctx.token) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(Json(crate::logbuf::recent()))
 }
 
 /// Prometheus text exposition of hub state (gated by the admin token, like the
