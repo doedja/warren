@@ -256,11 +256,9 @@ fn version_gt(remote: &str, local: &str) -> bool {
 }
 
 /// On a newer hub version, log it and (with --auto-update) re-run the installer
-/// detached: it stops this service, swaps the binary, and restarts it. On unix
-/// the re-run is in-place; on Windows a helper waits for this exe to exit first.
-/// Default is notice-only, because a silent binary swap across a fleet is
-/// dangerous; enable per node once confirmed. Version tolerance means an
-/// unupdated node keeps serving meanwhile.
+/// to swap the binary and restart the service. Default is notice-only, because a
+/// silent binary swap across a fleet is dangerous; enable per node once
+/// confirmed. Version tolerance means an unupdated node keeps serving meanwhile.
 fn maybe_self_update(remote: &str, auto_update: bool, r: &Resolved) {
     let local = env!("CARGO_PKG_VERSION");
     if !version_gt(remote, local) {
@@ -271,56 +269,78 @@ fn maybe_self_update(remote: &str, auto_update: bool, r: &Resolved) {
         tracing::warn!("auto-update off (pass --auto-update to enable); reinstall to upgrade");
         return;
     }
-    if cfg!(windows) {
-        // The running .exe is locked, so it cannot overwrite itself in place.
-        // Instead spawn a detached PowerShell helper that waits for THIS process
-        // to exit, then re-runs install.ps1 (which stops the task, swaps the exe,
-        // reinstalls the service, and restarts it). We exit right after spawning
-        // so the binary unlocks. -AutoUpdate persists the setting across the swap.
-        let ps_url = "https://raw.githubusercontent.com/doedja/warren/main/install.ps1";
-        let mut inv = format!(
-            "& ([scriptblock]::Create((irm {} -UseBasicParsing))) -Hub {}",
-            ps_single_quote(ps_url),
-            ps_single_quote(&r.hub)
-        );
-        if let Some(t) = &r.token {
-            inv.push_str(&format!(" -Token {}", ps_single_quote(t)));
-        }
-        if r.tls {
-            inv.push_str(" -Tls");
-            if let Some(fp) = &r.fingerprint {
-                inv.push_str(&format!(" -HubFingerprint {}", ps_single_quote(fp)));
-            }
-        }
-        if r.insecure {
-            inv.push_str(" -Insecure");
-        }
-        inv.push_str(" -AutoUpdate");
-        let script = format!(
-            "Wait-Process -Id {} -Timeout 300 -ErrorAction SilentlyContinue; {}",
-            std::process::id(),
-            inv
-        );
-        tracing::warn!("auto-updating: a helper will swap the binary after this node exits");
-        if std::process::Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-WindowStyle",
-                "Hidden",
-                "-Command",
-                &script,
-            ])
-            .spawn()
-            .is_ok()
-        {
-            // Release the locked exe so the helper can overwrite it. The helper
-            // restarts the service (install.ps1 ends with schtasks /Run).
-            std::process::exit(0);
-        }
-        tracing::warn!("auto-update: failed to spawn the Windows updater; reinstall manually");
-        return;
+    self_update_now(r);
+}
+
+/// Windows: the running .exe is locked, so a detached PowerShell helper waits for
+/// THIS process to exit, then re-runs install.ps1 (stops the task, swaps the exe,
+/// reinstalls the service, restarts it). We exit right after spawning so the
+/// binary unlocks. `-AutoUpdate` persists the setting across the swap.
+#[cfg(windows)]
+fn self_update_now(r: &Resolved) {
+    let ps_url = "https://raw.githubusercontent.com/doedja/warren/main/install.ps1";
+    let mut inv = format!(
+        "& ([scriptblock]::Create((irm {} -UseBasicParsing))) -Hub {}",
+        ps_single_quote(ps_url),
+        ps_single_quote(&r.hub)
+    );
+    if let Some(t) = &r.token {
+        inv.push_str(&format!(" -Token {}", ps_single_quote(t)));
     }
+    if r.tls {
+        inv.push_str(" -Tls");
+        if let Some(fp) = &r.fingerprint {
+            inv.push_str(&format!(" -HubFingerprint {}", ps_single_quote(fp)));
+        }
+    }
+    if r.insecure {
+        inv.push_str(" -Insecure");
+    }
+    inv.push_str(" -AutoUpdate");
+    let script = format!(
+        "Wait-Process -Id {} -Timeout 300 -ErrorAction SilentlyContinue; {}",
+        std::process::id(),
+        inv
+    );
+    tracing::warn!("auto-updating: a helper will swap the binary after this node exits");
+    if std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            &script,
+        ])
+        .spawn()
+        .is_ok()
+    {
+        // Release the locked exe so the helper can overwrite it. The helper
+        // restarts the service (install.ps1 ends with schtasks /Run).
+        std::process::exit(0);
+    }
+    tracing::warn!("auto-update: failed to spawn the Windows updater; reinstall manually");
+}
+
+/// Unix: re-run install.sh to swap the binary and restart the service. The
+/// installer STOPS the warren-node service mid-run (to release/replace the
+/// binary), so it must run DETACHED from this process. Otherwise it is our child
+/// and stopping the service kills it before the swap finishes, leaving the node
+/// down (the v0.4.x bug). See `spawn_detached_unix` for how it survives.
+#[cfg(unix)]
+fn self_update_now(r: &Resolved) {
+    let cmd = unix_update_cmd(r);
+    if spawn_detached_unix(&cmd) {
+        tracing::warn!("auto-updating: detached installer will swap the binary and restart");
+    } else {
+        tracing::warn!("auto-update: failed to launch the updater; reinstall manually");
+    }
+}
+
+/// Build the `curl install.sh | sh -s -- ...` command that re-installs this node.
+/// `--auto-update` is always appended so the setting survives the reinstall.
+#[cfg(unix)]
+fn unix_update_cmd(r: &Resolved) -> String {
     let url = "https://raw.githubusercontent.com/doedja/warren/main/install.sh";
     let mut cmd = format!("curl -fsSL {url} | sh -s -- --hub {}", r.hub);
     if let Some(t) = &r.token {
@@ -335,11 +355,52 @@ fn maybe_self_update(remote: &str, auto_update: bool, r: &Resolved) {
     if r.insecure {
         cmd.push_str(" --insecure");
     }
-    // Keep auto-update on after the update: the re-run reinstalls the service, so
-    // without this the upgraded node would come back with auto-update off.
     cmd.push_str(" --auto-update");
-    tracing::warn!("auto-updating: re-running installer (service will restart)");
-    let _ = std::process::Command::new("sh").arg("-c").arg(&cmd).spawn();
+    cmd
+}
+
+/// Launch `script` detached enough to outlive stopping the warren-node service.
+/// On systemd, a transient unit runs it in a cgroup that PID 1 owns, independent
+/// of the warren-node unit's stop/restart. Elsewhere (launchd, non-systemd), a
+/// new session (setsid) escapes the service's process-group teardown.
+#[cfg(unix)]
+fn spawn_detached_unix(script: &str) -> bool {
+    use std::process::Command;
+    if unix_command_exists("systemd-run") {
+        return Command::new("systemd-run")
+            .args(["--collect", "--quiet", "sh", "-c", script])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+    }
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(script);
+    // SAFETY: the only work in the child between fork and exec is setsid(), which
+    // is async-signal-safe. It detaches the child into a new session so a service
+    // manager signalling the old process group does not kill the updater.
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    cmd.spawn().is_ok()
+}
+
+#[cfg(unix)]
+fn unix_command_exists(name: &str) -> bool {
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {name} >/dev/null 2>&1"))
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn self_update_now(_r: &Resolved) {
+    tracing::warn!("auto-update unsupported on this platform; reinstall manually");
 }
 
 /// Flip the shutdown watch on the first SIGTERM/SIGINT. On non-unix there is no
@@ -1153,9 +1214,44 @@ fn current_platform() -> Platform {
 #[cfg(test)]
 mod tests {
     use super::{backoff_sleep, drain_in_flight, node_run_argv, version_gt, RunArgs, DRAIN_BUDGET};
+    #[cfg(unix)]
+    use super::{unix_update_cmd, Resolved};
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[cfg(unix)]
+    fn resolved(tls: bool) -> Resolved {
+        Resolved {
+            hub: "h:7000".into(),
+            token: Some("tok".into()),
+            tls,
+            fingerprint: tls.then(|| "FP".into()),
+            insecure: false,
+        }
+    }
+
+    // The self-update installer command carries the connection flags and always
+    // re-adds --auto-update so the opt-in survives the reinstall.
+    #[cfg(unix)]
+    #[test]
+    fn unix_update_cmd_includes_flags_and_auto_update() {
+        let c = unix_update_cmd(&resolved(true));
+        assert!(c.contains("--hub h:7000"));
+        assert!(c.contains("--token tok"));
+        assert!(c.contains("--tls --hub-fingerprint FP"));
+        assert!(c.trim_end().ends_with("--auto-update"));
+    }
+
+    // TLS flags are omitted when TLS is off; --auto-update is still appended.
+    #[cfg(unix)]
+    #[test]
+    fn unix_update_cmd_omits_tls_when_off() {
+        let c = unix_update_cmd(&resolved(false));
+        assert!(!c.contains("--tls"));
+        assert!(!c.contains("--hub-fingerprint"));
+        assert!(c.contains("--auto-update"));
+    }
 
     // Zero in-flight: drain returns at once, no waiting.
     #[tokio::test(start_paused = true)]

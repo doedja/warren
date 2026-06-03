@@ -40,6 +40,10 @@ yamux = "0.13"
 futures = "0.3"
 tokio-util = { version = "0.7", features = ["compat"] }
 
+# setsid() to detach the unix self-update helper from the service process group.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # test-util enables tokio's paused clock (start_paused) for fast drain tests.
 tokio = { version = "1", features = ["full", "test-util"] }

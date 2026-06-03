@@ -7,6 +7,20 @@ workflow publishes each version's section here as its GitHub release notes.
 
 ## [Unreleased]
 
+## [0.4.7] - 2026-06-03
+
+### Fixed
+- Unix `--auto-update` could take a node down instead of upgrading it. The node
+  launched `install.sh` as a child process, and the installer stops the
+  warren-node service to swap the binary, which killed the still-running
+  installer (its parent died) before the swap finished: service stopped, binary
+  not replaced, node offline until a manual reinstall. The updater now runs
+  detached from the service: a systemd transient unit on Linux (its own cgroup,
+  independent of the warren-node unit's restart), or a new session via `setsid`
+  elsewhere (so launchd's process-group teardown does not reach it). This mirrors
+  the Windows detached-helper design added in 0.4.6. Node-side only; reinstall a
+  node once to pick up the fixed updater.
+
 ## [0.4.6] - 2026-06-03
 
 ### Fixed
@@ -181,7 +195,8 @@ workflow publishes each version's section here as its GitHub release notes.
 - Dashboard refresh: a stat strip, setup stepper, version badge, and unified copy
   buttons.
 
-[Unreleased]: https://github.com/doedja/warren/compare/v0.4.6...HEAD
+[Unreleased]: https://github.com/doedja/warren/compare/v0.4.7...HEAD
+[0.4.7]: https://github.com/doedja/warren/releases/tag/v0.4.7
 [0.4.6]: https://github.com/doedja/warren/releases/tag/v0.4.6
 [0.4.5]: https://github.com/doedja/warren/releases/tag/v0.4.5
 [0.4.4]: https://github.com/doedja/warren/releases/tag/v0.4.4
