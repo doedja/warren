@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 
@@ -46,6 +46,25 @@ use crate::wire::{read_msg, write_msg};
 /// A node is skipped (tried only as last resort) once its consecutive-failure
 /// count reaches this.
 const UNHEALTHY_AT: u32 = 3;
+
+/// How long a recorded failure keeps counting toward a node's health. A success
+/// resets `fails` to 0 instantly; absent a success, recent failures expire after
+/// this window so a node that simply stopped failing (or went idle) recovers its
+/// health instead of sticking unhealthy until its next successful dial. Also
+/// stops transient dead-target timeouts from pinning an otherwise-fine node red.
+const HEALTH_WINDOW_SECS: i64 = 60;
+
+/// Effective recent-failure count: the raw counter, or 0 once the last failure is
+/// older than [`HEALTH_WINDOW_SECS`] (or there are no failures). Used everywhere
+/// health is read (routing order, dashboard, metrics) so a stale counter neither
+/// deprioritizes a recovered node nor shows it as unhealthy. Pure for testing.
+fn effective_fails(raw: u32, last_fail: i64, now: i64) -> u32 {
+    if raw == 0 || now.saturating_sub(last_fail) > HEALTH_WINDOW_SECS {
+        0
+    } else {
+        raw
+    }
+}
 
 /// Per-node cap on concurrent in-flight dials.
 const MAX_INFLIGHT_PER_NODE: u32 = 64;
@@ -134,7 +153,13 @@ struct NodeEntry {
     since: i64,
     tx: mpsc::UnboundedSender<HubToNode>,
     /// Consecutive dial failures (any target); reset to 0 on a successful dial.
+    /// Read through [`effective_fails`] so failures older than the health window
+    /// stop counting (see `last_fail`).
     fails: Arc<AtomicU32>,
+    /// Unix seconds of the most recent dial failure. Paired with `fails` so a run
+    /// of failures expires after [`HEALTH_WINDOW_SECS`] with no new failure,
+    /// letting an idle or recovered node return to healthy.
+    last_fail: Arc<AtomicI64>,
     /// Per-target-host consecutive failures. Lets routing prefer nodes that are
     /// still "fresh" on a given host (transport-level reachability). App-level
     /// blocks like 429/403 are inside the TLS tunnel and not observable here.
@@ -263,7 +288,8 @@ struct Hub {
 type NodeStats = HashMap<String, (u32, u32, Option<String>)>;
 
 /// A routing snapshot of one node: id, name, control tx, fails, per-host fails,
-/// in-flight, protocol version. Cloned out so routing decisions touch no locks.
+/// in-flight, protocol version, last-fail time. Cloned out so routing decisions
+/// touch no locks.
 type NodeSnap = (
     NodeId,
     String,
@@ -272,6 +298,7 @@ type NodeSnap = (
     Arc<StdMutex<HashMap<String, u32>>>,
     Arc<AtomicU32>,
     u16,
+    Arc<AtomicI64>,
 );
 
 fn node_snap(n: &NodeEntry) -> NodeSnap {
@@ -283,6 +310,7 @@ fn node_snap(n: &NodeEntry) -> NodeSnap {
         n.host_fails.clone(),
         n.in_flight.clone(),
         n.protocol_version,
+        n.last_fail.clone(),
     )
 }
 
@@ -424,7 +452,11 @@ impl Hub {
                 NodeInfo {
                     id: n.id.0.clone(),
                     name: n.name.clone(),
-                    fails: n.fails.load(Ordering::Relaxed),
+                    fails: effective_fails(
+                        n.fails.load(Ordering::Relaxed),
+                        n.last_fail.load(Ordering::Relaxed),
+                        unix_now(),
+                    ),
                     since: n.since,
                     ip: r.ip,
                     country: r.country,
@@ -814,6 +846,7 @@ async fn handle_node_conn(stream: TcpStream, peer_ip: IpAddr, hub: Arc<Hub>) -> 
         since: unix_now(),
         tx: tx.clone(),
         fails: Arc::new(AtomicU32::new(0)),
+        last_fail: Arc::new(AtomicI64::new(0)),
         host_fails: Arc::new(StdMutex::new(HashMap::new())),
         in_flight: Arc::new(AtomicU32::new(0)),
         protocol_version: hello.protocol_version,
@@ -1045,6 +1078,21 @@ fn host_fail_count(m: &StdMutex<HashMap<String, u32>>, host: &str) -> u32 {
     m.lock().unwrap().get(host).copied().unwrap_or(0)
 }
 
+/// Routing rank for a node on a given host; lower sorts first. Order: nodes
+/// healthy globally before unhealthy, then healthy-on-this-host before not, then
+/// least in-flight, then fewest host failures, then fewest global failures. So a
+/// recovered/healthy idle node is preferred and an unhealthy one is tried only as
+/// a last resort. Pure (the booleans gate the tiers) so the ordering is testable.
+fn route_rank(eff_fails: u32, host_fails: u32, in_flight: u32) -> (bool, bool, u32, u32, u32) {
+    (
+        eff_fails >= UNHEALTHY_AT,
+        host_fails >= UNHEALTHY_AT,
+        in_flight,
+        host_fails,
+        eff_fails,
+    )
+}
+
 /// How the client wants its request routed, parsed from the proxy username.
 #[derive(Debug, PartialEq, Clone, Default)]
 enum Route {
@@ -1210,17 +1258,16 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
     // Prefer nodes fresh on THIS host: fewest host-fails first, unhealthy-on-host
     // last, global fails as the final tie-break. Stable sort keeps round-robin
     // order within a tier.
+    let now = unix_now();
     order.sort_by_key(|&i| {
-        let node_fails = nodes[i].3.load(Ordering::Relaxed);
+        let node_fails = effective_fails(
+            nodes[i].3.load(Ordering::Relaxed),
+            nodes[i].7.load(Ordering::Relaxed),
+            now,
+        );
         let node_host_fails = host_fail_count(&nodes[i].4, &host);
         let node_in_flight = nodes[i].5.load(Ordering::Relaxed);
-        (
-            node_fails >= UNHEALTHY_AT,
-            node_host_fails >= UNHEALTHY_AT,
-            node_in_flight,
-            node_host_fails,
-            node_fails,
-        )
+        route_rank(node_fails, node_host_fails, node_in_flight)
     });
 
     let mut uncapped_idx: Vec<usize> = Vec::new();
@@ -1234,7 +1281,8 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
     }
 
     for idx in uncapped_idx.iter().chain(capped_idx.iter()).copied() {
-        let (node_id, node_name, node_tx, fails, host_fails, in_flight, _ver) = &nodes[idx];
+        let (node_id, node_name, node_tx, fails, host_fails, in_flight, _ver, last_fail) =
+            &nodes[idx];
         let _g = mux::InFlightGuard::new(in_flight.clone());
 
         let conn_id = hub.next_conn_id();
@@ -1253,6 +1301,7 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
         {
             hub.take_pending(conn_id).await;
             fails.fetch_add(1, Ordering::Relaxed);
+            last_fail.store(unix_now(), Ordering::Relaxed);
             hub.record_dial(&node_id.0, false, Some("dial send failed"))
                 .await;
             continue;
@@ -1280,6 +1329,7 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
             _ => {
                 hub.take_pending(conn_id).await;
                 fails.fetch_add(1, Ordering::Relaxed);
+                last_fail.store(unix_now(), Ordering::Relaxed);
                 hub.record_dial(&node_id.0, false, Some("dial timed out"))
                     .await;
                 {
@@ -1348,7 +1398,8 @@ async fn handle_udp_associate(
                 .copied()
                 .min_by_key(|n| n.5.load(Ordering::Relaxed))
         });
-    let Some((node_id, _name, node_tx, _fails, _host_fails, in_flight, _ver)) = chosen else {
+    let Some((node_id, _name, node_tx, _fails, _host_fails, in_flight, _ver, _last_fail)) = chosen
+    else {
         socks5::write_reply(&mut client, socks5::REP_GENERAL_FAILURE).await?;
         return Ok(());
     };
@@ -1552,13 +1603,30 @@ struct UserReq {
     password: String,
 }
 
-/// HTTP Basic auth: any username, password must equal the admin token.
+/// Constant-time byte equality: ORs every byte difference so the comparison takes
+/// the same time whether the mismatch is in the first byte or the last. A plain
+/// `==` short-circuits on the first differing byte, leaking (via timing) how much
+/// of a guessed admin token is correct. Length is not secret, so an early return
+/// on length mismatch is fine.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// HTTP Basic auth: any username, password must equal the admin token. Compared
+/// in constant time so the token cannot be recovered by timing.
 fn authed(headers: &HeaderMap, token: &str) -> bool {
     headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(crate::proxy::parse_basic)
-        .map(|(_, pass)| pass == token)
+        .map(|(_, pass)| ct_eq(pass.as_bytes(), token.as_bytes()))
         .unwrap_or(false)
 }
 
@@ -1991,11 +2059,11 @@ fn remove_conn(nodes: &mut Vec<NodeEntry>, id: &NodeId, conn_seq: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        displace_and_push, parse_route, remove_conn, success_pct, NodeEntry, NodeId, NodeReport,
-        Route,
+        ct_eq, displace_and_push, effective_fails, parse_route, remove_conn, route_rank,
+        success_pct, NodeEntry, NodeId, NodeReport, Route, HEALTH_WINDOW_SECS, UNHEALTHY_AT,
     };
     use std::collections::HashMap;
-    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::{AtomicI64, AtomicU32};
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
 
@@ -2007,6 +2075,7 @@ mod tests {
             since: 0,
             tx,
             fails: Arc::new(AtomicU32::new(0)),
+            last_fail: Arc::new(AtomicI64::new(0)),
             host_fails: Arc::new(Mutex::new(HashMap::new())),
             in_flight: Arc::new(AtomicU32::new(0)),
             protocol_version: 6,
@@ -2015,6 +2084,61 @@ mod tests {
             group: None,
             conn_seq,
         }
+    }
+
+    #[test]
+    fn route_rank_orders_healthy_least_loaded_first() {
+        // (eff_fails, host_fails, in_flight)
+        let healthy_idle = route_rank(0, 0, 0);
+        let healthy_busy = route_rank(0, 0, 5);
+        let host_unhealthy = route_rank(0, UNHEALTHY_AT, 0);
+        let globally_unhealthy = route_rank(UNHEALTHY_AT, 0, 0);
+        // Healthy idle beats healthy-but-busy (least in-flight wins within a tier).
+        assert!(healthy_idle < healthy_busy);
+        // Any healthy node beats one that is unhealthy on this host.
+        assert!(healthy_busy < host_unhealthy);
+        // Host-unhealthy (still globally ok) is tried before a globally-unhealthy node.
+        assert!(host_unhealthy < globally_unhealthy);
+        // A shuffled set sorts healthy-first, globally-unhealthy-last.
+        let mut v = vec![
+            globally_unhealthy,
+            healthy_busy,
+            host_unhealthy,
+            healthy_idle,
+        ];
+        v.sort();
+        assert_eq!(
+            v,
+            vec![
+                healthy_idle,
+                healthy_busy,
+                host_unhealthy,
+                globally_unhealthy
+            ]
+        );
+    }
+
+    #[test]
+    fn ct_eq_matches_only_identical_bytes() {
+        assert!(ct_eq(b"s3cret-token", b"s3cret-token"));
+        assert!(!ct_eq(b"s3cret-token", b"s3cret-toke!")); // same length, last byte differs
+        assert!(!ct_eq(b"short", b"longer-token")); // length mismatch
+        assert!(ct_eq(b"", b"")); // empty equals empty
+    }
+
+    #[test]
+    fn effective_fails_expires_and_resets() {
+        let w = HEALTH_WINDOW_SECS;
+        // No failures: always healthy, regardless of timestamps.
+        assert_eq!(effective_fails(0, 0, 1_000), 0);
+        // Recent failures (within the window) still count toward unhealthy.
+        assert_eq!(effective_fails(4, 1_000, 1_000), 4);
+        assert_eq!(effective_fails(4, 1_000, 1_000 + w), 4);
+        // Once the last failure is older than the window, it stops counting, so a
+        // node that simply stopped failing (or went idle) reads as healthy again.
+        assert_eq!(effective_fails(4, 1_000, 1_000 + w + 1), 0);
+        // A backwards clock (now < last_fail) must not underflow; keep counting.
+        assert_eq!(effective_fails(4, 1_000, 500), 4);
     }
 
     #[test]

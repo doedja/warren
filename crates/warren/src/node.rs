@@ -10,7 +10,7 @@
 //! `--hub-fingerprint` (or accepted blindly with `--insecure`, dev only).
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,6 +38,12 @@ use crate::wire::{read_msg, write_msg};
 /// for in-flight splices to finish before exiting, so a redeploy does not cut
 /// live requests.
 const DRAIN_BUDGET: Duration = Duration::from_secs(20);
+/// Window over which an auto-update is randomly delayed. A hub redeploy announces
+/// the new version to every auto-update node at once; without a stagger they would
+/// all restart together and the whole pool would blink out. Each node waits a
+/// random slice of this so updates roll across the fleet one at a time. Version
+/// tolerance keeps the not-yet-updated nodes routable meanwhile.
+const UPDATE_SPREAD: Duration = Duration::from_secs(300);
 /// Bound on the whole connect + enroll handshake (TCP/TLS dial, stream open,
 /// Hello, HelloReply). Without it, a connection that comes up at the transport
 /// layer but never completes enrollment (hub mid-restart, half-open link) wedges
@@ -104,6 +110,7 @@ pub async fn run(args: NodeArgs) -> Result<()> {
 }
 
 /// The connection settings after merging --join (if any) with the flags.
+#[derive(Clone)]
 struct Resolved {
     hub: String,
     token: Option<String>,
@@ -173,6 +180,9 @@ pub async fn run_agent(args: RunArgs) -> Result<()> {
     #[cfg(not(unix))]
     let _shutdown_tx_keepalive = shutdown_tx;
 
+    // Debounce slot for auto-update, shared across reconnects so a node that
+    // reconnects mid-stagger does not schedule a second update.
+    let update_pending = Arc::new(AtomicBool::new(false));
     let mut delay_ms: u64 = 0;
     loop {
         let res = connect_once(
@@ -183,6 +193,7 @@ pub async fn run_agent(args: RunArgs) -> Result<()> {
             shutdown_rx.clone(),
             in_flight.clone(),
             args.auto_update,
+            update_pending.clone(),
         )
         .await;
         if *shutdown_rx.borrow() {
@@ -255,21 +266,63 @@ fn version_gt(remote: &str, local: &str) -> bool {
     parse(remote) > parse(local)
 }
 
-/// On a newer hub version, log it and (with --auto-update) re-run the installer
+/// Whether to schedule a self-update now: only when auto-update is on, the hub is
+/// newer than this node, and no update is already pending (debounce, so a hub that
+/// keeps re-announcing the version does not stack timers). Pure for testing.
+fn should_schedule_update(
+    remote: &str,
+    local: &str,
+    auto_update: bool,
+    already_pending: bool,
+) -> bool {
+    auto_update && !already_pending && version_gt(remote, local)
+}
+
+/// On a newer hub version, log it and (with --auto-update) schedule the installer
 /// to swap the binary and restart the service. Default is notice-only, because a
-/// silent binary swap across a fleet is dangerous; enable per node once
-/// confirmed. Version tolerance means an unupdated node keeps serving meanwhile.
-fn maybe_self_update(remote: &str, auto_update: bool, r: &Resolved) {
+/// silent binary swap across a fleet is dangerous; enable per node once confirmed.
+/// Version tolerance means an unupdated node keeps serving meanwhile.
+///
+/// The update is delayed by a random slice of [`UPDATE_SPREAD`] and runs in a
+/// detached task, so a fleet-wide announce does not restart every node at once and
+/// the read loop keeps answering pings while the timer counts down. `pending`
+/// debounces: at most one update is scheduled per process.
+fn maybe_self_update(remote: &str, auto_update: bool, r: &Resolved, pending: &Arc<AtomicBool>) {
     let local = env!("CARGO_PKG_VERSION");
-    if !version_gt(remote, local) {
+    // Log the situation regardless of whether we act, so an operator always sees a
+    // newer hub even with auto-update off.
+    if version_gt(remote, local) {
+        tracing::warn!(node = local, hub = remote, "hub is newer than this node");
+        if !auto_update {
+            tracing::warn!("auto-update off (pass --auto-update to enable); reinstall to upgrade");
+        }
+    }
+    if !should_schedule_update(remote, local, auto_update, pending.load(Ordering::Acquire)) {
         return;
     }
-    tracing::warn!(node = local, hub = remote, "hub is newer than this node");
-    if !auto_update {
-        tracing::warn!("auto-update off (pass --auto-update to enable); reinstall to upgrade");
+    // Claim the single pending slot; if another HubVersion raced us to it, bail.
+    if pending
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
         return;
     }
-    self_update_now(r);
+    let delay = Duration::from_secs(rand::thread_rng().gen_range(0..=UPDATE_SPREAD.as_secs()));
+    let r = r.clone();
+    let pending = pending.clone();
+    tracing::warn!(
+        delay_s = delay.as_secs(),
+        "auto-update scheduled (staggered)"
+    );
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        if !self_update_now(&r) {
+            // The updater could not launch (e.g. failed to spawn the detached
+            // installer). Release the slot so a later hub announce retries instead
+            // of being silently debounced for the rest of this process's life.
+            pending.store(false, Ordering::Release);
+        }
+    });
 }
 
 /// Windows: the running .exe is locked, so a detached PowerShell helper waits for
@@ -277,7 +330,7 @@ fn maybe_self_update(remote: &str, auto_update: bool, r: &Resolved) {
 /// reinstalls the service, restarts it). We exit right after spawning so the
 /// binary unlocks. `-AutoUpdate` persists the setting across the swap.
 #[cfg(windows)]
-fn self_update_now(r: &Resolved) {
+fn self_update_now(r: &Resolved) -> bool {
     let ps_url = "https://raw.githubusercontent.com/doedja/warren/main/install.ps1";
     let mut inv = format!(
         "& ([scriptblock]::Create((irm {} -UseBasicParsing))) -Hub {}",
@@ -320,6 +373,7 @@ fn self_update_now(r: &Resolved) {
         std::process::exit(0);
     }
     tracing::warn!("auto-update: failed to spawn the Windows updater; reinstall manually");
+    false
 }
 
 /// Unix: re-run install.sh to swap the binary and restart the service. The
@@ -328,12 +382,14 @@ fn self_update_now(r: &Resolved) {
 /// and stopping the service kills it before the swap finishes, leaving the node
 /// down (the v0.4.x bug). See `spawn_detached_unix` for how it survives.
 #[cfg(unix)]
-fn self_update_now(r: &Resolved) {
+fn self_update_now(r: &Resolved) -> bool {
     let cmd = unix_update_cmd(r);
     if spawn_detached_unix(&cmd) {
         tracing::warn!("auto-updating: detached installer will swap the binary and restart");
+        true
     } else {
         tracing::warn!("auto-update: failed to launch the updater; reinstall manually");
+        false
     }
 }
 
@@ -399,8 +455,9 @@ fn unix_command_exists(name: &str) -> bool {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn self_update_now(_r: &Resolved) {
+fn self_update_now(_r: &Resolved) -> bool {
     tracing::warn!("auto-update unsupported on this platform; reinstall manually");
+    false
 }
 
 /// Flip the shutdown watch on the first SIGTERM/SIGINT. On non-unix there is no
@@ -463,6 +520,7 @@ async fn dial_conn(addr: &str, connector: &Option<TlsConnector>) -> Result<Conn>
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn connect_once(
     r: &Resolved,
     name: &str,
@@ -471,6 +529,7 @@ async fn connect_once(
     mut shutdown_rx: watch::Receiver<bool>,
     in_flight: Arc<AtomicU32>,
     auto_update: bool,
+    update_pending: Arc<AtomicBool>,
 ) -> Result<()> {
     // Whole handshake is bounded by CONNECT_TIMEOUT so a transport-up but
     // enroll-stalled hub cannot wedge us forever; a timeout returns Err and the
@@ -586,7 +645,7 @@ async fn connect_once(
                             });
                         }
                         HubToNode::HubVersion { version } => {
-                            maybe_self_update(&version, auto_update, r);
+                            maybe_self_update(&version, auto_update, r, &update_pending);
                         }
                     },
                     Ok(Err(e)) => break 'read Err(e.into()),
@@ -1213,12 +1272,28 @@ fn current_platform() -> Platform {
 
 #[cfg(test)]
 mod tests {
-    use super::{backoff_sleep, drain_in_flight, node_run_argv, version_gt, RunArgs, DRAIN_BUDGET};
+    use super::{
+        backoff_sleep, drain_in_flight, node_run_argv, should_schedule_update, version_gt, RunArgs,
+        DRAIN_BUDGET,
+    };
     #[cfg(unix)]
     use super::{unix_update_cmd, Resolved};
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[test]
+    fn schedule_update_requires_newer_auto_and_not_pending() {
+        // Newer hub + auto-update on + nothing pending: schedule.
+        assert!(should_schedule_update("0.4.8", "0.4.7", true, false));
+        // Auto-update off: never schedule (notice only).
+        assert!(!should_schedule_update("0.4.8", "0.4.7", false, false));
+        // Not newer (equal or older): never schedule.
+        assert!(!should_schedule_update("0.4.7", "0.4.7", true, false));
+        assert!(!should_schedule_update("0.4.6", "0.4.7", true, false));
+        // Already pending: debounce, do not stack a second timer.
+        assert!(!should_schedule_update("0.4.8", "0.4.7", true, true));
+    }
 
     #[cfg(unix)]
     fn resolved(tls: bool) -> Resolved {

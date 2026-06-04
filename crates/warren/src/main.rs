@@ -44,7 +44,13 @@ async fn main() -> Result<()> {
 
 fn init_tracing() {
     use tracing_subscriber::{fmt, prelude::*, EnvFilter};
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    // rustls WARNs on every ClientHello whose SNI is a literal IP (RFC 6066: SNI
+    // must be a hostname). Internet scanners hitting the exposed node port do this
+    // constantly; the warning is harmless (rustls ignores the SNI, auth is the
+    // app-layer enroll token) but floods the dashboard hub-log card. Drop just that
+    // target below WARN. RUST_LOG still overrides the whole filter when set.
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,rustls::msgs::handshake=error"));
     // stdout/journald as before, plus an in-memory ring the hub dashboard reads
     // (bounded in logbuf, so it never bloats).
     tracing_subscriber::registry()

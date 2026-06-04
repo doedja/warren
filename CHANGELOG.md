@@ -7,6 +7,37 @@ workflow publishes each version's section here as its GitHub release notes.
 
 ## [Unreleased]
 
+### Fixed
+
+- Hub log no longer floods with `rustls ... Illegal SNI extension` warnings.
+  Internet scanners probing the exposed node port present the host IP as the TLS
+  SNI; rustls warned on every one. The warning was harmless (the SNI is ignored,
+  node auth is the app-layer enroll token) but buried real warnings in the
+  dashboard log card. That one rustls target is now filtered below WARN.
+- Dashboard no longer shows a healthy node as unhealthy next to a contradictory
+  "100%" success rate. Two fixes: (1) the node Health counter now expires a run
+  of failures after 60s with no new failure (a successful dial still resets it
+  instantly), so a node that stopped failing or went idle recovers instead of
+  sticking red until its next success, and transient dead-target timeouts no
+  longer pin an otherwise-fine node. (2) the Success column floors to one decimal
+  instead of rounding, so "100%" shows only when every dial succeeded. The
+  expired health count also feeds routing order and the `/metrics` gauge.
+
+### Changed
+
+- Node auto-update is now staggered across the fleet. A hub redeploy announces
+  the new version to every `--auto-update` node at once; previously they all
+  re-ran the installer and restarted together, so the whole pool blinked out.
+  Each node now waits a random delay (up to 5 min) before updating and keeps
+  serving until it fires, so updates roll one node at a time (version tolerance
+  keeps the not-yet-updated nodes routable). Debounced so a repeated announce
+  does not stack timers. Single-node setups are unaffected (nothing to stagger).
+
+### Security
+
+- The admin/`/metrics` Basic-auth token is now compared in constant time, so it
+  cannot be recovered by timing how long a wrong token takes to reject.
+
 ## [0.4.7] - 2026-06-03
 
 ### Fixed

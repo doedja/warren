@@ -289,7 +289,9 @@ async function loadNodes(){
     if (!n.dials) {
       succ = '<span class="muted">-</span>';
     } else {
-      const pct = Math.round(n.success_rate);
+      // Floor to one decimal: never round a node with failures up to a fake
+      // 100%. "100%" shows only when every dial succeeded (ok === total).
+      const pct = Math.floor(n.success_rate * 10) / 10;
       const col = pct >= 95 ? 'var(--mut)' : 'var(--bad)';
       const err = n.last_error ? ` title="last error: ${esc(n.last_error)}"` : '';
       succ = `<span style="color:${col}"${err}>${pct}% <span class="muted">(${n.dials})</span></span>`;
