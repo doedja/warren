@@ -5,7 +5,7 @@ workflow publishes each version's section here as its GitHub release notes.
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 
-## [Unreleased]
+## [0.4.8] - 2026-06-04
 
 ### Fixed
 
@@ -226,7 +226,8 @@ workflow publishes each version's section here as its GitHub release notes.
 - Dashboard refresh: a stat strip, setup stepper, version badge, and unified copy
   buttons.
 
-[Unreleased]: https://github.com/doedja/warren/compare/v0.4.7...HEAD
+[Unreleased]: https://github.com/doedja/warren/compare/v0.4.8...HEAD
+[0.4.8]: https://github.com/doedja/warren/releases/tag/v0.4.8
 [0.4.7]: https://github.com/doedja/warren/releases/tag/v0.4.7
 [0.4.6]: https://github.com/doedja/warren/releases/tag/v0.4.6
 [0.4.5]: https://github.com/doedja/warren/releases/tag/v0.4.5
