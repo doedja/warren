@@ -5,6 +5,18 @@ workflow publishes each version's section here as its GitHub release notes.
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 
+## [0.4.10] - 2026-06-08
+
+### Fixed
+
+- Windows uninstall now removes the node key created under the SYSTEM profile.
+  The boot task runs as SYSTEM, so the identity lives at
+  `...\System32\config\systemprofile\.warren\node.key`, but uninstall runs as the
+  elevated admin user and only cleared that user's profile. The stale key
+  survived, so a reinstall reused the old identity and the hub kept the node on
+  its previous approval (you had to revoke the key on the hub to re-enroll).
+  Uninstall now clears the SYSTEM-profile key path explicitly.
+
 ## [0.4.9] - 2026-06-08
 
 ### Security
