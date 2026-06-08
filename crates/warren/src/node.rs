@@ -1251,13 +1251,29 @@ async fn uninstall_service() -> Result<()> {
 /// Leave the device clean after the service is gone: delete the node identity
 /// (and its dir if now empty), and best-effort remove the installed binary.
 fn remove_node_state() {
-    let key = default_key_file();
-    if std::fs::remove_file(&key).is_ok() {
-        println!("removed node key: {key}");
+    // Keys to clear. On Windows the boot task runs as SYSTEM (see install_windows),
+    // so the identity was created under the SYSTEM profile, not the interactive
+    // user. Uninstall runs as the elevated admin user, so default_key_file() here
+    // resolves to that user's profile, the WRONG path. Add the SYSTEM profile key
+    // explicitly: otherwise the stale key survives uninstall, a reinstall reuses
+    // it, and the hub keeps the node bound to its old approval (forcing you to
+    // revoke the key on the hub before a fresh enroll takes effect).
+    let mut keys = vec![default_key_file()];
+    if cfg!(windows) {
+        if let Ok(root) = std::env::var("SystemRoot").or_else(|_| std::env::var("windir")) {
+            keys.push(format!(
+                "{root}/System32/config/systemprofile/.warren/node.key"
+            ));
+        }
     }
-    if let Some(dir) = std::path::Path::new(&key).parent() {
-        // Only removes ~/.warren when it is empty; harmless otherwise.
-        let _ = std::fs::remove_dir(dir);
+    for key in &keys {
+        if std::fs::remove_file(key).is_ok() {
+            println!("removed node key: {key}");
+        }
+        if let Some(dir) = std::path::Path::new(key).parent() {
+            // Only removes the .warren dir when it is empty; harmless otherwise.
+            let _ = std::fs::remove_dir(dir);
+        }
     }
     match std::env::current_exe() {
         // A running .exe cannot delete itself on Windows; the PowerShell
