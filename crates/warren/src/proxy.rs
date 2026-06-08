@@ -192,7 +192,10 @@ mod tests {
     #[test]
     fn connect_target_parsing() {
         let s = |h: &str, p: u16| Some((h.to_string(), p));
-        assert_eq!(split_connect_target("example.com:443"), s("example.com", 443));
+        assert_eq!(
+            split_connect_target("example.com:443"),
+            s("example.com", 443)
+        );
         assert_eq!(split_connect_target("example.com"), s("example.com", 443)); // default port
         assert_eq!(split_connect_target("[::1]:8443"), s("::1", 8443)); // bracketed IPv6
         assert_eq!(split_connect_target("[2001:db8::1]"), s("2001:db8::1", 443)); // IPv6, default port

@@ -1549,7 +1549,13 @@ async fn handle_udp_associate(
     let chosen = udp
         .iter()
         .copied()
-        .filter(|n| effective_fails(n.3.load(Ordering::Relaxed), n.7.load(Ordering::Relaxed), now) < UNHEALTHY_AT)
+        .filter(|n| {
+            effective_fails(
+                n.3.load(Ordering::Relaxed),
+                n.7.load(Ordering::Relaxed),
+                now,
+            ) < UNHEALTHY_AT
+        })
         .min_by_key(|n| n.5.load(Ordering::Relaxed))
         .or_else(|| {
             udp.iter()
