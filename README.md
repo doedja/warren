@@ -207,7 +207,9 @@ release before extracting or running it, and abort on a mismatch (set
     -Join warren1.aGVsbG8...
 ```
 
-**Clean uninstall** (stops the service, deletes the node key, removes the binary):
+**Clean uninstall** (stops the service, deletes the node key, removes the binary).
+
+Linux / macOS:
 
 ```bash
 # if warren is on PATH:
@@ -216,8 +218,18 @@ warren node uninstall
 curl -fsSL https://raw.githubusercontent.com/doedja/warren/main/install.sh | sh -s -- --uninstall
 ```
 
-On Windows: `install.ps1 -Uninstall`. Revoke the device's key in the dashboard too
-if you want the hub to forget it. No prebuilt binary for your arch? Build it:
+Windows, from an **elevated** PowerShell (the startup task runs as SYSTEM, so
+removing it needs admin):
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/doedja/warren/main/install.ps1))) -Uninstall
+```
+
+(`irm install.ps1 | iex` cannot pass `-Uninstall`; the script-block form above
+downloads and runs the script with the switch.)
+
+Revoke the device's key in the dashboard too if you want the hub to forget it.
+No prebuilt binary for your arch? Build it:
 `cargo install --git https://github.com/doedja/warren warren`.
 
 ### On a phone (Android, via Termux)
