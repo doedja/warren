@@ -199,7 +199,10 @@ function setStatus(m){ document.getElementById('status').textContent = m; }
 async function api(method, path, body){
   // Page is behind HTTP Basic auth; the browser attaches credentials to these
   // same-origin requests automatically.
-  const opt = { method, headers: {} };
+  // Custom header marks the request as coming from this dashboard. Mutating
+  // routes require it; a cross-site page cannot set it without a CORS preflight
+  // the hub rejects, which is the CSRF defense. Harmless on read routes.
+  const opt = { method, headers: { 'X-Warren-Admin': '1' } };
   if (body){ opt.headers['Content-Type']='application/json'; opt.body = JSON.stringify(body); }
   const r = await fetch(path, opt);
   if (r.status === 401){ setStatus('unauthorized (reload to sign in)'); throw new Error('401'); }
@@ -370,7 +373,10 @@ async function addToken(){
   if (res && res.token) setStatus('token: ' + res.token);
   document.getElementById('tname').value=''; loadTokens();
 }
-async function delToken(t){ await api('DELETE','/api/tokens/'+encodeURIComponent(t)); loadTokens(); }
+async function delToken(t){
+  if (!confirm('Delete this enrollment token?\n\nDevices still holding it will no longer be able to join. Nodes already connected keep working until they disconnect.')) return;
+  await api('DELETE','/api/tokens/'+encodeURIComponent(t)); loadTokens();
+}
 async function renameToken(t, cur){
   const name = (prompt('New name for this token (this is its group label)', cur || '') || '').trim();
   if (!name || name === cur) return;

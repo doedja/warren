@@ -148,6 +148,9 @@ impl Store {
     }
 
     pub fn add_user(&self, username: &str, password: &str) -> Result<()> {
+        if username.is_empty() || password.is_empty() {
+            anyhow::bail!("proxy username and password must both be non-empty");
+        }
         // `+` and `-session-` are reserved in proxy usernames: clients put a
         // device name after `+` (user+device) or a session key after `-session-`
         // (user-session-KEY) to control routing, so a username containing either
@@ -273,6 +276,23 @@ impl Store {
         }
     }
 
+    /// True if an approved node OTHER than `pubkey` already uses `name`
+    /// (case-insensitive). Routing markers like `user+name` select by this name,
+    /// so two devices sharing one would route ambiguously; enrollment rejects the
+    /// second.
+    pub fn node_name_taken_by_other(&self, name: &str, pubkey: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        match conn.query_row(
+            "SELECT 1 FROM node_keys WHERE name = ?1 COLLATE NOCASE AND pubkey != ?2",
+            rusqlite::params![name, pubkey],
+            |_| Ok(()),
+        ) {
+            Ok(_) => Ok(true),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     pub fn list_nodes(&self) -> Result<Vec<(String, String, i64)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare("SELECT pubkey, name, approved_at FROM node_keys")?;
@@ -301,9 +321,26 @@ impl Store {
 
     // --- pending nodes (awaiting approval) ------------------------------------
 
-    /// Record a pubkey awaiting admin approval (no-op if already pending).
+    /// Record a pubkey awaiting admin approval (no-op if already pending). Capped
+    /// so an attacker flooding unsigned/invalid Hellos cannot grow the table
+    /// without bound; once full, only already-pending keys are refreshed.
     pub fn add_pending(&self, pubkey: &str, name: &str, code: &str) -> Result<()> {
+        const MAX_PENDING: i64 = 256;
         let conn = self.conn.lock().unwrap();
+        let already: bool = conn
+            .query_row(
+                "SELECT 1 FROM pending_nodes WHERE pubkey = ?1",
+                rusqlite::params![pubkey],
+                |_| Ok(()),
+            )
+            .is_ok();
+        if !already {
+            let count: i64 =
+                conn.query_row("SELECT COUNT(*) FROM pending_nodes", [], |r| r.get(0))?;
+            if count >= MAX_PENDING {
+                anyhow::bail!("pending-node table full ({MAX_PENDING}); approve or clear entries");
+            }
+        }
         conn.execute(
             "INSERT OR IGNORE INTO pending_nodes (pubkey, name, code, first_seen) VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![pubkey, name, code, Self::now()],
@@ -399,5 +436,40 @@ mod tests {
         // a valid username, otherwise auth would be ambiguous.
         assert!(store.add_user("me+phone", "p").is_err());
         assert!(store.add_user("me", "p").is_ok());
+    }
+
+    #[test]
+    fn rejects_empty_credentials() {
+        let store = Store::open(":memory:").unwrap();
+        assert!(store.add_user("", "p").is_err());
+        assert!(store.add_user("u", "").is_err());
+        assert!(store.add_user("u", "p").is_ok());
+    }
+
+    #[test]
+    fn node_name_uniqueness() {
+        let store = Store::open(":memory:").unwrap();
+        store.approve_node("pk-a", "phone").unwrap();
+        // Same name, different key -> taken. Case-insensitive.
+        assert!(store.node_name_taken_by_other("phone", "pk-b").unwrap());
+        assert!(store.node_name_taken_by_other("PHONE", "pk-b").unwrap());
+        // The owning key is excluded, so its own reconnect is fine.
+        assert!(!store.node_name_taken_by_other("phone", "pk-a").unwrap());
+        // A free name is fine.
+        assert!(!store.node_name_taken_by_other("laptop", "pk-b").unwrap());
+    }
+
+    #[test]
+    fn pending_table_is_capped() {
+        let store = Store::open(":memory:").unwrap();
+        for i in 0..256 {
+            store
+                .add_pending(&format!("pk{i}"), "n", &format!("c{i}"))
+                .unwrap();
+        }
+        // 257th distinct key is rejected once the table is full...
+        assert!(store.add_pending("overflow", "n", "co").is_err());
+        // ...but an already-pending key is still refreshed (no growth).
+        assert!(store.add_pending("pk0", "n", "c0").is_ok());
     }
 }

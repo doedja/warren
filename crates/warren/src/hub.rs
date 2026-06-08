@@ -26,7 +26,7 @@ use clap::Args;
 use serde::{Deserialize, Serialize};
 use tokio::io::{copy_bidirectional, split, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use tokio::time::{timeout, Duration};
 use tokio_rustls::TlsAcceptor;
 
@@ -88,6 +88,10 @@ const HUB_VERSION_MIN: u16 = 6;
 /// Bound on a data stream sending its DataHello before we give up on it, so a
 /// stream opened but never identified cannot leak a task + open stream.
 const DATA_HELLO_TIMEOUT: Duration = Duration::from_secs(15);
+/// Upper bound on a proxy client's pre-tunnel handshake (peek + SOCKS5/HTTP
+/// negotiation). Stops a client that connects then stalls from pinning a task +
+/// socket. Does not bound the data splice that follows.
+const PROXY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Args, Debug)]
 pub struct HubArgs {
@@ -184,6 +188,12 @@ struct NodeEntry {
     /// a stale half-open connection removes only its own entry, never the live
     /// reconnected one that shares the id.
     conn_seq: u64,
+    /// The node's key fingerprint (same value the store keys approvals on). Lets a
+    /// key revocation find and tear down this live link immediately.
+    pubkey: String,
+    /// Fired to force this link down (e.g. on key revocation). The connection
+    /// task selects on it alongside its read/accept loops.
+    shutdown: Arc<Notify>,
 }
 
 #[derive(Default, Clone)]
@@ -281,6 +291,14 @@ struct Hub {
     /// Per node id: (successful dials, total dials, last error reason). For the
     /// dashboard's success-rate + last-error display.
     node_stats: Mutex<NodeStats>,
+    /// Concurrent node-link count per source IP. A node holds one link, so a flood
+    /// of connections from one IP is abuse; capped to bound task/FD growth.
+    node_conns: StdMutex<HashMap<IpAddr, u32>>,
+    /// Highest enrollment timestamp accepted per node key fingerprint. A new
+    /// Hello must be strictly newer, so a captured Hello cannot be replayed within
+    /// the 120s skew window to displace the live link. In-memory: a hub restart
+    /// reopens only the 120s window.
+    last_auth: StdMutex<HashMap<String, u64>>,
 }
 
 /// Per node id -> (ok dials, total dials, last error). Aliased to keep the
@@ -317,6 +335,18 @@ fn node_snap(n: &NodeEntry) -> NodeSnap {
 impl Hub {
     fn next_conn_id(&self) -> u64 {
         self.conn_seq.fetch_add(1, Ordering::Relaxed)
+    }
+    /// Force every live link whose key fingerprint is `pubkey` down. Returns how
+    /// many were signalled. Called on key revocation so a captured session cannot
+    /// keep proxying until the link drops on its own.
+    async fn disconnect_node(&self, pubkey: &str) -> usize {
+        let nodes = self.nodes.lock().await;
+        let mut n = 0;
+        for e in nodes.iter().filter(|e| e.pubkey == pubkey) {
+            e.shutdown.notify_one();
+            n += 1;
+        }
+        n
     }
     /// Snapshot of connected nodes (id, name, tx, fails, host_fails, in_flight). When `sel`
     /// is `Some(name)`, only nodes with that exact device name are returned, so a
@@ -665,6 +695,8 @@ pub async fn run_with_listeners(
         node_bytes: Mutex::new(HashMap::new()),
         user_bytes: Mutex::new(HashMap::new()),
         node_stats: Mutex::new(HashMap::new()),
+        node_conns: StdMutex::new(HashMap::new()),
+        last_auth: StdMutex::new(HashMap::new()),
     });
 
     // Central UDP demux: one socket, datagrams routed to an association by the
@@ -779,7 +811,49 @@ pub async fn run_with_listeners(
     Ok(())
 }
 
+/// Max concurrent node links from a single source IP. A node holds exactly one
+/// link, so anything beyond a small reconnect overlap is abuse.
+const MAX_NODE_CONNS_PER_IP: u32 = 16;
+
+/// RAII per-IP node-connection counter. Increments on acquire, decrements (and
+/// prunes the map entry) on drop, so the count tracks live links exactly.
+struct NodeConnGuard {
+    hub: Arc<Hub>,
+    ip: IpAddr,
+}
+
+impl NodeConnGuard {
+    fn acquire(hub: &Arc<Hub>, ip: IpAddr) -> Option<Self> {
+        let mut m = hub.node_conns.lock().unwrap();
+        let c = m.entry(ip).or_insert(0);
+        if *c >= MAX_NODE_CONNS_PER_IP {
+            return None;
+        }
+        *c += 1;
+        Some(Self {
+            hub: hub.clone(),
+            ip,
+        })
+    }
+}
+
+impl Drop for NodeConnGuard {
+    fn drop(&mut self) {
+        let mut m = self.hub.node_conns.lock().unwrap();
+        if let Some(c) = m.get_mut(&self.ip) {
+            *c -= 1;
+            if *c == 0 {
+                m.remove(&self.ip);
+            }
+        }
+    }
+}
+
 async fn handle_node_conn(stream: TcpStream, peer_ip: IpAddr, hub: Arc<Hub>) -> Result<()> {
+    let Some(_conn_guard) = NodeConnGuard::acquire(&hub, peer_ip) else {
+        tracing::debug!(%peer_ip, "too many node connections from this IP; dropping");
+        return Ok(());
+    };
     let conn = match &hub.tls {
         Some(acceptor) => Conn::ServerTls(acceptor.accept(stream).await?),
         None => Conn::Plain(stream),
@@ -821,6 +895,9 @@ async fn handle_node_conn(stream: TcpStream, peer_ip: IpAddr, hub: Arc<Hub>) -> 
         // dropping _driver aborts the connection.
         _ => return Ok(()),
     };
+    let pubkey = identity::fingerprint(&hello.pubkey);
+    // Fired by a key revocation to force this link down (see Hub::disconnect_node).
+    let shutdown = Arc::new(Notify::new());
 
     let (tx, mut rx) = mpsc::unbounded_channel::<HubToNode>();
     let info = Arc::new(StdMutex::new(NodeReport::default()));
@@ -854,6 +931,8 @@ async fn handle_node_conn(stream: TcpStream, peer_ip: IpAddr, hub: Arc<Hub>) -> 
         info: info.clone(),
         group,
         conn_seq,
+        pubkey,
+        shutdown: shutdown.clone(),
     })
     .await;
     tracing::info!(node = %node_id.0, ip = %peer_ip, ver = hello.protocol_version, "node enrolled");
@@ -915,15 +994,13 @@ async fn handle_node_conn(stream: TcpStream, peer_ip: IpAddr, hub: Arc<Hub>) -> 
                         tracing::debug!(conn_id, %reason, "node reported dial failed");
                         let _ = ctrl_hub.take_pending(conn_id).await;
                     }
-                    NodeToHub::Info {
-                        public_ip,
-                        country,
-                        city,
-                    } => {
-                        let mut r = ctrl_info.lock().unwrap();
-                        r.ip = public_ip;
-                        r.country = country;
-                        r.city = city;
+                    NodeToHub::Info { .. } => {
+                        // Ignored: ip/country/city are hub-authoritative. The hub
+                        // sets `ip` from the control-conn peer address (the node's
+                        // real egress) and resolves geo itself. Trusting the
+                        // node-reported values here would let a malicious node spoof
+                        // its country and capture `user-region-*` traffic it should
+                        // not serve.
                     }
                     NodeToHub::Latency { ms } => {
                         ctrl_info.lock().unwrap().latency_ms = Some(ms);
@@ -953,6 +1030,7 @@ async fn handle_node_conn(stream: TcpStream, peer_ip: IpAddr, hub: Arc<Hub>) -> 
     let reason = tokio::select! {
         _ = accept => "connection closed",
         r = &mut ctrl_loop => r.unwrap_or("control task ended"),
+        _ = shutdown.notified() => "key revoked",
     };
 
     hub.remove_node(&node_id, conn_seq).await;
@@ -1026,9 +1104,56 @@ async fn enroll_node(
         return Ok(None);
     }
 
+    let pk_hex = identity::fingerprint(&hello.pubkey);
+
+    // 1a. Replay guard: each new Hello must carry a strictly newer timestamp than
+    //     the last one accepted for this key. A captured Hello (same timestamp)
+    //     is therefore rejected, so it cannot be replayed inside the 120s skew
+    //     window to displace the live link. (Lock released before the await.)
+    let replayed = {
+        let mut seen = hub.last_auth.lock().unwrap();
+        match seen.get(&pk_hex) {
+            Some(&prev) if hello.timestamp <= prev => true,
+            _ => {
+                seen.insert(pk_hex.clone(), hello.timestamp);
+                false
+            }
+        }
+    };
+    if replayed {
+        let _ = write_msg(
+            conn,
+            &HelloReply::Reject {
+                reason: "stale or replayed timestamp".into(),
+            },
+        )
+        .await;
+        return Ok(None);
+    }
+
+    // 1b. Names disambiguate routing (`user+name`), so a device may not claim a
+    //     name already approved for a DIFFERENT key (its own key is excluded, so
+    //     reconnects are fine).
+    if hub
+        .store
+        .node_name_taken_by_other(&hello.node_name, &pk_hex)
+        .unwrap_or(false)
+    {
+        let _ = write_msg(
+            conn,
+            &HelloReply::Reject {
+                reason: format!(
+                    "node name '{}' is already in use by another device; pass a unique --name",
+                    hello.node_name
+                ),
+            },
+        )
+        .await;
+        return Ok(None);
+    }
+
     // 2. Enrollment: an already-approved key, or a valid token (auto-approve),
     //    otherwise record as pending and ask for admin approval.
-    let pk_hex = identity::fingerprint(&hello.pubkey);
     let code = identity::short_code(&hello.pubkey);
     if !hub.store.is_node_approved(&pk_hex).unwrap_or(false) {
         let by_token = hello
@@ -1147,7 +1272,12 @@ enum Mode {
 async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
     // Detect the client protocol by peeking the first byte (0x05 = SOCKS5).
     let mut peek = [0u8; 1];
-    if client.peek(&mut peek).await? == 0 {
+    let peeked = match timeout(PROXY_HANDSHAKE_TIMEOUT, client.peek(&mut peek)).await {
+        Ok(r) => r?,
+        Err(_) => return Ok(()), // connected but sent nothing in time
+    };
+    if peeked == 0 {
+        tracing::debug!(peer = ?client.peer_addr().ok(), "client closed before sending any bytes");
         return Ok(());
     }
 
@@ -1169,7 +1299,16 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
 
     let (mode, host, port) = if peek[0] == 0x05 {
         let verify_opt: Option<&socks5::Verifier> = if need_auth { Some(&verify) } else { None };
-        match socks5::negotiate(&mut client, verify_opt).await? {
+        let neg = match timeout(
+            PROXY_HANDSHAKE_TIMEOUT,
+            socks5::negotiate(&mut client, verify_opt),
+        )
+        .await
+        {
+            Ok(r) => r?,
+            Err(_) => return Ok(()),
+        };
+        match neg {
             Some(socks5::Socks5Req::Connect { host, port }) => (Mode::Socks5, host, port),
             Some(socks5::Socks5Req::UdpAssociate) => {
                 // UDP relay: a different shape from the TCP splice, so it gets its
@@ -1181,7 +1320,10 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
             None => return Ok(()), // rejected, reply already sent
         }
     } else {
-        let req = proxy::read_request(&mut client).await?;
+        let req = match timeout(PROXY_HANDSHAKE_TIMEOUT, proxy::read_request(&mut client)).await {
+            Ok(r) => r?,
+            Err(_) => return Ok(()),
+        };
         if need_auth {
             let ok = req
                 .authorization()
@@ -1194,15 +1336,9 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
             }
         }
         if req.method.eq_ignore_ascii_case("CONNECT") {
-            // target is host:port
-            match req.target.rsplit_once(':') {
-                Some((h, p)) => match p.parse::<u16>() {
-                    Ok(port) => (Mode::Connect, h.to_string(), port),
-                    Err(_) => {
-                        proxy::write_bad_gateway(&mut client).await?;
-                        return Ok(());
-                    }
-                },
+            // host:port, bracketed IPv6, or bare host (defaults to port 443).
+            match proxy::split_connect_target(&req.target) {
+                Some((h, port)) => (Mode::Connect, h, port),
                 None => {
                     proxy::write_bad_gateway(&mut client).await?;
                     return Ok(());
@@ -1381,28 +1517,56 @@ async fn handle_udp_associate(
     // per-datagram failover; one node carries the whole association. Only nodes
     // new enough to speak UDP (the 7th tuple field is the protocol version) are
     // eligible, so an older node in the pool is skipped for UDP but still serves TCP.
+    // Sticky sessions over UDP pin to the device that served the session, same as
+    // TCP, falling back to the full pool if that device is gone. Without this,
+    // `user-session-KEY` would silently spread datagrams across the pool.
+    let session_key = if let Route::Session(k) = &route {
+        Some(k.clone())
+    } else {
+        None
+    };
     let nodes: Vec<NodeSnap> = match &route {
         Route::Device(name) => hub.snapshot(Some(name)).await,
         Route::Region(country) => hub.snapshot_region(country).await,
         Route::Group(group) => hub.snapshot_group(group).await,
-        _ => hub.snapshot(None).await,
+        Route::Session(key) => match hub.session_node(key).await {
+            Some(name) => {
+                let pinned = hub.snapshot(Some(&name)).await;
+                if pinned.is_empty() {
+                    hub.snapshot(None).await
+                } else {
+                    pinned
+                }
+            }
+            None => hub.snapshot(None).await,
+        },
+        Route::Pool => hub.snapshot(None).await,
     };
     let udp: Vec<&NodeSnap> = nodes.iter().filter(|n| n.6 >= UDP_MIN_VERSION).collect();
+    // Match TCP health semantics: failures older than the health window stop
+    // counting (effective_fails), so a recovered node is not wrongly excluded.
+    let now = unix_now();
     let chosen = udp
         .iter()
         .copied()
-        .filter(|n| n.3.load(Ordering::Relaxed) < UNHEALTHY_AT)
+        .filter(|n| effective_fails(n.3.load(Ordering::Relaxed), n.7.load(Ordering::Relaxed), now) < UNHEALTHY_AT)
         .min_by_key(|n| n.5.load(Ordering::Relaxed))
         .or_else(|| {
             udp.iter()
                 .copied()
                 .min_by_key(|n| n.5.load(Ordering::Relaxed))
         });
-    let Some((node_id, _name, node_tx, _fails, _host_fails, in_flight, _ver, _last_fail)) = chosen
+    let Some((node_id, node_name, node_tx, _fails, _host_fails, in_flight, _ver, _last_fail)) =
+        chosen
     else {
         socks5::write_reply(&mut client, socks5::REP_GENERAL_FAILURE).await?;
         return Ok(());
     };
+    // Stick the session to the chosen device so later requests (TCP or UDP) on the
+    // same session key land on it too.
+    if let Some(key) = &session_key {
+        hub.set_session(key, node_name).await;
+    }
     let node_id = node_id.0.clone();
     let _g = mux::InFlightGuard::new(in_flight.clone());
 
@@ -1464,8 +1628,9 @@ async fn handle_udp_associate(
         while let Ok(dg) = read_msg::<_, UdpDatagram>(&mut srd).await {
             let dest = *csrc.lock().unwrap();
             if let Some(ca) = dest {
-                let pkt = socks5::wrap_udp(&dg.host, dg.port, &dg.data);
-                let _ = relay_tx.send_to(&pkt, ca).await;
+                if let Some(pkt) = socks5::wrap_udp(&dg.host, dg.port, &dg.data) {
+                    let _ = relay_tx.send_to(&pkt, ca).await;
+                }
             }
         }
     });
@@ -1628,6 +1793,21 @@ fn authed(headers: &HeaderMap, token: &str) -> bool {
         .and_then(crate::proxy::parse_basic)
         .map(|(_, pass)| ct_eq(pass.as_bytes(), token.as_bytes()))
         .unwrap_or(false)
+}
+
+/// Guard for state-changing admin routes: valid Basic-auth token AND a custom
+/// `X-Warren-Admin` header. The dashboard's own fetch() sets the header; a
+/// cross-site page cannot (a custom header forces a CORS preflight the hub never
+/// approves), so a malicious site holding the browser's cached Basic creds still
+/// cannot drive a mutation. Non-browser clients (curl) just pass the header.
+fn admin_mutate_ok(headers: &HeaderMap, token: &str) -> Result<(), StatusCode> {
+    if !authed(headers, token) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    if !headers.contains_key("x-warren-admin") {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(())
 }
 
 /// 401 with a Basic challenge, so a browser shows its login prompt.
@@ -1837,9 +2017,7 @@ async fn api_create_token(
     headers: HeaderMap,
     Json(req): Json<NameReq>,
 ) -> Result<Json<TokenResp>, StatusCode> {
-    if !authed(&headers, &ctx.token) {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
+    admin_mutate_ok(&headers, &ctx.token)?;
     if Store::validate_token_name(&req.name).is_err() {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -1853,9 +2031,7 @@ async fn api_delete_token(
     headers: HeaderMap,
     Path(token): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
-    if !authed(&headers, &ctx.token) {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
+    admin_mutate_ok(&headers, &ctx.token)?;
     ctx.hub.store.delete_token(&token).map_err(ise)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1869,9 +2045,7 @@ async fn api_rename_token(
     Path(token): Path<String>,
     Json(req): Json<NameReq>,
 ) -> Result<StatusCode, StatusCode> {
-    if !authed(&headers, &ctx.token) {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
+    admin_mutate_ok(&headers, &ctx.token)?;
     if Store::validate_token_name(&req.name).is_err() {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -1916,8 +2090,9 @@ async fn api_create_user(
     headers: HeaderMap,
     Json(req): Json<UserReq>,
 ) -> Result<StatusCode, StatusCode> {
-    if !authed(&headers, &ctx.token) {
-        return Err(StatusCode::UNAUTHORIZED);
+    admin_mutate_ok(&headers, &ctx.token)?;
+    if req.username.is_empty() || req.password.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
     }
     ctx.hub
         .store
@@ -1931,9 +2106,7 @@ async fn api_delete_user(
     headers: HeaderMap,
     Path(username): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
-    if !authed(&headers, &ctx.token) {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
+    admin_mutate_ok(&headers, &ctx.token)?;
     ctx.hub.store.delete_user(&username).map_err(ise)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1978,9 +2151,7 @@ async fn api_approve_pending(
     headers: HeaderMap,
     Path(pubkey): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
-    if !authed(&headers, &ctx.token) {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
+    admin_mutate_ok(&headers, &ctx.token)?;
     // Carry over the name from the pending entry if present.
     let name = ctx
         .hub
@@ -2000,9 +2171,7 @@ async fn api_deny_pending(
     headers: HeaderMap,
     Path(pubkey): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
-    if !authed(&headers, &ctx.token) {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
+    admin_mutate_ok(&headers, &ctx.token)?;
     ctx.hub.store.delete_pending(&pubkey).map_err(ise)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2031,10 +2200,14 @@ async fn api_delete_node_key(
     headers: HeaderMap,
     Path(pubkey): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
-    if !authed(&headers, &ctx.token) {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
+    admin_mutate_ok(&headers, &ctx.token)?;
     ctx.hub.store.delete_node(&pubkey).map_err(ise)?;
+    // Reconnection is already blocked by the deleted key; also tear down any link
+    // still live so a captured session stops proxying immediately.
+    let dropped = ctx.hub.disconnect_node(&pubkey).await;
+    if dropped > 0 {
+        tracing::info!(%pubkey, count = dropped, "revoked node key; tore down live link(s)");
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2059,13 +2232,43 @@ fn remove_conn(nodes: &mut Vec<NodeEntry>, id: &NodeId, conn_seq: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ct_eq, displace_and_push, effective_fails, parse_route, remove_conn, route_rank,
-        success_pct, NodeEntry, NodeId, NodeReport, Route, HEALTH_WINDOW_SECS, UNHEALTHY_AT,
+        admin_mutate_ok, ct_eq, displace_and_push, effective_fails, parse_route, remove_conn,
+        route_rank, success_pct, NodeEntry, NodeId, NodeReport, Route, HEALTH_WINDOW_SECS,
+        UNHEALTHY_AT,
     };
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use base64::Engine as _;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicI64, AtomicU32};
     use std::sync::{Arc, Mutex};
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, Notify};
+
+    #[test]
+    fn admin_mutate_guard_requires_auth_and_csrf_header() {
+        let tok = "secret";
+        let basic = base64::engine::general_purpose::STANDARD.encode("admin:secret");
+        let auth = || HeaderValue::from_str(&format!("Basic {basic}")).unwrap();
+
+        // Both present -> ok.
+        let mut h = HeaderMap::new();
+        h.insert("authorization", auth());
+        h.insert("x-warren-admin", HeaderValue::from_static("1"));
+        assert!(admin_mutate_ok(&h, tok).is_ok());
+
+        // Authed but no CSRF header -> 403 (blocks cross-site requests carrying
+        // the browser's cached Basic creds).
+        let mut h = HeaderMap::new();
+        h.insert("authorization", auth());
+        assert_eq!(admin_mutate_ok(&h, tok).unwrap_err(), StatusCode::FORBIDDEN);
+
+        // CSRF header but bad/no token -> 401.
+        let mut h = HeaderMap::new();
+        h.insert("x-warren-admin", HeaderValue::from_static("1"));
+        assert_eq!(
+            admin_mutate_ok(&h, tok).unwrap_err(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
 
     fn entry(id: &str, conn_seq: u64) -> NodeEntry {
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -2083,6 +2286,8 @@ mod tests {
             info: Arc::new(Mutex::new(NodeReport::default())),
             group: None,
             conn_seq,
+            pubkey: String::new(),
+            shutdown: Arc::new(Notify::new()),
         }
     }
 

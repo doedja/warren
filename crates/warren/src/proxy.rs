@@ -121,6 +121,26 @@ pub fn forward_request(req: &HttpRequest) -> Option<(String, u16, Vec<u8>)> {
     Some((host, port, out.into_bytes()))
 }
 
+/// Split an HTTP CONNECT target into (host, port). Handles bracketed IPv6
+/// literals (`[::1]:443`, `[::1]`), `host:port`, and a bare `host` (default
+/// port 443, per the CONNECT convention). Returns None only when an explicit
+/// port is present but unparseable.
+pub fn split_connect_target(target: &str) -> Option<(String, u16)> {
+    if let Some(rest) = target.strip_prefix('[') {
+        let (host, after) = rest.split_once(']')?;
+        let port = match after.strip_prefix(':') {
+            Some(p) => p.parse().ok()?,
+            None if after.is_empty() => 443,
+            None => return None,
+        };
+        return Some((host.to_string(), port));
+    }
+    match target.rsplit_once(':') {
+        Some((h, p)) => Some((h.to_string(), p.parse().ok()?)),
+        None => Some((target.to_string(), 443)),
+    }
+}
+
 /// Parse a `Basic <base64(user:pass)>` header value into (user, pass).
 pub fn parse_basic(authorization: &str) -> Option<(String, String)> {
     let rest = match authorization.get(..6) {
@@ -167,6 +187,17 @@ mod tests {
             Some(("user".to_string(), "pass".to_string()))
         );
         assert_eq!(parse_basic("Bearer x"), None);
+    }
+
+    #[test]
+    fn connect_target_parsing() {
+        let s = |h: &str, p: u16| Some((h.to_string(), p));
+        assert_eq!(split_connect_target("example.com:443"), s("example.com", 443));
+        assert_eq!(split_connect_target("example.com"), s("example.com", 443)); // default port
+        assert_eq!(split_connect_target("[::1]:8443"), s("::1", 8443)); // bracketed IPv6
+        assert_eq!(split_connect_target("[2001:db8::1]"), s("2001:db8::1", 443)); // IPv6, default port
+        assert_eq!(split_connect_target("example.com:notaport"), None); // bad explicit port
+        assert_eq!(split_connect_target("[::1]:bad"), None); // bad bracketed port
     }
 
     #[tokio::test]

@@ -251,7 +251,7 @@ pub fn parse_udp_header(buf: &[u8]) -> Option<(String, u16, usize)> {
 /// Build a SOCKS5 UDP reply datagram for a packet coming back from `host:port`:
 /// the RSV/FRAG/ATYP/ADDR/PORT header followed by `data`, ready to send to the
 /// client's UDP socket.
-pub fn wrap_udp(host: &str, port: u16, data: &[u8]) -> Vec<u8> {
+pub fn wrap_udp(host: &str, port: u16, data: &[u8]) -> Option<Vec<u8>> {
     let mut out = vec![0x00, 0x00, 0x00]; // RSV, RSV, FRAG=0
     if let Ok(v4) = host.parse::<std::net::Ipv4Addr>() {
         out.push(ATYP_IPV4);
@@ -261,13 +261,18 @@ pub fn wrap_udp(host: &str, port: u16, data: &[u8]) -> Vec<u8> {
         out.extend_from_slice(&v6.octets());
     } else {
         let h = host.as_bytes();
+        // SOCKS5 domain length is a single byte; a longer name cannot be encoded
+        // without silent truncation, so drop the datagram instead.
+        if h.len() > 255 {
+            return None;
+        }
         out.push(ATYP_DOMAIN);
         out.push(h.len() as u8);
         out.extend_from_slice(h);
     }
     out.extend_from_slice(&port.to_be_bytes());
     out.extend_from_slice(data);
-    out
+    Some(out)
 }
 
 #[cfg(test)]
@@ -313,15 +318,17 @@ mod tests {
     fn udp_header_roundtrip() {
         // wrap_udp builds a reply header; parse_udp_header reads a request header.
         // Same on-wire layout, so a wrap then parse round-trips host/port/data.
-        let dgram = wrap_udp("1.1.1.1", 53, b"\xde\xad");
+        let dgram = wrap_udp("1.1.1.1", 53, b"\xde\xad").expect("wrap");
         let (host, port, off) = parse_udp_header(&dgram).expect("parse");
         assert_eq!((host.as_str(), port), ("1.1.1.1", 53));
         assert_eq!(&dgram[off..], b"\xde\xad");
+        // A domain longer than 255 bytes cannot be SOCKS5-encoded: drop it.
+        assert!(wrap_udp(&"a".repeat(256), 53, b"x").is_none());
     }
 
     #[test]
     fn udp_header_domain_and_fragment() {
-        let dgram = wrap_udp("dns.example", 5353, b"x");
+        let dgram = wrap_udp("dns.example", 5353, b"x").expect("wrap");
         let (host, port, off) = parse_udp_header(&dgram).expect("parse domain");
         assert_eq!((host.as_str(), port), ("dns.example", 5353));
         assert_eq!(&dgram[off..], b"x");

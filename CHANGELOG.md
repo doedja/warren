@@ -5,6 +5,56 @@ workflow publishes each version's section here as its GitHub release notes.
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 
+## [0.4.9] - 2026-06-08
+
+### Security
+
+- Region routing can no longer be spoofed by a node. A connected node's
+  self-reported IP, country, and city are now treated as display-only; the hub
+  uses the control-connection peer address and its own geo lookup for all routing
+  decisions, so a malicious node cannot claim another country to capture
+  `user-region-*` traffic.
+- Revoking a node key in the dashboard now tears down that device's live link
+  immediately. Previously the key was removed (blocking reconnect) but an
+  already-connected device kept proxying until it disconnected on its own.
+- Enrollment is replay-protected. Each Hello must carry a timestamp strictly
+  newer than the last one accepted for that key, so a captured Hello cannot be
+  replayed inside the skew window to displace the live link.
+- State-changing admin routes (create/delete tokens, users, keys; approve/deny
+  devices) now require an `X-Warren-Admin` request header in addition to the
+  Basic-auth token. The dashboard sends it automatically; a cross-site page
+  cannot, which blocks CSRF. Scripts driving these routes add
+  `-H "X-Warren-Admin: 1"` (read-only `GET`s are unaffected).
+- DoS hardening on the public listeners: a per-IP cap on concurrent node links, a
+  bounded proxy-handshake timeout, and a cap on the pending-enrollment table.
+- The TLS certificate and key files are written with `0600` permissions on Unix,
+  matching node identity-key handling.
+
+### Fixed
+
+- HTTP `CONNECT` now parses bracketed IPv6 targets (`[::1]:443`) and bare hosts
+  (defaulting to port 443) instead of rejecting them.
+- UDP node selection now applies the same recent-failure health window as TCP, so
+  a recovered node is no longer wrongly excluded from UDP associations.
+- Sticky sessions over SOCKS5 UDP now pin to the session's device, matching TCP.
+  Previously `user-session-KEY` silently spread datagrams across the whole pool.
+- A device may no longer enroll under a name already in use by a different key,
+  which previously made `user+name` routing ambiguous.
+- SOCKS5 UDP replies for domain names longer than 255 bytes are dropped rather
+  than truncated into a malformed datagram.
+- Empty proxy usernames and passwords are rejected server-side (was only checked
+  in the dashboard).
+
+### Changed
+
+- Deleting an enrollment token in the dashboard now asks for confirmation.
+- A node connecting in plaintext to a TLS hub now fails with a pointed hint
+  (use the join code or `--tls`) instead of an opaque handshake error.
+- launchd plist generation XML-escapes interpolated paths and arguments.
+- A client that connects but sends no bytes is logged at debug level.
+- README: minimum Rust is 1.88 (was 1.74); UDP egress targets may be IPv4 or
+  IPv6 (was documented as IPv4-only).
+
 ## [0.4.8] - 2026-06-04
 
 ### Fixed
@@ -226,7 +276,8 @@ workflow publishes each version's section here as its GitHub release notes.
 - Dashboard refresh: a stat strip, setup stepper, version badge, and unified copy
   buttons.
 
-[Unreleased]: https://github.com/doedja/warren/compare/v0.4.8...HEAD
+[Unreleased]: https://github.com/doedja/warren/compare/v0.4.9...HEAD
+[0.4.9]: https://github.com/doedja/warren/releases/tag/v0.4.9
 [0.4.8]: https://github.com/doedja/warren/releases/tag/v0.4.8
 [0.4.7]: https://github.com/doedja/warren/releases/tag/v0.4.7
 [0.4.6]: https://github.com/doedja/warren/releases/tag/v0.4.6

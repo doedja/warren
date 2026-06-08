@@ -558,14 +558,27 @@ async fn connect_once(
         agent_version: env!("CARGO_PKG_VERSION").to_string(),
     };
     // Open the control stream + exchange Hello/HelloReply under the same bound.
-    let (ctrl, reply) = tokio::time::timeout(CONNECT_TIMEOUT, async {
+    // A plaintext node against a TLS hub fails here (garbled handshake), so when
+    // we are not using TLS, add a pointed hint instead of a bare decode/timeout.
+    let tls_hint = "; if the hub uses TLS, re-run with the join code (or --tls)";
+    let (ctrl, reply) = match tokio::time::timeout(CONNECT_TIMEOUT, async {
         let mut ctrl = mux::open(&opener).await?;
         write_msg(&mut ctrl, &Greeting::Control(hello)).await?;
         let reply: HelloReply = read_msg(&mut ctrl).await?;
         Ok::<_, anyhow::Error>((ctrl, reply))
     })
     .await
-    .map_err(|_| anyhow!("hub enrollment handshake timed out"))??;
+    {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) if connector.is_none() => {
+            return Err(e.context(format!("enrollment handshake failed{tls_hint}")));
+        }
+        Ok(Err(e)) => return Err(e.context("enrollment handshake failed")),
+        Err(_) if connector.is_none() => {
+            anyhow::bail!("hub enrollment handshake timed out{tls_hint}");
+        }
+        Err(_) => anyhow::bail!("hub enrollment handshake timed out"),
+    };
     match reply {
         HelloReply::Welcome { node_id } => {
             tracing::info!(node = %node_id.0, hub = %r.hub, "enrolled")
@@ -1017,6 +1030,16 @@ fn install_systemd(argv: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Escape XML text so plist string values containing `&`, `<`, `>`, or quotes
+/// (e.g. a binary path or argument) produce a well-formed plist.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 fn install_launchd(argv: &[String]) -> Result<()> {
     // A launchd LaunchAgent is per-user. It must be loaded into the target
     // user's GUI domain (gui/<uid>), not root's. If the installer runs as root
@@ -1028,7 +1051,7 @@ fn install_launchd(argv: &[String]) -> Result<()> {
     let plist_path = format!("{}/Library/LaunchAgents/{LAUNCHD_LABEL}.plist", t.home);
     let args_xml: String = argv
         .iter()
-        .map(|a| format!("    <string>{a}</string>\n"))
+        .map(|a| format!("    <string>{}</string>\n", xml_escape(a)))
         .collect();
     let plist = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\

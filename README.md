@@ -313,7 +313,7 @@ mint one on first run, printed in the logs).
   proxy's host:port on UDP, so a client points at the same address. Caveats: the
   client must actually route its UDP through the proxy (native SOCKS5-UDP apps or
   a system tun2socks do; browsers bypass SOCKS for WebRTC by default, the usual
-  "WebRTC leak"); egress targets are IPv4 for now; one association per client IP.
+  "WebRTC leak"); egress targets may be IPv4 or IPv6; one association per client IP.
 - **How a device is chosen:** round-robin across the pool, biased toward devices
   that are healthy, least-loaded, and recently succeeded on the target host. A
   device that fails three dials in a row is skipped until it recovers. `user+name`
@@ -375,7 +375,7 @@ token in the dashboard.
 ## Build from source
 
 ```bash
-# needs rustup, stable >= 1.74; binary lands at target/release/warren
+# needs rustup, stable >= 1.88; binary lands at target/release/warren
 cargo build --release
 # unit + end-to-end tests
 cargo test

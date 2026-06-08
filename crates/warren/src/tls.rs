@@ -55,6 +55,14 @@ pub fn server_acceptor_from_dir(dir: &str) -> Result<(TlsAcceptor, String)> {
         std::fs::create_dir_all(dir).ok();
         std::fs::write(&cert_path, &c)?;
         std::fs::write(&key_path, &k)?;
+        // The private key must not be world-readable; match node identity-key
+        // handling (identity.rs). Restrict the cert too for good measure.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+            let _ = std::fs::set_permissions(&cert_path, std::fs::Permissions::from_mode(0o600));
+        }
         (c, k)
     };
 

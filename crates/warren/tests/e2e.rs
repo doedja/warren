@@ -425,7 +425,7 @@ async fn try_udp(proxy_addr: SocketAddr, echo_addr: SocketAddr) -> std::io::Resu
         std::net::IpAddr::V4(v) => v.to_string(),
         std::net::IpAddr::V6(v) => v.to_string(),
     };
-    let dgram = warren::socks5::wrap_udp(&ip, echo_addr.port(), b"pong");
+    let dgram = warren::socks5::wrap_udp(&ip, echo_addr.port(), b"pong").expect("wrap_udp");
     cudp.send_to(&dgram, bnd).await?;
 
     let mut buf = [0u8; 2048];
