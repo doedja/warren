@@ -86,8 +86,9 @@ curl -x http://warren-session-ab12:PASSWORD@SERVER:8000 https://api.ipify.org
 ```
 
 Or route by **region**: `user-region-COUNTRY` leaves through a device whose
-reported location matches (e.g. `warren-region-Indonesia`), with no fallback to
-other regions if none match:
+location matches (e.g. `warren-region-Indonesia`), with no fallback to other
+regions if none match. The hub determines each device's location from its exit
+IP, so a device cannot spoof its region:
 
 ```bash
 curl -x http://warren-region-Indonesia:PASSWORD@SERVER:8000 https://api.ipify.org
@@ -357,7 +358,7 @@ flags yourself.
 | `--join` | one-paste join code; fills in hub address, token, TLS, and fingerprint |
 | `--hub HOST:7000` | the hub address, if you are not using `--join` |
 | `--token` | join automatically (Mode B); omit to wait for dashboard approval (Mode A) |
-| `--name` | the device's name in the pool (defaults to its hostname); this is the name used in `user+name` |
+| `--name` | the device's name in the pool (defaults to its hostname); this is the name used in `user+name`, and must be unique (a second device claiming a name already in use is rejected) |
 | `--tls` `--hub-fingerprint FP` | use TLS and pin the hub (carried by `--join`) |
 | `--insecure` | with `--tls`, skip fingerprint pinning. Dev only; do not use against a real hub |
 | `--key-file` | where the device keeps its identity key (default `~/.warren/node.key`) |
