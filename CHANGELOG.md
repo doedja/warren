@@ -5,6 +5,62 @@ workflow publishes each version's section here as its GitHub release notes.
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 
+## [0.4.11] - 2026-06-10
+
+Security and robustness release from a full-codebase audit. Update nodes
+(auto-update picks it up) and redeploy hubs.
+
+### Security
+
+- **Node TLS pinning now verifies the handshake signature.** The pinned-cert
+  verifier accepted any CertificateVerify, and the hub's self-signed cert is
+  public, so an active man-in-the-middle could present the real cert with its
+  own key, complete the handshake, and read the tunnel (including the
+  enrollment token in the node's Hello). Signature verification now runs
+  through the real rustls crypto provider; pinning is unchanged otherwise.
+- Proxy auth fails closed: a store error (locked or broken database) used to
+  disable authentication for that connection, briefly turning the pool into an
+  open relay. Node-name uniqueness checks fail closed the same way.
+- The enrollment replay-guard map is pruned past the timestamp skew window; it
+  previously grew without bound on attacker-minted keypairs.
+- Node identity and hub TLS key files are created with mode 0600 from the
+  start (no world-readable window between write and chmod).
+- The unix self-update command and systemd unit now shell-quote the hub
+  address, token, and fingerprint.
+- Release workflow actions are pinned to commit SHAs (the job holds a write
+  token, so a hijacked action tag could have published attacker binaries with
+  matching checksums). CI runs with a read-only token.
+- `install.sh` runs inside a function called on the last line, so a truncated
+  `curl | sh` cannot execute a partial script; Termux boot-script arguments
+  are single-quoted.
+- Geo/public-IP lookups (plaintext HTTP) cap the response at 64 KB.
+- The dashboard asks for confirmation before deleting the last proxy user
+  (zero users disables proxy authentication entirely).
+
+### Fixed
+
+- Two nodes enrolling concurrently with the same name could both be approved
+  and then permanently reject each other on reconnect; the name check and
+  approval are now atomic.
+- Two SOCKS5 UDP clients behind one NAT IP no longer tear down each other's
+  association on disconnect.
+- A failed auto-update no longer wedges updates until the process restarts;
+  the debounce re-arms 10 minutes after launching the installer.
+- `node install --join CODE --insecure` keeps `--insecure` in the service
+  command (the service used to crash-loop on a missing fingerprint).
+- Node dials time out after 10s instead of hanging in the OS SYN-retry path
+  and holding up shutdown drains; the node's real dial-failure reason now
+  shows in the dashboard instead of a generic "dial timed out".
+- Absolute-URI HTTP proxy requests handle bracketed IPv6 hosts and reject
+  invalid ports instead of silently sending the request to port 80.
+- SOCKS5 replies 0x08 (address type not supported) to unknown address types
+  instead of closing the connection without a reply.
+- Hub accept loops back off briefly on accept errors instead of hot-spinning
+  at 100% CPU when out of file descriptors; the node-link TLS handshake is
+  time-bounded; the sticky-session cap is enforced hard (oldest evicted).
+- Creating a proxy user with a reserved routing marker in the name returns
+  400 instead of 500.
+
 ## [0.4.10] - 2026-06-08
 
 ### Fixed
