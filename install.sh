@@ -8,6 +8,10 @@ set -e
 
 REPO="doedja/warren"
 
+# Everything runs inside main(), called on the last line: under `curl | sh` a
+# connection drop mid-stream must not execute a half-downloaded script.
+main() {
+
 # Clean uninstall: stop the service, remove the key, remove the binary.
 if [ "$1" = "--uninstall" ] || [ "$1" = "uninstall" ]; then
   if command -v warren >/dev/null 2>&1; then
@@ -50,7 +54,9 @@ setup_termux() {
     echo "#!$PREFIX/bin/sh"
     echo "termux-wake-lock 2>/dev/null || true"
     printf 'exec "%s" node run' "$dest"
-    for a in "$@"; do printf ' "%s"' "$a"; done
+    # Single-quote each arg ('\'' for embedded quotes): inside double quotes a
+    # token containing `$` or backquote would expand/corrupt at boot time.
+    for a in "$@"; do printf " '%s'" "$(printf '%s' "$a" | sed "s/'/'\\\\''/g")"; done
     echo ""
   } >"$bootdir/start-warren.sh"
   chmod +x "$bootdir/start-warren.sh"
@@ -203,3 +209,7 @@ else
   echo "  warren node run --hub HOST:7000 --token TOKEN [--tls --hub-fingerprint FP]" >&2
   echo "  warren node run --hub HOST:7000            # no token: shows a pending code to approve" >&2
 fi
+
+}
+
+main "$@"

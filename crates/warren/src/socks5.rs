@@ -23,6 +23,8 @@ const ATYP_IPV6: u8 = 0x04;
 /// SOCKS5 reply codes (subset).
 pub const REP_SUCCESS: u8 = 0x00;
 pub const REP_GENERAL_FAILURE: u8 = 0x01;
+const REP_CMD_NOT_SUPPORTED: u8 = 0x07;
+const REP_ATYP_NOT_SUPPORTED: u8 = 0x08;
 
 /// What the client asked for after the handshake.
 #[derive(Debug, PartialEq)]
@@ -90,9 +92,21 @@ pub async fn negotiate<S: AsyncRead + AsyncWrite + Unpin>(
     if req[0] != VER {
         return Err(invalid("bad request version"));
     }
+    // RFC 1928: an unsupported ATYP gets reply 0x08, not a raw close (the
+    // client could not otherwise tell a proxy error from a network failure).
+    if !matches!(req[3], ATYP_IPV4 | ATYP_DOMAIN | ATYP_IPV6) {
+        write_reply(s, REP_ATYP_NOT_SUPPORTED).await?;
+        return Ok(None);
+    }
     match req[1] {
         CMD_CONNECT => {
             let (host, port) = read_addr_port(s, req[3]).await?;
+            // A zero-length domain parses but can never dial; reject here
+            // instead of burning a node dial on it.
+            if host.is_empty() {
+                write_reply(s, REP_GENERAL_FAILURE).await?;
+                return Ok(None);
+            }
             Ok(Some(Socks5Req::Connect { host, port }))
         }
         CMD_UDP_ASSOCIATE => {
@@ -102,7 +116,7 @@ pub async fn negotiate<S: AsyncRead + AsyncWrite + Unpin>(
             Ok(Some(Socks5Req::UdpAssociate))
         }
         _ => {
-            write_reply(s, 0x07).await?; // command not supported
+            write_reply(s, REP_CMD_NOT_SUPPORTED).await?;
             Ok(None)
         }
     }

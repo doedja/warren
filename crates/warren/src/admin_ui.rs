@@ -399,7 +399,12 @@ async function addUser(){
   await api('POST','/api/users',{username,password});
   document.getElementById('uname').value=''; document.getElementById('upass').value=''; loadUsers();
 }
-async function delUser(u){ await api('DELETE','/api/users/'+encodeURIComponent(u)); loadUsers(); }
+async function delUser(u){
+  // Zero users = the proxy ports accept ANYONE (auth is required only while at
+  // least one user exists). Make deleting the last one an explicit decision.
+  const n = document.getElementById('stat-users').textContent;
+  if (n === '1' && !confirm('This is the last proxy user. With zero users the proxy accepts unauthenticated connections from anyone (open relay). Delete anyway?')) return;
+  await api('DELETE','/api/users/'+encodeURIComponent(u)); loadUsers(); }
 function setLive(ok){ const el=document.getElementById('live'); if(!el) return; el.textContent = ok?'live':'stale'; el.style.color = ok?'var(--ok)':'var(--mut)'; }
 async function loadAll(){
   try { await loadInfo(); await loadPending(); await loadNodes(); await loadKeys(); await loadTokens(); await loadUsers(); await loadLogs(); setLive(true); }

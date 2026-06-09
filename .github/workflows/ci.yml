@@ -4,6 +4,10 @@ on:
   push:
   pull_request:
 
+# Nothing in CI writes to the repo; don't hand the jobs a write-capable token.
+permissions:
+  contents: read
+
 jobs:
   check:
     runs-on: ubuntu-latest

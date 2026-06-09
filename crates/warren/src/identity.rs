@@ -31,12 +31,20 @@ impl Identity {
             if let Some(dir) = std::path::Path::new(path).parent() {
                 std::fs::create_dir_all(dir).ok();
             }
-            std::fs::write(path, signing.to_bytes())
-                .with_context(|| format!("write key {path}"))?;
+            // Owner-only from the moment the file exists: a post-write chmod
+            // would leave a world-readable window.
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            {
+                use std::io::Write;
+                opts.open(path)
+                    .and_then(|mut f| f.write_all(&signing.to_bytes()))
+                    .with_context(|| format!("write key {path}"))?;
             }
             Ok(Identity { signing })
         }

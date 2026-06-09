@@ -11,9 +11,13 @@ permissions:
 jobs:
   create-release:
     runs-on: ubuntu-latest
+    # Third-party actions are pinned to commit SHAs: this job's token has
+    # contents:write, so a hijacked mutable tag could publish attacker binaries
+    # WITH matching .sha256 files that install.sh (and auto-updating fleets)
+    # would happily verify and run.
     steps:
-      - uses: actions/checkout@v4
-      - uses: taiki-e/create-gh-release-action@v1
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: taiki-e/create-gh-release-action@eba8ea96c86cca8a37f1b56e94b4d13301fba651 # v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           # Publish the matching version's section from CHANGELOG.md as the release
@@ -45,17 +49,18 @@ jobs:
             os: windows-latest
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       # ring needs nasm to assemble on windows-msvc.
       - if: runner.os == 'Windows'
-        uses: ilammy/setup-nasm@v1
-      - uses: taiki-e/upload-rust-binary-action@v1
+        uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1
+      - uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1
         with:
           bin: warren
           target: ${{ matrix.target }}
           # $tag is the release tag (e.g. v0.1.9): warren-v0.1.9-linux-x86_64.tar.gz
           archive: warren-$tag-${{ matrix.name }}
           # Publish a sha256 next to each archive so install.sh can verify the
-          # download before extracting/running it (uploads warren-$tag-NAME.tar.gz.sha256).
+          # download before extracting/running it (uploads warren-$tag-NAME.sha256,
+          # the archive name without its extension).
           checksum: sha256
           token: ${{ secrets.GITHUB_TOKEN }}

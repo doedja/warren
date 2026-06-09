@@ -90,9 +90,22 @@ fn parse_http_target(target: &str, host_header: Option<&str>) -> Option<(String,
     };
     // authority may be user@host:port; drop any userinfo.
     let hostport = authority.rsplit('@').next().unwrap_or(authority);
-    let (host, port) = match hostport.rsplit_once(':') {
-        Some((h, p)) => (h.to_string(), p.parse().unwrap_or(80)),
-        None => (hostport.to_string(), 80),
+    // Bracketed IPv6 first (`[::1]:8080`, `[::1]`): a bare rsplit on ':' would
+    // split inside the address. An unparseable explicit port is an error, not
+    // a silent fallback to 80 (the request would go to the wrong place).
+    let (host, port) = if let Some(rest) = hostport.strip_prefix('[') {
+        let (h, after) = rest.split_once(']')?;
+        let port = match after.strip_prefix(':') {
+            Some(p) => p.parse().ok()?,
+            None if after.is_empty() => 80,
+            None => return None,
+        };
+        (h.to_string(), port)
+    } else {
+        match hostport.rsplit_once(':') {
+            Some((h, p)) => (h.to_string(), p.parse().ok()?),
+            None => (hostport.to_string(), 80),
+        }
     };
     let host = if host.is_empty() {
         host_header?.split(':').next().unwrap_or("").to_string()
@@ -201,6 +214,23 @@ mod tests {
         assert_eq!(split_connect_target("[2001:db8::1]"), s("2001:db8::1", 443)); // IPv6, default port
         assert_eq!(split_connect_target("example.com:notaport"), None); // bad explicit port
         assert_eq!(split_connect_target("[::1]:bad"), None); // bad bracketed port
+    }
+
+    #[test]
+    fn http_target_parsing() {
+        // Bracketed IPv6: host comes out unbracketed, port honored / defaulted.
+        assert_eq!(
+            parse_http_target("http://[::1]:8080/x", None),
+            Some(("::1".to_string(), 8080, "/x".to_string()))
+        );
+        assert_eq!(
+            parse_http_target("http://[2001:db8::1]/", None),
+            Some(("2001:db8::1".to_string(), 80, "/".to_string()))
+        );
+        // An explicit but unparseable port is an error, not port 80.
+        assert_eq!(parse_http_target("http://h:99999/", None), None);
+        assert_eq!(parse_http_target("http://h:abc/", None), None);
+        assert_eq!(parse_http_target("http://[::1]:bad/", None), None);
     }
 
     #[tokio::test]

@@ -222,6 +222,11 @@ pub struct HubConfig {
 /// A live UDP association: the channel that forwards client datagrams to the
 /// node's relay stream, and the client's source address for replies.
 struct UdpAssoc {
+    /// Unique association id. Cleanup removes the map entry only if it still
+    /// holds THIS association: two NAT'd clients share a client IP, so the
+    /// second associate overwrites the first's entry, and the first's teardown
+    /// must not delete the second's live routing.
+    id: u64,
     /// Bounded so a client flooding faster than its node drains drops datagrams
     /// (UDP is lossy) instead of growing hub memory without limit.
     to_node: mpsc::Sender<UdpDatagram>,
@@ -278,8 +283,9 @@ struct Hub {
     nodes: Mutex<Vec<NodeEntry>>,
     /// conn_id -> (expected data-conn nonce, waker for the client). The nonce
     /// authenticates the data connection: only the node we sent the Dial to
-    /// knows it, so a guessed conn_id alone cannot hijack the splice.
-    pending: Mutex<HashMap<u64, (u64, oneshot::Sender<MuxStream>)>>,
+    /// knows it, so a guessed conn_id alone cannot hijack the splice. The waker
+    /// resolves to the stream, or the node's DialFailed reason.
+    pending: Mutex<HashMap<u64, (u64, oneshot::Sender<DialOutcome>)>>,
     rr: AtomicUsize,
     conn_seq: AtomicU64,
     /// Sticky sessions: session key -> (node name, last use). A `user-session-K`
@@ -304,6 +310,11 @@ struct Hub {
 /// Per node id -> (ok dials, total dials, last error). Aliased to keep the
 /// `Hub` field readable (clippy::type_complexity).
 type NodeStats = HashMap<String, (u32, u32, Option<String>)>;
+
+/// What a pending dial resolves to: the node's data stream, or the reason the
+/// node reported in DialFailed (so the dashboard shows the real error instead
+/// of a generic "dial timed out").
+type DialOutcome = Result<MuxStream, String>;
 
 /// A routing snapshot of one node: id, name, control tx, fails, per-host fails,
 /// in-flight, protocol version, last-fail time. Cloned out so routing decisions
@@ -376,6 +387,18 @@ impl Hub {
         let mut map = self.sessions.lock().await;
         if map.len() > SESSION_CAP {
             map.retain(|_, (_, seen)| seen.elapsed() < SESSION_TTL);
+            // Still over (a client minting unique session keys faster than the
+            // TTL expires them): the cap must be hard, so evict oldest-first.
+            if map.len() > SESSION_CAP {
+                let mut by_age: Vec<(String, Instant)> = map
+                    .iter()
+                    .map(|(k, (_, seen))| (k.clone(), *seen))
+                    .collect();
+                by_age.sort_by_key(|(_, seen)| *seen);
+                for (k, _) in by_age.iter().take(map.len() - SESSION_CAP) {
+                    map.remove(k);
+                }
+            }
         }
         map.insert(key.to_string(), (name.to_string(), Instant::now()));
     }
@@ -405,9 +428,9 @@ impl Hub {
     async fn record_dial(&self, node_id: &str, ok: bool, reason: Option<&str>) {
         let mut m = self.node_stats.lock().await;
         let e = m.entry(node_id.to_string()).or_insert((0, 0, None));
-        e.1 += 1;
+        e.1 = e.1.saturating_add(1);
         if ok {
-            e.0 += 1;
+            e.0 = e.0.saturating_add(1);
         } else {
             e.2 = reason.map(str::to_string);
         }
@@ -462,10 +485,10 @@ impl Hub {
             self.node_stats.lock().await.remove(&id.0);
         }
     }
-    async fn insert_pending(&self, id: u64, nonce: u64, tx: oneshot::Sender<MuxStream>) {
+    async fn insert_pending(&self, id: u64, nonce: u64, tx: oneshot::Sender<DialOutcome>) {
         self.pending.lock().await.insert(id, (nonce, tx));
     }
-    async fn take_pending(&self, id: u64) -> Option<(u64, oneshot::Sender<MuxStream>)> {
+    async fn take_pending(&self, id: u64) -> Option<(u64, oneshot::Sender<DialOutcome>)> {
         self.pending.lock().await.remove(&id)
     }
     async fn list_node_info(&self) -> Vec<NodeInfo> {
@@ -784,7 +807,12 @@ pub async fn run_with_listeners(
                         }
                     });
                 }
-                Err(e) => tracing::warn!(error = %e, "node accept failed"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "node accept failed");
+                    // EMFILE/ENFILE fail instantly; without a pause this loop
+                    // hot-spins at 100% CPU exactly when the process is fd-starved.
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
             }
         }
     });
@@ -802,7 +830,10 @@ pub async fn run_with_listeners(
                         }
                     });
                 }
-                Err(e) => tracing::warn!(error = %e, "client accept failed"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "client accept failed");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
             }
         }
     });
@@ -854,8 +885,14 @@ async fn handle_node_conn(stream: TcpStream, peer_ip: IpAddr, hub: Arc<Hub>) -> 
         tracing::debug!(%peer_ip, "too many node connections from this IP; dropping");
         return Ok(());
     };
+    // Bounded: a peer that connects and never sends a ClientHello must not pin
+    // this task, the fd, and a per-IP conn slot forever.
     let conn = match &hub.tls {
-        Some(acceptor) => Conn::ServerTls(acceptor.accept(stream).await?),
+        Some(acceptor) => Conn::ServerTls(
+            timeout(ENROLL_TIMEOUT, acceptor.accept(stream))
+                .await
+                .map_err(|_| anyhow::anyhow!("tls handshake timed out"))??,
+        ),
         None => Conn::Plain(stream),
     };
     // The node<->hub link is one yamux connection. The hub only accepts streams;
@@ -992,7 +1029,9 @@ async fn handle_node_conn(stream: TcpStream, peer_ip: IpAddr, hub: Arc<Hub>) -> 
                     NodeToHub::Pong { .. } => {}
                     NodeToHub::DialFailed { conn_id, reason } => {
                         tracing::debug!(conn_id, %reason, "node reported dial failed");
-                        let _ = ctrl_hub.take_pending(conn_id).await;
+                        if let Some((_, tx)) = ctrl_hub.take_pending(conn_id).await {
+                            let _ = tx.send(Err(reason));
+                        }
                     }
                     NodeToHub::Info { .. } => {
                         // Ignored: ip/country/city are hub-authoritative. The hub
@@ -1092,7 +1131,9 @@ async fn enroll_node(
         .await;
         return Ok(None);
     }
-    let skew = (unix_now() - hello.timestamp as i64).abs();
+    // i128: a crafted timestamp near u64::MAX would overflow i64 subtraction
+    // (debug panic). Wide math keeps the comparison exact for any input.
+    let skew = (unix_now() as i128 - hello.timestamp as i128).abs();
     if skew > 120 {
         let _ = write_msg(
             conn,
@@ -1112,6 +1153,15 @@ async fn enroll_node(
     //     window to displace the live link. (Lock released before the await.)
     let replayed = {
         let mut seen = hub.last_auth.lock().unwrap();
+        // An entry whose timestamp fell out of the 120s skew window can no
+        // longer be replayed (the skew check above already rejects anything
+        // that old), so it is dead weight. Pruning bounds the map: anyone can
+        // mint fresh keypairs with valid self-signatures, so without this the
+        // map would grow forever.
+        if seen.len() >= 1024 {
+            let cutoff = (unix_now() - 121).max(0) as u64;
+            seen.retain(|_, ts| *ts >= cutoff);
+        }
         match seen.get(&pk_hex) {
             Some(&prev) if hello.timestamp <= prev => true,
             _ => {
@@ -1133,11 +1183,12 @@ async fn enroll_node(
 
     // 1b. Names disambiguate routing (`user+name`), so a device may not claim a
     //     name already approved for a DIFFERENT key (its own key is excluded, so
-    //     reconnects are fine).
+    //     reconnects are fine). A store error rejects (fail closed) rather than
+    //     letting a duplicate name through.
     if hub
         .store
         .node_name_taken_by_other(&hello.node_name, &pk_hex)
-        .unwrap_or(false)
+        .unwrap_or(true)
     {
         let _ = write_msg(
             conn,
@@ -1162,8 +1213,30 @@ async fn enroll_node(
             .map(|t| hub.store.token_valid(t).unwrap_or(false))
             .unwrap_or(false);
         if by_token {
-            let _ = hub.store.approve_node(&pk_hex, &hello.node_name);
-            tracing::info!(%code, name = %hello.node_name, "node approved via token");
+            // Atomic check-and-approve: closes the race where two nodes with the
+            // same name enroll concurrently, both pass the 1b check, both get
+            // approved, and then permanently reject each other on reconnect.
+            match hub
+                .store
+                .approve_node_if_name_free(&pk_hex, &hello.node_name)
+            {
+                Ok(true) => {
+                    tracing::info!(%code, name = %hello.node_name, "node approved via token");
+                }
+                _ => {
+                    let _ = write_msg(
+                        conn,
+                        &HelloReply::Reject {
+                            reason: format!(
+                                "node name '{}' is already in use by another device; pass a unique --name",
+                                hello.node_name
+                            ),
+                        },
+                    )
+                    .await;
+                    return Ok(None);
+                }
+            }
         } else {
             let _ = hub.store.add_pending(&pk_hex, &hello.node_name, &code);
             let _ = write_msg(conn, &HelloReply::Pending { code: code.clone() }).await;
@@ -1186,7 +1259,7 @@ async fn enroll_node(
 async fn handle_data(dh: DataHello, conn: MuxStream, hub: Arc<Hub>) -> Result<()> {
     match hub.take_pending(dh.conn_id).await {
         Some((nonce, tx)) if nonce == dh.nonce => {
-            let _ = tx.send(conn);
+            let _ = tx.send(Ok(conn));
         }
         Some((nonce, tx)) => {
             // Right conn_id, wrong nonce: not the node we dialed. Drop it and
@@ -1281,7 +1354,9 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
         return Ok(());
     }
 
-    let need_auth = hub.store.auth_required().unwrap_or(false);
+    // Fail CLOSED: a store error (locked db, I/O) must require auth, not
+    // silently turn the pool into an open relay for this connection.
+    let need_auth = hub.store.auth_required().unwrap_or(true);
     let store = hub.store.clone();
     // The proxy username encodes how to route (user / user+device / user-session-K).
     // Auth runs inside the SOCKS5/HTTP paths, so capture the route there and read
@@ -1423,7 +1498,7 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
 
         let conn_id = hub.next_conn_id();
         let nonce = rand::random::<u64>();
-        let (otx, orx) = oneshot::channel::<MuxStream>();
+        let (otx, orx) = oneshot::channel::<DialOutcome>();
         hub.insert_pending(conn_id, nonce, otx).await;
 
         if node_tx
@@ -1444,7 +1519,7 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
         }
 
         match timeout(Duration::from_secs(15), orx).await {
-            Ok(Ok(mut data)) => {
+            Ok(Ok(Ok(mut data))) => {
                 fails.store(0, Ordering::Relaxed);
                 host_fails.lock().unwrap().remove(&host);
                 hub.record_dial(&node_id.0, true, None).await;
@@ -1462,12 +1537,18 @@ async fn handle_client(mut client: TcpStream, hub: Arc<Hub>) -> Result<()> {
                 }
                 return Ok(());
             }
-            _ => {
+            outcome => {
                 hub.take_pending(conn_id).await;
                 fails.fetch_add(1, Ordering::Relaxed);
                 last_fail.store(unix_now(), Ordering::Relaxed);
-                hub.record_dial(&node_id.0, false, Some("dial timed out"))
-                    .await;
+                // The node's DialFailed reason if it sent one; otherwise the
+                // 15s window elapsed (or the link died and dropped the waker).
+                let reason = match outcome {
+                    Ok(Ok(Err(r))) => r,
+                    Ok(Err(_)) => "node link lost during dial".to_string(),
+                    _ => "dial timed out".to_string(),
+                };
+                hub.record_dial(&node_id.0, false, Some(&reason)).await;
                 {
                     let mut hf = host_fails.lock().unwrap();
                     *hf.entry(host.clone()).or_insert(0) += 1;
@@ -1579,7 +1660,7 @@ async fn handle_udp_associate(
     // Open the relay stream on the node (same conn_id/nonce handshake as a dial).
     let conn_id = hub.next_conn_id();
     let nonce = rand::random::<u64>();
-    let (otx, orx) = oneshot::channel::<MuxStream>();
+    let (otx, orx) = oneshot::channel::<DialOutcome>();
     hub.insert_pending(conn_id, nonce, otx).await;
     if node_tx.send(HubToNode::UdpOpen { conn_id, nonce }).is_err() {
         hub.take_pending(conn_id).await;
@@ -1587,7 +1668,7 @@ async fn handle_udp_associate(
         return Ok(());
     }
     let stream = match timeout(Duration::from_secs(15), orx).await {
-        Ok(Ok(s)) => s,
+        Ok(Ok(Ok(s))) => s,
         _ => {
             hub.take_pending(conn_id).await;
             socks5::write_reply(&mut client, socks5::REP_GENERAL_FAILURE).await?;
@@ -1609,6 +1690,7 @@ async fn handle_udp_associate(
     hub.udp_assoc.lock().await.insert(
         client_ip,
         UdpAssoc {
+            id: conn_id,
             to_node,
             client_src: client_src.clone(),
             meter: meter.clone(),
@@ -1658,7 +1740,14 @@ async fn handle_udp_associate(
         } => {}
     }
 
-    hub.udp_assoc.lock().await.remove(&client_ip);
+    // Remove only OUR entry: a later associate from the same client IP may have
+    // replaced it, and deleting that one would kill the successor's routing.
+    {
+        let mut assoc = hub.udp_assoc.lock().await;
+        if assoc.get(&client_ip).is_some_and(|a| a.id == conn_id) {
+            assoc.remove(&client_ip);
+        }
+    }
     writer.abort();
     reader.abort();
     Ok(())
@@ -1691,11 +1780,16 @@ async fn geo_lookup(ip: &str) -> Option<(Option<String>, Option<String>)> {
         "GET /line/{ip}?fields=status,country,city HTTP/1.1\r\nHost: ip-api.com\r\nConnection: close\r\nUser-Agent: warren\r\n\r\n"
     );
     s.write_all(req.as_bytes()).await.ok()?;
+    // Bounded read: this is plaintext HTTP, so an on-path attacker controls the
+    // body; a tiny geo answer must not become an unbounded allocation.
     let mut buf = Vec::new();
-    timeout(Duration::from_secs(8), s.read_to_end(&mut buf))
-        .await
-        .ok()?
-        .ok()?;
+    timeout(
+        Duration::from_secs(8),
+        s.take(64 * 1024).read_to_end(&mut buf),
+    )
+    .await
+    .ok()?
+    .ok()?;
     let text = String::from_utf8_lossy(&buf);
     let body = text.split("\r\n\r\n").nth(1)?;
     let mut lines = body.lines().map(str::trim).filter(|l| !l.is_empty());
@@ -2097,7 +2191,9 @@ async fn api_create_user(
     Json(req): Json<UserReq>,
 ) -> Result<StatusCode, StatusCode> {
     admin_mutate_ok(&headers, &ctx.token)?;
-    if req.username.is_empty() || req.password.is_empty() {
+    // Invalid input (empty, reserved routing markers) is the caller's mistake:
+    // 400, not the 500 that mapping store validation errors through `ise` gives.
+    if Store::validate_username(&req.username, &req.password).is_err() {
         return Err(StatusCode::BAD_REQUEST);
     }
     ctx.hub

@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use tokio_rustls::rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
 };
+use tokio_rustls::rustls::crypto::CryptoProvider;
 use tokio_rustls::rustls::pki_types::{
     CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime,
 };
@@ -53,16 +54,11 @@ pub fn server_acceptor_from_dir(dir: &str) -> Result<(TlsAcceptor, String)> {
         let c = cert.cert.der().to_vec();
         let k = cert.key_pair.serialize_der();
         std::fs::create_dir_all(dir).ok();
-        std::fs::write(&cert_path, &c)?;
-        std::fs::write(&key_path, &k)?;
-        // The private key must not be world-readable; match node identity-key
-        // handling (identity.rs). Restrict the cert too for good measure.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
-            let _ = std::fs::set_permissions(&cert_path, std::fs::Permissions::from_mode(0o600));
-        }
+        // The private key must not be world-readable, not even between create
+        // and a later chmod: set the mode at create time (identity.rs does the
+        // same). Restrict the cert too for good measure.
+        write_private(&cert_path, &c)?;
+        write_private(&key_path, &k)?;
         (c, k)
     };
 
@@ -76,12 +72,29 @@ pub fn server_acceptor_from_dir(dir: &str) -> Result<(TlsAcceptor, String)> {
     Ok((TlsAcceptor::from(Arc::new(config)), fingerprint))
 }
 
+/// Write `bytes` to `path` with owner-only permissions from the moment the
+/// file exists (no world-readable window).
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)?.write_all(bytes)
+}
+
 /// Build a TLS connector. With `fingerprint` set, the hub cert must match it.
 /// With `insecure` true, any cert is accepted (dev only).
 pub fn client_connector(fingerprint: Option<String>, insecure: bool) -> Result<TlsConnector> {
     init_crypto();
+    let provider = CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(tokio_rustls::rustls::crypto::ring::default_provider()));
     let verifier: Arc<dyn ServerCertVerifier> = if insecure {
-        Arc::new(AcceptAny)
+        Arc::new(AcceptAny { provider })
     } else {
         let hex_pin = fingerprint
             .ok_or_else(|| anyhow!("--tls requires --hub-fingerprint <sha256> (or --insecure)"))?;
@@ -89,7 +102,7 @@ pub fn client_connector(fingerprint: Option<String>, insecure: bool) -> Result<T
         if pin.len() != 32 {
             return Err(anyhow!("fingerprint must be 32 bytes of SHA256 hex"));
         }
-        Arc::new(PinnedCert { pin })
+        Arc::new(PinnedCert { pin, provider })
     };
     let config = ClientConfig::builder()
         .dangerous()
@@ -98,24 +111,17 @@ pub fn client_connector(fingerprint: Option<String>, insecure: bool) -> Result<T
     Ok(TlsConnector::from(Arc::new(config)))
 }
 
-fn all_schemes() -> Vec<SignatureScheme> {
-    vec![
-        SignatureScheme::RSA_PKCS1_SHA256,
-        SignatureScheme::RSA_PKCS1_SHA384,
-        SignatureScheme::RSA_PKCS1_SHA512,
-        SignatureScheme::ECDSA_NISTP256_SHA256,
-        SignatureScheme::ECDSA_NISTP384_SHA384,
-        SignatureScheme::RSA_PSS_SHA256,
-        SignatureScheme::RSA_PSS_SHA384,
-        SignatureScheme::RSA_PSS_SHA512,
-        SignatureScheme::ED25519,
-    ]
-}
-
 /// Verifier that trusts a cert iff its SHA256 matches the pinned value.
+///
+/// Matching the fingerprint alone is NOT enough: the handshake signature
+/// (CertificateVerify) is the only proof the peer holds the cert's private
+/// key. The cert itself is public (served to anyone who connects), so both
+/// signature callbacks delegate to the real crypto provider instead of
+/// blind-accepting.
 #[derive(Debug)]
 struct PinnedCert {
     pin: Vec<u8>,
+    provider: Arc<CryptoProvider>,
 }
 
 impl ServerCertVerifier for PinnedCert {
@@ -138,28 +144,43 @@ impl ServerCertVerifier for PinnedCert {
     }
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, tokio_rustls::rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        tokio_rustls::rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, tokio_rustls::rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        tokio_rustls::rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        all_schemes()
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
-/// Dev-only verifier that accepts any certificate.
+/// Dev-only verifier that accepts any certificate (still checks the peer holds
+/// the presented cert's key, it just doesn't care which cert it is).
 #[derive(Debug)]
-struct AcceptAny;
+struct AcceptAny {
+    provider: Arc<CryptoProvider>,
+}
 
 impl ServerCertVerifier for AcceptAny {
     fn verify_server_cert(
@@ -174,21 +195,33 @@ impl ServerCertVerifier for AcceptAny {
     }
     fn verify_tls12_signature(
         &self,
-        _m: &[u8],
-        _c: &CertificateDer<'_>,
-        _d: &DigitallySignedStruct,
+        m: &[u8],
+        c: &CertificateDer<'_>,
+        d: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, tokio_rustls::rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        tokio_rustls::rustls::crypto::verify_tls12_signature(
+            m,
+            c,
+            d,
+            &self.provider.signature_verification_algorithms,
+        )
     }
     fn verify_tls13_signature(
         &self,
-        _m: &[u8],
-        _c: &CertificateDer<'_>,
-        _d: &DigitallySignedStruct,
+        m: &[u8],
+        c: &CertificateDer<'_>,
+        d: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, tokio_rustls::rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        tokio_rustls::rustls::crypto::verify_tls13_signature(
+            m,
+            c,
+            d,
+            &self.provider.signature_verification_algorithms,
+        )
     }
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        all_schemes()
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }

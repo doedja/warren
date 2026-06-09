@@ -147,14 +147,14 @@ impl Store {
         Ok(exists)
     }
 
-    pub fn add_user(&self, username: &str, password: &str) -> Result<()> {
+    /// Validate a proxy username/password pair. `+` and the `-session-` /
+    /// `-region-` / `-group-` markers are reserved in proxy usernames: clients
+    /// append them to control routing, so a username containing one would be
+    /// ambiguous at proxy-auth time. Reject at creation.
+    pub fn validate_username(username: &str, password: &str) -> Result<()> {
         if username.is_empty() || password.is_empty() {
             anyhow::bail!("proxy username and password must both be non-empty");
         }
-        // `+` and `-session-` are reserved in proxy usernames: clients put a
-        // device name after `+` (user+device) or a session key after `-session-`
-        // (user-session-KEY) to control routing, so a username containing either
-        // would be ambiguous at proxy-auth time. Reject at creation.
         if username.contains('+') {
             anyhow::bail!(
                 "proxy username may not contain '+' (it is reserved for device selection)"
@@ -175,6 +175,11 @@ impl Store {
                 "proxy username may not contain '-group-' (it is reserved for node-group selection)"
             );
         }
+        Ok(())
+    }
+
+    pub fn add_user(&self, username: &str, password: &str) -> Result<()> {
+        Self::validate_username(username, password)?;
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO proxy_users (username, password) VALUES (?1, ?2)",
@@ -261,6 +266,36 @@ impl Store {
             rusqlite::params![pubkey],
         )?;
         Ok(())
+    }
+
+    /// Atomically approve `pubkey` under `name` unless an approved node with a
+    /// DIFFERENT key already uses the name (case-insensitive). The check and the
+    /// insert run under one connection lock, so two concurrent enrollments with
+    /// the same name cannot both pass (each would then see the other's row and be
+    /// locked out forever on reconnect). Returns false if the name was taken.
+    pub fn approve_node_if_name_free(&self, pubkey: &str, name: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let taken = match conn.query_row(
+            "SELECT 1 FROM node_keys WHERE name = ?1 COLLATE NOCASE AND pubkey != ?2",
+            rusqlite::params![name, pubkey],
+            |_| Ok(()),
+        ) {
+            Ok(_) => true,
+            Err(rusqlite::Error::QueryReturnedNoRows) => false,
+            Err(e) => return Err(e.into()),
+        };
+        if taken {
+            return Ok(false);
+        }
+        conn.execute(
+            "INSERT OR REPLACE INTO node_keys (pubkey, name, approved_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![pubkey, name, Self::now()],
+        )?;
+        conn.execute(
+            "DELETE FROM pending_nodes WHERE pubkey = ?1",
+            rusqlite::params![pubkey],
+        )?;
+        Ok(true)
     }
 
     pub fn is_node_approved(&self, pubkey: &str) -> Result<bool> {
@@ -457,6 +492,19 @@ mod tests {
         assert!(!store.node_name_taken_by_other("phone", "pk-a").unwrap());
         // A free name is fine.
         assert!(!store.node_name_taken_by_other("laptop", "pk-b").unwrap());
+    }
+
+    #[test]
+    fn atomic_approve_respects_name_ownership() {
+        let store = Store::open(":memory:").unwrap();
+        assert!(store.approve_node_if_name_free("pk-a", "phone").unwrap());
+        // Different key, same name (any case): refused, nothing inserted.
+        assert!(!store.approve_node_if_name_free("pk-b", "PHONE").unwrap());
+        assert!(!store.is_node_approved("pk-b").unwrap());
+        // Same key re-approving its own name: fine (reconnect path).
+        assert!(store.approve_node_if_name_free("pk-a", "phone").unwrap());
+        // Free name: fine.
+        assert!(store.approve_node_if_name_free("pk-b", "laptop").unwrap());
     }
 
     #[test]

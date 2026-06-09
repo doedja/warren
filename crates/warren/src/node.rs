@@ -44,6 +44,13 @@ const DRAIN_BUDGET: Duration = Duration::from_secs(20);
 /// random slice of this so updates roll across the fleet one at a time. Version
 /// tolerance keeps the not-yet-updated nodes routable meanwhile.
 const UPDATE_SPREAD: Duration = Duration::from_secs(300);
+
+/// How long after launching the detached installer the update-pending debounce
+/// re-arms. On success the process is restarted and the flag dies with it; if
+/// the installer failed (network blip, GitHub outage), nothing else clears the
+/// flag, and without a re-arm every later HubVersion announce would be debounced
+/// away until something restarts the process.
+const UPDATE_REARM: Duration = Duration::from_secs(600);
 /// Bound on the whole connect + enroll handshake (TCP/TLS dial, stream open,
 /// Hello, HelloReply). Without it, a connection that comes up at the transport
 /// layer but never completes enrollment (hub mid-restart, half-open link) wedges
@@ -321,6 +328,12 @@ fn maybe_self_update(remote: &str, auto_update: bool, r: &Resolved, pending: &Ar
             // installer). Release the slot so a later hub announce retries instead
             // of being silently debounced for the rest of this process's life.
             pending.store(false, Ordering::Release);
+        } else {
+            // Launched, but "launched" is not "succeeded": the detached installer
+            // can still fail after spawn. Re-arm after a grace period; if the
+            // update worked this process is gone before the sleep ends.
+            tokio::time::sleep(UPDATE_REARM).await;
+            pending.store(false, Ordering::Release);
         }
     });
 }
@@ -393,19 +406,30 @@ fn self_update_now(r: &Resolved) -> bool {
     }
 }
 
+/// Wrap a value as a POSIX-shell single-quoted literal so a hub address, token,
+/// or fingerprint containing a space or shell metachar cannot break out of (or
+/// inject into) the `sh -c` self-update command. Mirrors `ps_single_quote`.
+#[cfg(unix)]
+fn sh_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 /// Build the `curl install.sh | sh -s -- ...` command that re-installs this node.
 /// `--auto-update` is always appended so the setting survives the reinstall.
 #[cfg(unix)]
 fn unix_update_cmd(r: &Resolved) -> String {
     let url = "https://raw.githubusercontent.com/doedja/warren/main/install.sh";
-    let mut cmd = format!("curl -fsSL {url} | sh -s -- --hub {}", r.hub);
+    let mut cmd = format!(
+        "curl -fsSL {url} | sh -s -- --hub {}",
+        sh_single_quote(&r.hub)
+    );
     if let Some(t) = &r.token {
-        cmd.push_str(&format!(" --token {t}"));
+        cmd.push_str(&format!(" --token {}", sh_single_quote(t)));
     }
     if r.tls {
         cmd.push_str(" --tls");
         if let Some(fp) = &r.fingerprint {
-            cmd.push_str(&format!(" --hub-fingerprint {fp}"));
+            cmd.push_str(&format!(" --hub-fingerprint {}", sh_single_quote(fp)));
         }
     }
     if r.insecure {
@@ -696,11 +720,16 @@ async fn fetch_public_info() -> Option<(String, Option<String>, Option<String>, 
         .ok()?;
     let req = "GET /line/?fields=query,country,city HTTP/1.1\r\nHost: ip-api.com\r\nConnection: close\r\nUser-Agent: warren\r\n\r\n";
     s.write_all(req.as_bytes()).await.ok()?;
+    // Bounded read: plaintext HTTP, so an on-path attacker controls the body; a
+    // few geo lines must not become an unbounded allocation.
     let mut buf = Vec::new();
-    tokio::time::timeout(Duration::from_secs(8), s.read_to_end(&mut buf))
-        .await
-        .ok()?
-        .ok()?;
+    tokio::time::timeout(
+        Duration::from_secs(8),
+        s.take(64 * 1024).read_to_end(&mut buf),
+    )
+    .await
+    .ok()?
+    .ok()?;
     let latency_ms = start.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
     let text = String::from_utf8_lossy(&buf);
     let body = text.split("\r\n\r\n").nth(1)?;
@@ -725,16 +754,30 @@ async fn handle_dial(
     port: u16,
     ntx: mpsc::UnboundedSender<NodeToHub>,
 ) {
-    // Dial the target from this node: this is the residential egress.
-    let mut target = match TcpStream::connect((host.as_str(), port)).await {
-        Ok(t) => {
+    // Dial the target from this node: this is the residential egress. Bounded:
+    // the hub gives up at 15s, and a black-holed target would otherwise sit in
+    // the OS SYN-retry path (~2min) holding the in-flight guard, which makes a
+    // SIGTERM drain burn its whole budget on dials nobody is waiting for.
+    let dial = tokio::time::timeout(
+        Duration::from_secs(10),
+        TcpStream::connect((host.as_str(), port)),
+    );
+    let mut target = match dial.await {
+        Ok(Ok(t)) => {
             let _ = t.set_nodelay(true); // proxied splice: no Nagle stalls
             t
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             let _ = ntx.send(NodeToHub::DialFailed {
                 conn_id,
                 reason: e.to_string(),
+            });
+            return;
+        }
+        Err(_) => {
+            let _ = ntx.send(NodeToHub::DialFailed {
+                conn_id,
+                reason: "connect timed out".to_string(),
             });
             return;
         }
@@ -881,6 +924,12 @@ fn node_run_argv(exe: &str, a: &RunArgs) -> Vec<String> {
     if let Some(code) = &a.join {
         v.push("--join".into());
         v.push(code.clone());
+        // A join code carries hub/token/tls/fingerprint but NOT --insecure
+        // (tls-without-pin). Dropping it here used to install a service that
+        // crash-loops on "--tls requires --hub-fingerprint".
+        if a.insecure {
+            v.push("--insecure".into());
+        }
     } else if let Some(hub) = &a.hub {
         v.push("--hub".into());
         v.push(hub.clone());
@@ -1008,19 +1057,30 @@ fn ps_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
+/// Quote one argv element for a systemd ExecStart= line (double quotes,
+/// backslash escapes), so a name or token containing a space or quote cannot
+/// split into extra arguments or corrupt the unit.
+fn systemd_quote(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 fn install_systemd(argv: &[String]) -> Result<()> {
+    let exec = argv
+        .iter()
+        .map(|a| systemd_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ");
     let unit = format!(
         "[Unit]\n\
          Description=warren proxy node\n\
          After=network-online.target\n\
          Wants=network-online.target\n\n\
          [Service]\n\
-         ExecStart={}\n\
+         ExecStart={exec}\n\
          Restart=always\n\
          RestartSec=3\n\n\
          [Install]\n\
-         WantedBy=multi-user.target\n",
-        argv.join(" ")
+         WantedBy=multi-user.target\n"
     );
     std::fs::write(SYSTEMD_UNIT, unit)
         .with_context(|| format!("write {SYSTEMD_UNIT} (need root? re-run with sudo)"))?;
@@ -1316,7 +1376,7 @@ mod tests {
         DRAIN_BUDGET,
     };
     #[cfg(unix)]
-    use super::{unix_update_cmd, Resolved};
+    use super::{sh_single_quote, unix_update_cmd, Resolved};
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -1345,16 +1405,25 @@ mod tests {
         }
     }
 
-    // The self-update installer command carries the connection flags and always
-    // re-adds --auto-update so the opt-in survives the reinstall.
+    // The self-update installer command carries the connection flags (shell
+    // single-quoted, so a metachar in a value cannot break the sh -c string)
+    // and always re-adds --auto-update so the opt-in survives the reinstall.
     #[cfg(unix)]
     #[test]
     fn unix_update_cmd_includes_flags_and_auto_update() {
         let c = unix_update_cmd(&resolved(true));
-        assert!(c.contains("--hub h:7000"));
-        assert!(c.contains("--token tok"));
-        assert!(c.contains("--tls --hub-fingerprint FP"));
+        assert!(c.contains("--hub 'h:7000'"));
+        assert!(c.contains("--token 'tok'"));
+        assert!(c.contains("--tls --hub-fingerprint 'FP'"));
         assert!(c.trim_end().ends_with("--auto-update"));
+    }
+
+    // A value containing a single quote cannot escape its quoting.
+    #[cfg(unix)]
+    #[test]
+    fn sh_single_quote_neutralizes_metachars() {
+        assert_eq!(sh_single_quote("a'b; rm -rf /"), "'a'\\''b; rm -rf /'");
+        assert_eq!(sh_single_quote("$HOME `x`"), "'$HOME `x`'");
     }
 
     // TLS flags are omitted when TLS is off; --auto-update is still appended.

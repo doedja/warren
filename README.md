@@ -297,7 +297,9 @@ hub reached only over localhost or a tailnet.
 A device makes an ed25519 key on first run and proves it owns that key when it
 connects. With a token (in the join code) the hub trusts the device right away;
 without one it appears as **pending** and you approve it in the dashboard. You can
-revoke any device's key later, and nothing secret travels over the wire.
+revoke any device's key later, and no key material travels over the wire (the
+enrollment token does; under the default TLS it is encrypted, so treat it as a
+secret either way).
 
 ### As a container
 
