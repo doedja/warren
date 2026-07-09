@@ -165,6 +165,7 @@ pub const DASHBOARD: &str = r###"<!doctype html>
   <section class="card">
     <h2>Live nodes</h2>
     <p class="desc">Devices connected and ready to carry requests. <b>Health</b> tracks recent dial errors (deprioritized at 3/3). <b>Success</b> is the dial success rate. <b>copy proxy</b> gives a ready-to-paste proxy URL (endpoint + auth) that routes only through that device; <b>copy cmd</b> is the same as a curl test.</p>
+    <div class="row" style="margin:0 0 2px"><button class="ghost" onclick="copyAllProxies(this)">copy all proxies</button><span class="muted" style="font-size:11.5px">every live node as one proxy URL per line. Scripts: <code>GET /api/proxies</code> (add <code>?format=txt</code> for a plain list).</span></div>
     <table><thead><tr><th>Node</th><th>Exit IP</th><th>Location</th><th>Up since</th><th>Health</th><th>Success</th><th>Traffic</th><th>Version</th><th></th></tr></thead><tbody id="nodes"></tbody></table>
   </section>
 
@@ -195,6 +196,10 @@ pub const DASHBOARD: &str = r###"<!doctype html>
 </main>
 <script>
 let INFO = {};
+// Per-device proxy URLs for the live nodes, rebuilt each poll (see loadNodes).
+// Backs the "copy all proxies" button; the /api/proxies endpoint is the
+// programmatic equivalent for scripts.
+let PROXY_URLS = [];
 function setStatus(m){ document.getElementById('status').textContent = m; }
 async function api(method, path, body){
   // Page is behind HTTP Basic auth; the browser attaches credentials to these
@@ -225,6 +230,11 @@ function copyEl(btn){
 }
 // Copy an explicit string (table rows where the text is not a sibling <code>).
 function copyVal(btn, t){ navigator.clipboard.writeText(t).then(()=>flash(btn)); setStatus('copied'); }
+// Copy every live node's proxy URL, one per line (the "copy all proxies" button).
+function copyAllProxies(btn){
+  if (!PROXY_URLS.length){ setStatus('no live nodes to copy'); return; }
+  copyVal(btn, PROXY_URLS.join('\n'));
+}
 function copyText(t){ navigator.clipboard.writeText(t); setStatus('copied'); }
 function kv(k,v){ return `<div class="kv"><b>${k}</b><code>${esc(v)}</code></div>`; }
 function cmd(label, c){ return `<div class="cmd"><div class="cmdlabel">${label}</div><div class="cmdrow"><code>${esc(c)}</code><button class="ghost" onclick="copyEl(this)">copy</button></div></div>`; }
@@ -309,6 +319,8 @@ async function loadNodes(){
       `<td><button class="ghost" onclick='copyVal(this, ${esc(JSON.stringify(purl))})'>copy proxy</button> `+
       `<button class="ghost" onclick='copyVal(this, ${esc(JSON.stringify(c))})'>copy cmd</button></td></tr>`;
   }).join('') || '<tr><td class="empty" colspan=9>No devices online yet. Create a token below and run the install line on a device.</td></tr>';
+  // Same per-device proxy URLs the row "copy proxy" buttons use, for "copy all".
+  PROXY_URLS = rows.map(n => `http://${puser}+${n.name}:${ppass}@${proxy}`);
   // Stat strip: online count + total relayed traffic.
   document.getElementById('stat-nodes').innerHTML = rows.length + ' <small>online</small>';
   const total = rows.reduce((a,n)=>a+(n.bytes||0),0);

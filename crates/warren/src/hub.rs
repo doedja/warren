@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Html;
 use axum::routing::{delete, get, post};
@@ -1843,6 +1843,22 @@ struct NodeInfo {
 }
 
 #[derive(Serialize)]
+struct ProxyEntry {
+    name: String,
+    /// Ready-to-use proxy URL pinned to this one device (endpoint + auth).
+    url: String,
+    ip: Option<String>,
+    country: Option<String>,
+    city: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ProxyQuery {
+    /// `txt` => newline-delimited URLs (paste into a rotator); default JSON.
+    format: Option<String>,
+}
+
+#[derive(Serialize)]
 struct TokenInfo {
     token: String,
     name: String,
@@ -1942,6 +1958,7 @@ async fn run_admin(listen: String, ctx: AdminCtx) -> Result<()> {
         .route("/", get(dashboard))
         .route("/api/info", get(api_info))
         .route("/api/nodes", get(api_nodes))
+        .route("/api/proxies", get(api_proxies))
         .route("/api/tokens", get(api_list_tokens).post(api_create_token))
         .route(
             "/api/tokens/:token",
@@ -2012,6 +2029,69 @@ async fn api_nodes(
         return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(Json(ctx.hub.list_node_info().await))
+}
+
+/// Build a ready-to-use proxy URL that pins ONE device via the `user+name`
+/// route. With a proxy user set it embeds `user:pass`; with none (open ports),
+/// an empty base still parses to the device pin, so the URL stays usable.
+fn proxy_pin_url(creds: Option<(&str, &str)>, name: &str, proxy: &str) -> String {
+    match creds {
+        Some((u, p)) => format!("http://{u}+{name}:{p}@{proxy}"),
+        None => format!("http://+{name}@{proxy}"),
+    }
+}
+
+/// Every live node as a per-device-pinned proxy URL, in one call, so a scraper
+/// or rotator can pull the whole pool at once instead of copying each node by
+/// hand. Same admin auth as `/api/nodes`; the URLs embed the proxy password,
+/// exactly what `/api/info` and the dashboard already expose. Uses the first
+/// proxy user's credentials (like the dashboard's copy buttons). `?format=txt`
+/// returns one URL per line; default is JSON with geo fields.
+async fn api_proxies(
+    State(ctx): State<AdminCtx>,
+    headers: HeaderMap,
+    Query(q): Query<ProxyQuery>,
+) -> Result<axum::response::Response, StatusCode> {
+    use axum::response::IntoResponse;
+    if !authed(&headers, &ctx.token) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let creds = ctx.hub.store.first_user().ok().flatten();
+    let cred_ref = creds.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
+    let proxy = ctx
+        .hub
+        .public_proxy_addr
+        .clone()
+        .unwrap_or_else(|| "<hub-host>:8000".to_string());
+    let entries: Vec<ProxyEntry> = ctx
+        .hub
+        .list_node_info()
+        .await
+        .into_iter()
+        .map(|n| ProxyEntry {
+            url: proxy_pin_url(cred_ref, &n.name, &proxy),
+            name: n.name,
+            ip: n.ip,
+            country: n.country,
+            city: n.city,
+        })
+        .collect();
+    if q.format.as_deref() == Some("txt") {
+        let body = entries
+            .iter()
+            .map(|e| e.url.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Ok((
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )],
+            body,
+        )
+            .into_response());
+    }
+    Ok(Json(entries).into_response())
 }
 
 /// Recent hub log lines (bounded ring) for the dashboard's log pane. Same admin
@@ -2334,9 +2414,9 @@ fn remove_conn(nodes: &mut Vec<NodeEntry>, id: &NodeId, conn_seq: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        admin_mutate_ok, ct_eq, displace_and_push, effective_fails, parse_route, remove_conn,
-        route_rank, success_pct, NodeEntry, NodeId, NodeReport, Route, HEALTH_WINDOW_SECS,
-        UNHEALTHY_AT,
+        admin_mutate_ok, ct_eq, displace_and_push, effective_fails, parse_route, proxy_pin_url,
+        remove_conn, route_rank, success_pct, NodeEntry, NodeId, NodeReport, Route,
+        HEALTH_WINDOW_SECS, UNHEALTHY_AT,
     };
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
     use base64::Engine as _;
@@ -2344,6 +2424,39 @@ mod tests {
     use std::sync::atomic::{AtomicI64, AtomicU32};
     use std::sync::{Arc, Mutex};
     use tokio::sync::{mpsc, Notify};
+
+    // The /api/proxies URL-building decision across its input space: proxy user
+    // present vs absent, and the newline join used by ?format=txt. The device
+    // pin (user+name) must survive both credential states.
+    #[test]
+    fn proxy_pin_url_matrix() {
+        let p = "warren.doedja.com:8000";
+        // With a proxy user: embeds user+name:pass, pinned to the device.
+        assert_eq!(
+            proxy_pin_url(Some(("acme", "s3cret")), "tokyo-1", p),
+            "http://acme+tokyo-1:s3cret@warren.doedja.com:8000"
+        );
+        assert_eq!(
+            proxy_pin_url(Some(("acme", "s3cret")), "paris-2", p),
+            "http://acme+paris-2:s3cret@warren.doedja.com:8000"
+        );
+        // No proxy user (open ports): empty base still parses to the device pin.
+        assert_eq!(
+            proxy_pin_url(None, "tokyo-1", p),
+            "http://+tokyo-1@warren.doedja.com:8000"
+        );
+        // Newline join is exactly what /api/proxies?format=txt returns.
+        let txt = ["tokyo-1", "paris-2"]
+            .iter()
+            .map(|n| proxy_pin_url(Some(("acme", "s3cret")), n, p))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            txt,
+            "http://acme+tokyo-1:s3cret@warren.doedja.com:8000\n\
+             http://acme+paris-2:s3cret@warren.doedja.com:8000"
+        );
+    }
 
     #[test]
     fn admin_mutate_guard_requires_auth_and_csrf_header() {
