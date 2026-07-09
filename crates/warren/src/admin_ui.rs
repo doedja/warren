@@ -164,7 +164,7 @@ pub const DASHBOARD: &str = r###"<!doctype html>
 
   <section class="card">
     <h2>Live nodes</h2>
-    <p class="desc">Devices connected and ready to carry requests. <b>Health</b> tracks recent dial errors (deprioritized at 3/3). <b>Success</b> is the dial success rate. Copy a device's command to route only through it.</p>
+    <p class="desc">Devices connected and ready to carry requests. <b>Health</b> tracks recent dial errors (deprioritized at 3/3). <b>Success</b> is the dial success rate. <b>copy proxy</b> gives a ready-to-paste proxy URL (endpoint + auth) that routes only through that device; <b>copy cmd</b> is the same as a curl test.</p>
     <table><thead><tr><th>Node</th><th>Exit IP</th><th>Location</th><th>Up since</th><th>Health</th><th>Success</th><th>Traffic</th><th>Version</th><th></th></tr></thead><tbody id="nodes"></tbody></table>
   </section>
 
@@ -281,7 +281,10 @@ async function loadNodes(){
   const ppass = INFO.proxy_pass || '<PASSWORD>';
   const proxy = INFO.proxy_addr || '<hub-host>:18080';
   document.getElementById('nodes').innerHTML = rows.map(n => {
-    const c = `curl -x http://${puser}+${n.name}:${ppass}@${proxy} https://api.ipify.org`;
+    // Ready-to-paste proxy URL (endpoint + auth) pinned to this one device, plus
+    // a curl form for a quick test. Both route only through node n via user+name.
+    const purl = `http://${puser}+${n.name}:${ppass}@${proxy}`;
+    const c = `curl -x ${purl} https://api.ipify.org`;
     const dotc = n.fails === 0 ? 'ok' : n.fails >= 3 ? 'bad' : 'warn';
     const lat = n.latency_ms != null ? ` <span class="muted">${n.latency_ms}ms</span>` : '';
     const fcol = n.fails >= 3 ? 'color:var(--bad)' : '';
@@ -303,7 +306,8 @@ async function loadNodes(){
     const ver = n.version ? `<code>v${esc(n.version)}</code>` : '<span class="muted">-</span>';
     const grp = n.group ? ` <span class="muted" title="enroll-token group: route with user-group-${esc(n.group)}">[${esc(n.group)}]</span>` : '';
     return `<tr><td><b>${esc(n.id)}</b>${grp}</td><td>${ip}</td><td>${loc}</td><td>${up}</td><td>${fail}</td><td>${succ}</td><td>${fmtBytes(n.bytes)}</td><td>${ver}</td>`+
-      `<td><button class="ghost" onclick='copyVal(this, ${esc(JSON.stringify(c))})'>copy cmd</button></td></tr>`;
+      `<td><button class="ghost" onclick='copyVal(this, ${esc(JSON.stringify(purl))})'>copy proxy</button> `+
+      `<button class="ghost" onclick='copyVal(this, ${esc(JSON.stringify(c))})'>copy cmd</button></td></tr>`;
   }).join('') || '<tr><td class="empty" colspan=9>No devices online yet. Create a token below and run the install line on a device.</td></tr>';
   // Stat strip: online count + total relayed traffic.
   document.getElementById('stat-nodes').innerHTML = rows.length + ' <small>online</small>';
