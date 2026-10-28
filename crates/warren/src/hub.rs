@@ -104,7 +104,7 @@ pub struct HubArgs {
     /// SQLite database (enrollment tokens + proxy users). Created if absent.
     #[arg(long, env = "WARREN_DB", default_value = "warren.db")]
     pub db: String,
-    /// Seed this enrollment token into the DB on startup (empty means unset).
+    /// Seed this enrollment token into the DB on startup (blank means unset).
     #[arg(long, env = "WARREN_ENROLL_TOKEN")]
     pub enroll_token: Option<String>,
     /// Seed this proxy username into the DB on startup (with --proxy-pass).
@@ -574,42 +574,48 @@ fn db_parent_dir(db: &str) -> String {
 /// Print the secrets and a ready-to-paste join command once at startup, so a
 /// fresh hub is usable without digging through flags or the dashboard.
 fn print_startup(
-    store: &Store,
+    token: &str,
     tls_on: bool,
     fingerprint: Option<&str>,
     public_node_addr: Option<&str>,
     login: Option<(String, String)>,
-) -> Result<()> {
-    let token = store.list_tokens()?.into_iter().next().map(|(t, _, _)| t);
+) {
     println!("\n  warren hub is up.");
     if let Some((u, p)) = &login {
         println!("  proxy login:   {u} / {p}");
     }
-    if let Some(t) = &token {
-        println!("  enroll token:  {t}");
-    }
+    println!("  enroll token:  {token}");
     if tls_on {
         if let Some(fp) = fingerprint {
             println!("  fingerprint:   {fp}");
         }
     }
-    match (public_node_addr, &token) {
-        (Some(addr), Some(t)) => {
-            let code = crate::joincode::encode(addr, tls_on, fingerprint, Some(t));
+    match public_node_addr {
+        Some(addr) => {
+            let code = crate::joincode::encode(addr, tls_on, fingerprint, Some(token));
             println!("  join a device: warren node run --join {code}");
         }
-        _ => println!(
+        None => println!(
             "  (set --public-node-addr to print a one-paste join code, or copy it from the dashboard)"
         ),
     }
     println!();
-    Ok(())
 }
 
 pub async fn run(mut args: HubArgs) -> Result<()> {
-    // Compose passes optional environment variables as empty strings by default.
-    args.enroll_token = args.enroll_token.filter(|token| !token.is_empty());
-    args.public_node_addr = args.public_node_addr.filter(|addr| !addr.is_empty());
+    // Compose passes unset optional variables as empty strings (`${VAR:-}`), and
+    // values read from files often end in a newline, so blank means unset.
+    // Credentials are kept verbatim; everything else is trimmed.
+    let trimmed = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let non_blank = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
+    args.enroll_token = trimmed(args.enroll_token);
+    args.tls_cert_dir = trimmed(args.tls_cert_dir);
+    args.admin_listen = trimmed(args.admin_listen);
+    args.public_node_addr = trimmed(args.public_node_addr);
+    args.public_proxy_addr = trimmed(args.public_proxy_addr);
+    args.proxy_user = non_blank(args.proxy_user);
+    args.proxy_pass = non_blank(args.proxy_pass);
+    args.admin_token = non_blank(args.admin_token);
 
     let node_listener = TcpListener::bind(&args.listen)
         .await
@@ -636,13 +642,23 @@ pub async fn run(mut args: HubArgs) -> Result<()> {
     };
 
     let store = Arc::new(Store::open(&args.db).with_context(|| format!("open db {}", args.db))?);
-    if let Some(tok) = &args.enroll_token {
-        store.add_token(tok, "cli")?;
-    } else if store.list_tokens()?.is_empty() {
-        // No token supplied and none stored yet: mint one so a fresh hub is
-        // usable without inventing a secret. Rotate with `warren enroll`.
-        store.add_token(&gen_token(), "auto")?;
-    }
+    // The token printed at startup: the one supplied, else one already stored.
+    let enroll_token = match args.enroll_token.take() {
+        Some(tok) => {
+            store.add_token(&tok, "cli")?;
+            tok
+        }
+        None => match store.list_tokens()?.into_iter().next() {
+            Some((tok, _, _)) => tok,
+            None => {
+                // No token supplied and none stored yet: mint one so a fresh hub
+                // is usable without inventing a secret. Rotate with `warren enroll`.
+                let tok = gen_token();
+                store.add_token(&tok, "auto")?;
+                tok
+            }
+        },
+    };
     // Seed a proxy login. If none is given and none exists yet, generate one so
     // a fresh hub is immediately usable; the operator can change it later.
     let mut printed_login: Option<(String, String)> = None;
@@ -656,12 +672,12 @@ pub async fn run(mut args: HubArgs) -> Result<()> {
         _ => {}
     }
     print_startup(
-        &store,
+        &enroll_token,
         tls_on,
         fingerprint.as_deref(),
         args.public_node_addr.as_deref(),
         printed_login,
-    )?;
+    );
 
     let admin = match (args.admin_listen, args.admin_token) {
         (Some(l), Some(t)) => Some((l, t)),
