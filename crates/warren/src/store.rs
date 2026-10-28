@@ -32,6 +32,19 @@ impl Store {
                 first_seen INTEGER NOT NULL
             );",
         )?;
+        // Older hubs stored a blank `WARREN_ENROLL_TOKEN` (Compose's default) as a
+        // real token, which auto-approved any node that sent an empty one. Drop
+        // such rows; devices already approved keep their keys.
+        let purged = conn.execute(
+            "DELETE FROM enroll_tokens WHERE trim(token, ' ' || char(9, 10, 13)) = ''",
+            [],
+        )?;
+        if purged > 0 {
+            tracing::warn!(
+                purged,
+                "removed blank enrollment token(s) left by an older version"
+            );
+        }
         Ok(Store {
             conn: Mutex::new(conn),
         })
@@ -64,7 +77,21 @@ impl Store {
         Ok(())
     }
 
+    /// An enrollment token is a secret that rides in newline-separated join
+    /// codes and on command lines, so it must be non-empty and free of whitespace
+    /// and control characters.
+    pub fn validate_token(token: &str) -> Result<()> {
+        if token.is_empty() {
+            anyhow::bail!("enrollment token cannot be empty");
+        }
+        if token.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            anyhow::bail!("enrollment token may not contain whitespace or control characters");
+        }
+        Ok(())
+    }
+
     pub fn add_token(&self, token: &str, name: &str) -> Result<()> {
+        Self::validate_token(token)?;
         Self::validate_token_name(name)?;
         let conn = self.conn.lock().unwrap();
         let created = SystemTime::now()
@@ -134,6 +161,10 @@ impl Store {
     }
 
     pub fn token_valid(&self, token: &str) -> Result<bool> {
+        // A node that presents an empty token never matches one.
+        if token.is_empty() {
+            return Ok(false);
+        }
         let conn = self.conn.lock().unwrap();
         let exists: bool = match conn.query_row(
             "SELECT 1 FROM enroll_tokens WHERE token = ?1",
@@ -456,6 +487,49 @@ mod tests {
         assert!(store.add_token("tk", "bad name").is_err());
         assert!(store.add_token("tk", "good").is_ok());
         assert!(store.rename_token("tk", "x-session-y").is_err());
+    }
+
+    #[test]
+    fn rejects_blank_tokens() {
+        let store = Store::open(":memory:").unwrap();
+        assert!(store.add_token("", "cli").is_err());
+        assert!(store.add_token(" ", "cli").is_err());
+        assert!(store.add_token("abc\n", "cli").is_err());
+        assert!(store.add_token("a b", "cli").is_err());
+        assert!(!store.token_valid("").unwrap());
+        assert!(store.add_token("abc", "cli").is_ok());
+        assert!(store.token_valid("abc").unwrap());
+    }
+
+    #[test]
+    fn open_purges_blank_tokens_from_older_versions() {
+        let dir = std::env::temp_dir().join(format!("warren-store-{}", rand::random::<u64>()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("warren.db");
+        let path = path.to_str().unwrap();
+        {
+            // Write rows the way an older version could, bypassing validation.
+            let store = Store::open(path).unwrap();
+            let conn = store.conn.lock().unwrap();
+            for token in ["", " ", "\n", "keep"] {
+                conn.execute(
+                    "INSERT INTO enroll_tokens (token, name, created) VALUES (?1, 'cli', 0)",
+                    rusqlite::params![token],
+                )
+                .unwrap();
+            }
+        }
+        let store = Store::open(path).unwrap();
+        let tokens: Vec<String> = store
+            .list_tokens()
+            .unwrap()
+            .into_iter()
+            .map(|(t, _, _)| t)
+            .collect();
+        assert_eq!(tokens, vec!["keep".to_string()]);
+        assert!(!store.token_valid("").unwrap());
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

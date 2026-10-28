@@ -4,8 +4,10 @@
 #     docker compose -f examples/docker-compose.yml up --build
 #
 # The hub prints an enrollment token on first run (see the logs); join a device
-# with it. Put the admin port (9000) behind TLS / a reverse proxy if it is
-# reachable from outside your network.
+# with it. Also set WARREN_PUBLIC_NODE_ADDR (the host:port devices reach, e.g.
+# 203.0.113.7:7000) to have it print a ready-to-paste join command. Put the
+# admin port (9000) behind TLS / a reverse proxy if it is reachable from outside
+# your network.
 services:
   warren-hub:
     build:
@@ -14,8 +16,11 @@ services:
     volumes:
       - warren-data:/data    # TLS cert + SQLite state, kept across restarts
     environment:
-      # Omit WARREN_ENROLL_TOKEN to have the hub mint one on first run.
+      # Unset or empty: mint a token on first run if none is stored.
       WARREN_ENROLL_TOKEN: ${WARREN_ENROLL_TOKEN:-}
+      # Address devices can reach; enables the ready-to-paste join command.
+      # Unset or empty: omit the join command.
+      WARREN_PUBLIC_NODE_ADDR: ${WARREN_PUBLIC_NODE_ADDR:-}
       WARREN_PROXY_USER: ${WARREN_PROXY_USER:?set a proxy username}
       WARREN_PROXY_PASS: ${WARREN_PROXY_PASS:?set a proxy password}
       WARREN_ADMIN_TOKEN: ${WARREN_ADMIN_TOKEN:?set an admin token}

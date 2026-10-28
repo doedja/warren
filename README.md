@@ -313,9 +313,18 @@ WARREN_PROXY_USER=me WARREN_PROXY_PASS=secret WARREN_ADMIN_TOKEN=admin \
   docker compose -f examples/docker-compose.yml up --build
 ```
 
-Set `WARREN_ENROLL_TOKEN`, `WARREN_PROXY_USER`, `WARREN_PROXY_PASS`, and
-`WARREN_ADMIN_TOKEN` in the environment (omit the enroll token to have the hub
-mint one on first run, printed in the logs).
+Set `WARREN_PROXY_USER`, `WARREN_PROXY_PASS`, and `WARREN_ADMIN_TOKEN` in the
+environment. Optionally set `WARREN_ENROLL_TOKEN`; when unset or empty, the hub
+mints a token if none is stored and prints it in the logs.
+
+Optionally set `WARREN_PUBLIC_NODE_ADDR` to the host:port devices can reach (for
+example `WARREN_PUBLIC_NODE_ADDR=203.0.113.7:7000`) to also print a
+ready-to-paste `warren node run --join ...` command. When unset or empty, no join
+command is printed. This setting is also available as
+`warren hub --public-node-addr`.
+
+Empty enrollment tokens saved by older versions are removed when the hub starts;
+devices that already joined keep working.
 
 ## Good to know
 
@@ -360,8 +369,8 @@ One binary, three subcommands. Run any with `--help` for the full list.
 Most of these also read an env var (`WARREN_ENROLL_TOKEN`, `WARREN_PROXY_USER`,
 `WARREN_PROXY_PASS`, `WARREN_ADMIN_LISTEN`, `WARREN_ADMIN_TOKEN`, `WARREN_DB`,
 `WARREN_TLS_CERT_DIR`, `WARREN_PUBLIC_NODE_ADDR`, `WARREN_PUBLIC_PROXY_ADDR`),
-which is how the container image is configured. `--listen`, `--proxy-listen`, and
-`--no-tls` are flags only.
+which is how the container image is configured. An empty or blank value counts as
+unset. `--listen`, `--proxy-listen`, and `--no-tls` are flags only.
 
 **`warren node run --join <code>`** runs the agent on a device. The join code (from
 the hub's startup output or the dashboard) fills in everything below; or pass the
